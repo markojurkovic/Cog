@@ -335,16 +335,15 @@ static size_t convert_dsd_to_dop_f32(float *output, const uint8_t *input, size_t
 
 static void convert_u8_to_s16(int16_t *output, const uint8_t *input, size_t count) {
 	for(size_t i = 0; i < count; ++i) {
-		uint16_t sample = (input[i] << 8) | input[i];
-		sample ^= 0x8080;
-		output[i] = (int16_t)(sample);
+		// Preserve the original 8-bit PCM code in the high byte. Replicating
+		// it into the low byte changes every non-zero sample on a wider DAC.
+		output[i] = (int16_t)(((int32_t)input[i] - 128) * 256);
 	}
 }
 
 static void convert_s8_to_s16(int16_t *output, const uint8_t *input, size_t count) {
 	for(size_t i = 0; i < count; ++i) {
-		uint16_t sample = (input[i] << 8) | input[i];
-		output[i] = (int16_t)(sample);
+		output[i] = (int16_t)((int16_t)(int8_t)input[i] * 256);
 	}
 }
 

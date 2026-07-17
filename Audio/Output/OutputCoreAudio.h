@@ -104,8 +104,12 @@ using std::atomic_long;
 	BOOL preferDoPIntegerOutput;
 	BOOL renderFormatDoPInteger;
 	double preferredDoPCarrierSampleRate;
+	BOOL preferNativeHighPrecisionOutput;
+	BOOL renderFormatNativeHighPrecision;
+	AudioStreamBasicDescription preferredNativeHighPrecisionFormat;
 
 	float *outputFloatScratch;
+	float *inputFloatScratch;
 	size_t outputFloatScratchCapacity;
 
 	AUAudioUnit *_au;

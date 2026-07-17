@@ -380,7 +380,7 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 		const float *inBuffer = (const float *)[sampleData bytes];
 		if(audioBufferIsDoP(inBuffer, channels, frameCount, NULL)) {
 			outputChunk = [AudioChunk new];
-			[outputChunk setFormat:inputFormat];
+			[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
@@ -404,7 +404,7 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 		vDSP_biquadm(eqSetup, (const float **)buffers, channels, buffers, channels, (vDSP_Length)frameCount);
 
 		outputChunk = [AudioChunk new];
-		[outputChunk setFormat:inputFormat];
+		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 		if(outputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

@@ -504,7 +504,10 @@ static int32_t convertDoPFloatToS32(float sample) {
 static int32_t convertPCMFloatToS32(float sample) {
 	if(sample >= 1.0f) return (int32_t)(((uint32_t)INT32_MAX) & 0xFFFFFF00U);
 	if(sample <= -1.0f) return INT32_MIN;
-	return (int32_t)(((uint32_t)llrint((double)sample * 2147483647.0)) & 0xFFFFFF00U);
+	// Integer PCM is normalized by dividing by 2^31. Use the exact inverse
+	// here: multiplying by INT32_MAX loses one 24-bit LSB in the upper half
+	// of the positive range before the 24-bit carrier mask is applied.
+	return (int32_t)(((uint32_t)llrint((double)sample * 2147483648.0)) & 0xFFFFFF00U);
 }
 
 static void convertFloatBufferToS32(int32_t *output, const float *input, size_t count, BOOL isDoP) {
@@ -513,11 +516,59 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	}
 }
 
-- (BOOL)prepareOutputFloatScratchForRenderFormat:(AudioStreamBasicDescription)format {
-	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+static int32_t convertPCMFloatToFullS32(float sample) {
+	if(sample >= 1.0f) return INT32_MAX;
+	if(sample <= -1.0f) return INT32_MIN;
+	return (int32_t)llrint((double)sample * 2147483648.0);
+}
+
+static void convertFloatBufferToFullS32(int32_t *output, const float *input, size_t count) {
+	for(size_t i = 0; i < count; ++i) {
+		output[i] = convertPCMFloatToFullS32(input[i]);
+	}
+}
+
+static void convertFloatBufferToF64(double *output, const float *input, size_t count) {
+	vDSP_vspdp(input, 1, output, 1, count);
+}
+
+static BOOL convertPCMBufferToFloat32(float *output, const void *input, AudioStreamBasicDescription format, size_t count) {
+	if(AudioFormatIsFloat32(format)) {
+		memcpy(output, input, count * sizeof(float));
 		return YES;
 	}
+	if(!AudioFormatIsHighPrecisionPCM(format)) {
+		return NO;
+	}
 
+	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+		vDSP_vdpsp((const double *)input, 1, output, 1, count);
+	} else {
+		vDSP_vflt32((const int32_t *)input, 1, output, 1, count);
+		const float scale = 2147483648.0f;
+		vDSP_vsdiv(output, 1, &scale, output, 1, count);
+	}
+	return YES;
+}
+
+static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first, AudioStreamBasicDescription second) {
+	if(!AudioFormatIsHighPrecisionPCM(first) || !AudioFormatIsHighPrecisionPCM(second)) {
+		return NO;
+	}
+	const AudioStreamBasicDescription canonicalFirst = AudioFormatAsCanonicalHighPrecisionPCM(first);
+	if(first.mFormatFlags != canonicalFirst.mFormatFlags ||
+	   first.mBitsPerChannel != canonicalFirst.mBitsPerChannel ||
+	   first.mBytesPerFrame != canonicalFirst.mBytesPerFrame ||
+	   first.mBytesPerPacket != canonicalFirst.mBytesPerPacket) {
+		return NO;
+	}
+	return first.mChannelsPerFrame == second.mChannelsPerFrame &&
+	       first.mBytesPerPacket == second.mBytesPerPacket &&
+	       !!(first.mFormatFlags & kAudioFormatFlagIsFloat) ==
+	       !!(second.mFormatFlags & kAudioFormatFlagIsFloat);
+}
+
+- (BOOL)prepareOutputFloatScratchForRenderFormat:(AudioStreamBasicDescription)format {
 	const size_t maximumFrames = (size_t)_au.maximumFramesToRender;
 	const size_t channels = (size_t)format.mChannelsPerFrame;
 	if(!maximumFrames || !channels || maximumFrames > SIZE_MAX / channels) {
@@ -528,16 +579,21 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	if(requiredSamples > SIZE_MAX / sizeof(float)) {
 		return NO;
 	}
-	if(outputFloatScratch && outputFloatScratchCapacity >= requiredSamples) {
+	if(outputFloatScratch && inputFloatScratch && outputFloatScratchCapacity >= requiredSamples) {
 		return YES;
 	}
 
-	float *scratch = (float *)realloc(outputFloatScratch, requiredSamples * sizeof(float));
-	if(!scratch) {
+	float *outputScratch = (float *)realloc(outputFloatScratch, requiredSamples * sizeof(float));
+	if(!outputScratch) {
 		return NO;
 	}
+	outputFloatScratch = outputScratch;
 
-	outputFloatScratch = scratch;
+	float *inputScratch = (float *)realloc(inputFloatScratch, requiredSamples * sizeof(float));
+	if(!inputScratch) {
+		return NO;
+	}
+	inputFloatScratch = inputScratch;
 	outputFloatScratchCapacity = requiredSamples;
 	return YES;
 }
@@ -627,7 +683,13 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	}
 
 	const BOOL targetDoPInteger = preferDoPIntegerOutput;
-	if(!_deviceFormat || ![_deviceFormat isEqual:format] || renderFormatDoPInteger != targetDoPInteger) {
+	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
+	const BOOL nativeFormatChanged = targetNativeHighPrecision &&
+	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
+	if(!_deviceFormat || ![_deviceFormat isEqual:format] ||
+	   renderFormatDoPInteger != targetDoPInteger ||
+	   renderFormatNativeHighPrecision != targetNativeHighPrecision ||
+	   nativeFormatChanged) {
 		NSError *err = nil;
 		AVAudioFormat *renderAVFormat;
 
@@ -638,6 +700,8 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsNonInterleaved;
 		if(preferDoPIntegerOutput && preferredDoPCarrierSampleRate > 0.0) {
 			deviceFormat.mSampleRate = preferredDoPCarrierSampleRate;
+		} else if(targetNativeHighPrecision && preferredNativeHighPrecisionFormat.mSampleRate > 0.0) {
+			deviceFormat.mSampleRate = preferredNativeHighPrecisionFormat.mSampleRate;
 		}
 		//    deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsFloat;
 		//    deviceFormat.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger;
@@ -685,15 +749,26 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 				break;
 		}
 
-		renderFormat = targetDoPInteger ? DoPIntegerRenderFormatForDeviceFormat(deviceFormat) : deviceFormat;
+		if(targetDoPInteger) {
+			renderFormat = DoPIntegerRenderFormatForDeviceFormat(deviceFormat);
+		} else if(targetNativeHighPrecision) {
+			renderFormat = preferredNativeHighPrecisionFormat;
+			renderFormat.mSampleRate = deviceFormat.mSampleRate;
+			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerFrame = (UInt32)((renderFormat.mBitsPerChannel / 8) * renderFormat.mChannelsPerFrame);
+			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
+		} else {
+			renderFormat = deviceFormat;
+		}
 		renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 		resetting = YES;
 		[_au stopHardware];
 		if(renderAVFormat) {
 			[_au.inputBusses[0] setFormat:renderAVFormat error:&err];
 		}
-		if((!renderAVFormat || err != nil) && targetDoPInteger) {
+		if((!renderAVFormat || err != nil) && (targetDoPInteger || targetNativeHighPrecision)) {
 			preferDoPIntegerOutput = NO;
+			preferNativeHighPrecisionOutput = NO;
 			renderFormat = deviceFormat;
 			renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 			err = nil;
@@ -710,6 +785,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 			return NO;
 		}
 		renderFormatDoPInteger = targetDoPInteger && preferDoPIntegerOutput;
+		renderFormatNativeHighPrecision = targetNativeHighPrecision && preferNativeHighPrecisionOutput;
 
 		if(notifyController) {
 			[outputController setFormat:&deviceFormat channelConfig:deviceChannelConfig];
@@ -738,17 +814,24 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat {
 	AudioStreamBasicDescription outputFormat = deviceFormat;
-	if(inputFormatUsesDoPCarrierRate(inputFormat)) {
-		const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
-		if([self deviceSupportsSampleRate:sampleRate]) {
-			outputFormat.mSampleRate = sampleRate;
-		}
+	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	// Preloaded chains are built before they become the active output. Build
+	// them at the source rate whenever the device supports it; selectNextBuffer
+	// switches the hardware at the actual track boundary. This keeps SOXR out
+	// of the inactive PCM path instead of baking a resample into the queue.
+	if([self deviceSupportsSampleRate:sampleRate]) {
+		outputFormat.mSampleRate = sampleRate;
 	}
 	return outputFormat;
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
-	if(!inputFormatUsesDoPCarrierRate(inputFormat)) {
+	const BOOL highPrecisionPCM = AudioFormatIsHighPrecisionPCM(inputFormat);
+	const BOOL usesDoPCarrier = !highPrecisionPCM && inputFormatUsesDoPCarrierRate(inputFormat);
+	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	const BOOL sampleRateSupported = [self deviceSupportsSampleRate:sampleRate];
+
+	if(!usesDoPCarrier) {
 		// A pending DoP seek is only meaningful while another DoP carrier is
 		// expected. If playback moves to PCM before that carrier arrives, do not
 		// keep replacing PCM buffers with DoP silence indefinitely.
@@ -757,20 +840,42 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		doPMarker = 0x05;
 		[faderNode setDoPMode:NO];
 
-		if(preferDoPIntegerOutput || renderFormatDoPInteger) {
-			preferDoPIntegerOutput = NO;
-			preferredDoPCarrierSampleRate = 0.0;
+		preferDoPIntegerOutput = NO;
+		preferredDoPCarrierSampleRate = 0.0;
+		preferNativeHighPrecisionOutput = highPrecisionPCM && sampleRateSupported &&
+		                                    inputFormat.mChannelsPerFrame == deviceFormat.mChannelsPerFrame;
+		if(preferNativeHighPrecisionOutput) {
+			preferredNativeHighPrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
+			preferredNativeHighPrecisionFormat.mSampleRate = sampleRate;
+		} else {
+			bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+		}
+
+		// A matching hardware clock is a prerequisite for bit-perfect PCM.
+		// Unsupported rates still play through the existing converter fallback.
+		if(sampleRateSupported) {
+			if(![self setDeviceSampleRate:sampleRate]) {
+				// The queued converter was intentionally configured for this
+				// source rate. Do not silently hand it to AUHAL for hidden SRC.
+				return NO;
+			}
+			outputdevicechanged = YES;
+			return [self updateDeviceFormatNotifyingController:NO];
+		}
+
+		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
 			return [self updateDeviceFormatNotifyingController:NO];
 		}
 		return YES;
 	}
 
-	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
 	if(![self setDeviceSampleRate:sampleRate]) {
 		return NO;
 	}
 
 	preferDoPIntegerOutput = YES;
+	preferNativeHighPrecisionOutput = NO;
+	bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 	preferredDoPCarrierSampleRate = sampleRate;
 	outputdevicechanged = YES;
 	BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
@@ -789,9 +894,6 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 	streamFormat = realStreamFormat;
 	streamFormat.mChannelsPerFrame = channels;
-	streamFormat.mBytesPerFrame = sizeof(float) * channels;
-	streamFormat.mFramesPerPacket = 1;
-	streamFormat.mBytesPerPacket = sizeof(float) * channels;
 	streamChannelConfig = channelConfig;
 
 	AudioChannelLayoutTag tag = 0;
@@ -894,21 +996,76 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 			return 0;
 		}
 		
-		const BOOL renderAsFloat = !!(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat);
-		float *outSamples = NULL;
-		if(renderAsFloat) {
-			outSamples = (float *)inputData->mBuffers[0].mData;
-		} else {
-			const size_t scratchSamples = (size_t)frameCount * channels;
-			if(!_self->outputFloatScratch || _self->outputFloatScratchCapacity < scratchSamples) {
-				return 0;
-			}
-			outSamples = _self->outputFloatScratch;
+		const BOOL renderAsFloat32 = AudioFormatIsFloat32(*renderASBD);
+		const BOOL renderAsHighPrecision = AudioFormatIsHighPrecisionPCM(*renderASBD);
+		const size_t scratchSamples = (size_t)frameCount * channels;
+		if(!_self->inputFloatScratch || !_self->outputFloatScratch ||
+		   _self->outputFloatScratchCapacity < scratchSamples) {
+			return 0;
+		}
+		float *outSamples = renderAsFloat32 ? (float *)inputData->mBuffers[0].mData : _self->outputFloatScratch;
+		if(!renderAsFloat32) {
 			bzero(outSamples, scratchSamples * sizeof(float));
 		}
 
+		const BOOL directHighPrecision = _self->renderFormatNativeHighPrecision &&
+		                                 renderAsHighPrecision &&
+		                                 !_self->fading && !_self->faded &&
+		                                 !_self->doPActive && !_self->doPSeekPending &&
+		                                 _self->volume == 1.0f;
+
 		@autoreleasepool {
-			if(!_self->faded) {
+			if(directHighPrecision) {
+				while(renderedSamples < frameCount) {
+					[refLock lock];
+					AudioChunk *chunk = nil;
+					if(![_self->bufferNode.buffer isEmpty]) {
+						chunk = [self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+					}
+					[refLock unlock];
+
+					size_t chunkFrames = chunk ? [chunk frameCount] : 0;
+					if(chunkFrames) {
+						_self->prebufferReached = YES;
+						double streamTimestamp = [chunk streamTimestamp];
+						if(!streamTimestamp || _self->streamTimestamp > streamTimestamp) {
+							_self->prebufferSignaled = NO;
+						}
+						_self->streamTimestamp = streamTimestamp;
+
+						const AudioStreamBasicDescription chunkFormat = [chunk format];
+						NSData *sampleData = [chunk removeSamples:chunkFrames];
+						const size_t inputTodo = MIN(chunkFrames, frameCount - renderedSamples);
+						const size_t sampleCount = inputTodo * channels;
+						uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+						                       renderedSamples * renderASBD->mBytesPerPacket;
+						BOOL renderedChunk = NO;
+
+						if(chunkFormat.mChannelsPerFrame != (UInt32)channels) {
+							chunkFrames = 0;
+						} else if(highPrecisionRepresentationsMatch(chunkFormat, *renderASBD)) {
+							memcpy(destination, [sampleData bytes], inputTodo * renderASBD->mBytesPerPacket);
+							renderedChunk = YES;
+						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, sampleCount)) {
+							if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
+								convertFloatBufferToF64((double *)destination, _self->inputFloatScratch, sampleCount);
+							} else {
+								convertFloatBufferToFullS32((int32_t *)destination, _self->inputFloatScratch, sampleCount);
+							}
+							renderedChunk = YES;
+						}
+						if(renderedChunk) {
+							renderedSamples += (int)inputTodo;
+						} else {
+							chunkFrames = 0;
+						}
+					}
+
+					if((_self->stopping && !_self->fadingstop) || _self->resetting || !chunk || !chunkFrames) {
+						break;
+					}
+				}
+			} else if(!_self->faded) {
 				while(renderedSamples < frameCount) {
 					[refLock lock];
 					AudioChunk *chunk = nil;
@@ -929,11 +1086,24 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 						_self->streamTimestamp = streamTimestamp;
 
 						_frameCount = [chunk frameCount];
+						const AudioStreamBasicDescription chunkFormat = [chunk format];
 						NSData *sampleData = [chunk removeSamples:_frameCount];
-						float *samplePtr = (float *)[sampleData bytes];
 						size_t inputTodo = MIN(_frameCount, frameCount - renderedSamples);
+						if(chunkFormat.mChannelsPerFrame != (UInt32)channels) {
+							break;
+						}
+						float *samplePtr = NULL;
+						if(AudioFormatIsFloat32(chunkFormat)) {
+							samplePtr = (float *)[sampleData bytes];
+						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, inputTodo * channels)) {
+							samplePtr = _self->inputFloatScratch;
+						}
+						if(!samplePtr) {
+							break;
+						}
 						uint8_t nextDoPMarker = 0x05;
-						BOOL inputIsDoP = audioBufferIsDoP(samplePtr, channels, inputTodo, &nextDoPMarker);
+						BOOL inputIsDoP = AudioFormatIsFloat32(chunkFormat) &&
+						                  audioBufferIsDoP(samplePtr, channels, inputTodo, &nextDoPMarker);
 
 						if(_self->doPSeekPending && !inputIsDoP) {
 							// Never expose transitional or stale PCM-looking data while a
@@ -984,7 +1154,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 					}
 				}
 			}
-			if(_self->doPActive && renderedSamples < frameCount) {
+			if(!directHighPrecision && _self->doPActive && renderedSamples < frameCount) {
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
 				// track changes, and brief underruns with standard DSD silence.
 				fillDoPSilence(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
@@ -993,11 +1163,17 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 			double secondsRendered = (double)renderedSamples / format->mSampleRate;
 
-			if(!outputContainsDoP) {
+			if(!directHighPrecision && !outputContainsDoP) {
 				scale_by_volume(outSamples, frameCount * channels, _self->volume);
 			}
 
-			if(!renderAsFloat) {
+			if(!directHighPrecision && _self->renderFormatNativeHighPrecision) {
+				if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
+					convertFloatBufferToF64((double *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+				} else {
+					convertFloatBufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+				}
+			} else if(!directHighPrecision && !renderAsFloat32) {
 				convertFloatBufferToS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels, outputContainsDoP);
 			}
 
@@ -1010,7 +1186,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		}
 
 #ifdef _DEBUG
-		if(renderAsFloat) {
+		if(renderAsFloat32) {
 			[BadSampleCleaner cleanSamples:(float *)inputData->mBuffers[0].mData
 									amount:inputData->mBuffers[0].mDataByteSize / sizeof(float)
 								  location:@"final output"];
@@ -1044,6 +1220,9 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		preferDoPIntegerOutput = NO;
 		renderFormatDoPInteger = NO;
 		preferredDoPCarrierSampleRate = 0.0;
+		preferNativeHighPrecisionOutput = NO;
+		renderFormatNativeHighPrecision = NO;
+		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		bzero(&renderFormat, sizeof(renderFormat));
 
 		cutOffInput = NO;
@@ -1228,8 +1407,12 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		if(outputFloatScratch) {
 			free(outputFloatScratch);
 			outputFloatScratch = NULL;
-			outputFloatScratchCapacity = 0;
 		}
+		if(inputFloatScratch) {
+			free(inputFloatScratch);
+			inputFloatScratch = NULL;
+		}
+		outputFloatScratchCapacity = 0;
 		if(running) {
 			while(!stopped) {
 				stopping = YES;

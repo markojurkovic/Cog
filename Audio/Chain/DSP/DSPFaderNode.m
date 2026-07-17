@@ -155,20 +155,28 @@
 		}
 	}
 		
-	BOOL inputRead = YES;
-	AudioChunk *chunk = [self readChunkAsFloat32:512];
-	size_t frameCount = chunk ? [chunk frameCount] : 0;
-	if(waitForResetEvent && frameCount && !chunk.resetForward) {
-		frameCount = 0;
-	}
 	[fadersLock lock];
 	size_t count = [faders count];
 	[fadersLock unlock];
+	const BOOL processingRequired = fadeStep || count;
+
+	BOOL inputRead = YES;
+	AudioChunk *chunk = processingRequired ? [self readChunkAsFloat32:512] : [self readChunk:512];
+	size_t frameCount = chunk ? [chunk frameCount] : 0;
+	if(frameCount && processingRequired) {
+		AudioStreamBasicDescription processingFormat = [chunk format];
+		[self setOutputFormat:processingFormat withChannelConfig:[chunk channelConfig]];
+	}
+	if(waitForResetEvent && frameCount && !chunk.resetForward) {
+		frameCount = 0;
+	}
 	if(!frameCount && count && formatSet) {
+		AudioStreamBasicDescription processingFormat = AudioFormatAsFloat32(outputFormat);
+		[self setOutputFormat:processingFormat withChannelConfig:outputChannelConfig];
 		chunk = [AudioChunk new];
-		[chunk setFormat:outputFormat];
+		[chunk setFormat:processingFormat];
 		[chunk setChannelConfig:outputChannelConfig];
-		bzero(inBuffer, 512 * outputFormat.mBytesPerPacket);
+		bzero(inBuffer, 512 * processingFormat.mBytesPerPacket);
 		frameCount = 512;
 		inputRead = NO;
 	}

@@ -164,6 +164,89 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		return nil;
 	}
 
+	if(nativePrecisionCandidate && volumeScale == 1.0f && inpOffset == inpSize) {
+		AudioStreamBasicDescription inf;
+		uint32_t config;
+		if([self peekFormat:&inf channelConfig:&config]) {
+			if(config != inputChannelConfig || memcmp(&inf, &inputFormat, sizeof(inf)) != 0) {
+				if(inputChannelConfig == 0 && memcmp(&inf, &inputFormat, sizeof(inf)) == 0) {
+					inputChannelConfig = config;
+				} else {
+					newInputFormat = inf;
+					newInputChannelConfig = config;
+					streamFormatChanged = YES;
+					[mutex unlock];
+					return nil;
+				}
+			}
+		}
+
+		AudioChunk *inputChunk = [self readChunk:4096];
+		const size_t frameCount = inputChunk ? [inputChunk frameCount] : 0;
+		if(!frameCount) {
+			[mutex unlock];
+			return nil;
+		}
+
+		const AudioStreamBasicDescription sourceFormat = [inputChunk format];
+		const BOOL sourceIsFloat = !!(sourceFormat.mFormatFlags & kAudioFormatFlagIsFloat);
+		const BOOL sourceIsUnsigned = !sourceIsFloat && !(sourceFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger);
+#if __BIG_ENDIAN__
+		const BOOL sourceNeedsSwap = !(sourceFormat.mFormatFlags & kAudioFormatFlagIsBigEndian);
+#else
+		const BOOL sourceNeedsSwap = !!(sourceFormat.mFormatFlags & kAudioFormatFlagIsBigEndian);
+#endif
+
+		[self addObservers];
+		nodeFormat = nativePrecisionFormat;
+		nodeChannelConfig = inputChannelConfig;
+		nodeLossless = rememberedLossless;
+
+		if(!sourceNeedsSwap && !sourceIsUnsigned) {
+			[inputChunk setFormat:nativePrecisionFormat];
+			[inputChunk setChannelConfig:inputChannelConfig];
+			[mutex unlock];
+			return inputChunk;
+		}
+
+		const double timestamp = inputChunk.streamTimestamp;
+		const double timeRatio = inputChunk.streamTimeRatio;
+		const BOOL resetForward = inputChunk.resetForward;
+		const BOOL isHDCD = [inputChunk isHDCD];
+		NSData *inputData = [inputChunk removeSamples:frameCount];
+		NSMutableData *outputData = [inputData mutableCopy];
+		uint8_t *samples = (uint8_t *)[outputData mutableBytes];
+		const size_t sampleCount = frameCount * sourceFormat.mChannelsPerFrame;
+		if(sourceIsFloat) {
+			for(size_t i = 0; i < sampleCount; ++i) {
+				uint64_t value;
+				memcpy(&value, samples + i * sizeof(value), sizeof(value));
+				if(sourceNeedsSwap) value = __builtin_bswap64(value);
+				memcpy(samples + i * sizeof(value), &value, sizeof(value));
+			}
+		} else {
+			for(size_t i = 0; i < sampleCount; ++i) {
+				uint32_t value;
+				memcpy(&value, samples + i * sizeof(value), sizeof(value));
+				if(sourceNeedsSwap) value = __builtin_bswap32(value);
+				if(sourceIsUnsigned) value ^= 0x80000000U;
+				memcpy(samples + i * sizeof(value), &value, sizeof(value));
+			}
+		}
+
+		AudioChunk *outputChunk = [AudioChunk new];
+		[outputChunk setFormat:nativePrecisionFormat];
+		[outputChunk setChannelConfig:inputChannelConfig];
+		[outputChunk setLossless:[inputChunk lossless]];
+		[outputChunk setStreamTimestamp:timestamp];
+		[outputChunk setStreamTimeRatio:timeRatio];
+		outputChunk.resetForward = resetForward;
+		if(isHDCD) [outputChunk setHDCD];
+		[outputChunk assignData:outputData];
+		[mutex unlock];
+		return outputChunk;
+	}
+
 	if(inpOffset == inpSize) {
 		streamTimestamp = 0.0;
 		streamTimeRatio = 1.0;
@@ -354,7 +437,8 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 
 	if(ioNumberPackets) {
 		AudioChunk *chunk = [AudioChunk new];
-		[chunk setFormat:nodeFormat];
+		nodeFormat = processedFormat;
+		[chunk setFormat:processedFormat];
 		if(nodeChannelConfig) {
 			[chunk setChannelConfig:nodeChannelConfig];
 		}
@@ -402,6 +486,7 @@ static float db_to_scale(float db) {
 - (void)refreshVolumeScaling {
 	if(rgInfo == nil) {
 		volumeScale = 1.0;
+		if(nativePrecisionCandidate) nodeFormat = nativePrecisionFormat;
 		return;
 	}
 
@@ -444,6 +529,9 @@ static float db_to_scale(float db) {
 			scale = 1.0 / peak;
 	}
 	volumeScale = scale;
+	if(nativePrecisionCandidate) {
+		nodeFormat = (volumeScale == 1.0f) ? nativePrecisionFormat : processedFormat;
+	}
 }
 
 - (BOOL)setupWithInputFormat:(AudioStreamBasicDescription)inf withInputConfig:(uint32_t)inputConfig outputFormat:(AudioStreamBasicDescription)outf isLossless:(BOOL)lossless {
@@ -484,14 +572,18 @@ static float db_to_scale(float db) {
 	inpOffset = 0;
 	inpSize = 0;
 
-	// This is a post resampler format
-
-	nodeFormat = floatFormat;
-	nodeFormat.mSampleRate = outputFormat.mSampleRate;
+	// These are the post-resampler formats. High-precision sources keep their
+	// native integer or Float64 representation while the path is transparent;
+	// any active gain or resampling uses the established Float32 processor.
+	processedFormat = floatFormat;
+	processedFormat.mSampleRate = outputFormat.mSampleRate;
+	nativePrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
+	nativePrecisionFormat.mSampleRate = outputFormat.mSampleRate;
 	nodeChannelConfig = inputChannelConfig;
 
 	sampleRatio = (double)outputFormat.mSampleRate / (double)floatFormat.mSampleRate;
 	skipResampler = fabs(sampleRatio - 1.0) < 1e-7;
+	nativePrecisionCandidate = skipResampler && AudioFormatIsHighPrecisionPCM(inputFormat);
 	if(!skipResampler) {
 		soxr_quality_spec_t q_spec = soxr_quality_spec(SOXR_HQ, 0);
 		soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
@@ -521,10 +613,11 @@ static float db_to_scale(float db) {
 	latencyEatenPost = 0;
 	doPStream = NO;
 
+	[self refreshVolumeScaling];
+	nodeFormat = (nativePrecisionCandidate && volumeScale == 1.0f) ? nativePrecisionFormat : processedFormat;
+
 	PrintStreamDesc(&inf);
 	PrintStreamDesc(&nodeFormat);
-
-	[self refreshVolumeScaling];
 
 	// Move this here so process call isn't running the resampler until it's allocated
 	stopping = NO;

@@ -50,7 +50,9 @@
 - (BOOL)fullInit {
 	[mutex lock];
 	if(formatSet) {
-		downmix = [[DownmixProcessor alloc] initWithInputFormat:inputFormat inputConfig:inputChannelConfig andOutputFormat:outputFormat outputConfig:outputChannelConfig];
+		AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat32(inputFormat);
+		AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat32(outputFormat);
+		downmix = [[DownmixProcessor alloc] initWithInputFormat:processingInputFormat inputConfig:inputChannelConfig andOutputFormat:processingOutputFormat outputConfig:outputChannelConfig];
 		if(!downmix) {
 			[mutex unlock];
 			return NO;
@@ -159,7 +161,22 @@
 		return nil;
 	}
 
-	if((formatSet && !downmix) ||
+	const BOOL channelMappingMatches = inputChannelConfig == outputChannelConfig ||
+	                                   (inputFormat.mChannelsPerFrame == 2 &&
+	                                    inputChannelConfig == (AudioChannelSideLeft | AudioChannelSideRight) &&
+	                                    outputChannelConfig == AudioConfigStereo);
+	const BOOL channelProcessingRequired = formatSet &&
+	                                       (inputFormat.mChannelsPerFrame != outputFormat.mChannelsPerFrame ||
+	                                        !channelMappingMatches);
+	if(!channelProcessingRequired) {
+		lastInputFormat = inputFormat;
+		lastInputChannelConfig = inputChannelConfig;
+		[self fullShutdown];
+		[mutex unlock];
+		return [self readChunk:4096];
+	}
+
+	if(!downmix ||
 	   memcmp(&inputFormat, &lastInputFormat, sizeof(inputFormat)) != 0 ||
 	   inputChannelConfig != lastInputChannelConfig) {
 		lastInputFormat = inputFormat;
@@ -187,11 +204,13 @@
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
 	const float *inSamples = (const float *)[sampleData bytes];
+	const AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat32(inputFormat);
+	const AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat32(outputFormat);
 	uint8_t nextDoPMarker = 0x05;
 	if(fabs(inputFormat.mSampleRate - outputFormat.mSampleRate) < 1.0 &&
 	   audioBufferIsDoP(inSamples, inputFormat.mChannelsPerFrame, frameCount, &nextDoPMarker)) {
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:outputFormat];
+		[outputChunk setFormat:processingOutputFormat];
 		if(outputChannelConfig) {
 			[outputChunk setChannelConfig:outputChannelConfig];
 		}
@@ -199,8 +218,8 @@
 		if(chunk.resetForward) outputChunk.resetForward = YES;
 		[outputChunk setStreamTimestamp:streamTimestamp];
 		[outputChunk setStreamTimeRatio:[chunk streamTimeRatio]];
-		if(inputFormat.mChannelsPerFrame == outputFormat.mChannelsPerFrame &&
-		   inputFormat.mBytesPerPacket == outputFormat.mBytesPerPacket) {
+		if(processingInputFormat.mChannelsPerFrame == processingOutputFormat.mChannelsPerFrame &&
+		   processingInputFormat.mBytesPerPacket == processingOutputFormat.mBytesPerPacket) {
 			[outputChunk assignData:sampleData];
 		} else {
 			const size_t inputChannels = inputFormat.mChannelsPerFrame;
@@ -221,7 +240,7 @@
 	[downmix process:inSamples frameCount:frameCount output:&outBuffer[0]];
 
 	AudioChunk *outputChunk = [AudioChunk new];
-	[outputChunk setFormat:outputFormat];
+	[outputChunk setFormat:processingOutputFormat];
 	if(outputChannelConfig) {
 		[outputChunk setChannelConfig:outputChannelConfig];
 	}

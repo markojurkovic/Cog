@@ -56,6 +56,11 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 	float rsDeinterleaveBuffer[32 * 65536];
 }
 
+- (BOOL)processingEnabled {
+	return enableStretch &&
+	       (pitch != 1.0 || tempo != 1.0);
+}
+
 - (id _Nullable)initWithController:(id _Nonnull)c previous:(id _Nullable)p latency:(double)latency {
 	self = [super initWithController:c previous:p latency:latency];
 	if(self) {
@@ -244,7 +249,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 				[self writeChunk:chunk];
 				chunk = nil;
 			}
-			if(!enableStretch && ts) {
+			if(![self processingEnabled] && ts) {
 				[self fullShutdown];
 			} else if(tsapplynewoptions) {
 				[self partialInit];
@@ -279,13 +284,14 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 		return nil;
 	}
 
-	if((enableStretch && !ts) ||
+	const BOOL processingEnabled = [self processingEnabled];
+	if((processingEnabled != (ts != nullptr)) ||
 	   memcmp(&inputFormat, &lastInputFormat, sizeof(inputFormat)) != 0 ||
 	   inputChannelConfig != lastInputChannelConfig) {
 		lastInputFormat = inputFormat;
 		lastInputChannelConfig = inputChannelConfig;
 		[self fullShutdown];
-		if(enableStretch && ![self setup]) {
+		if(processingEnabled && ![self setup]) {
 			[mutex unlock];
 			return nil;
 		}
@@ -322,7 +328,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 			NSData *sampleData = [chunk removeSamples:frameCount];
 			if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 				AudioChunk *outputChunk = [AudioChunk new];
-				[outputChunk setFormat:inputFormat];
+				[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 				if(inputChannelConfig) {
 					[outputChunk setChannelConfig:inputChannelConfig];
 				}
@@ -362,7 +368,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 		NSData *sampleData = [chunk removeSamples:frameCount];
 		if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 			AudioChunk *outputChunk = [AudioChunk new];
-			[outputChunk setFormat:inputFormat];
+			[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
@@ -423,7 +429,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 	AudioChunk *outputChunk = nil;
 	if(samplesBuffered > 0) {
 		outputChunk = [AudioChunk new];
-		[outputChunk setFormat:inputFormat];
+		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

@@ -48,6 +48,7 @@
 
 	BOOL resetProcessed;
 	BOOL doPStream;
+	BOOL nativePrecisionCandidate;
 
 	float volumeScale;
 
@@ -61,6 +62,8 @@
 
 	AudioStreamBasicDescription inputFormat;
 	AudioStreamBasicDescription floatFormat;
+	AudioStreamBasicDescription processedFormat;
+	AudioStreamBasicDescription nativePrecisionFormat;
 	AudioStreamBasicDescription outputFormat;
 
 	uint32_t inputChannelConfig;
