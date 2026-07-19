@@ -431,6 +431,19 @@
 	return paused;
 }
 
+- (BOOL)beginStreamReplacement {
+	if([output beginStreamReplacement]) {
+		[self setEndOfStream:NO];
+		return YES;
+	}
+	return NO;
+}
+
+- (void)finishStreamReplacement {
+	[self setEndOfStream:NO];
+	[output finishStreamReplacement];
+}
+
 - (void)sustainHDCD {
 	[output sustainHDCD];
 }

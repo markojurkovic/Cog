@@ -249,7 +249,7 @@
 
 - (void)initialBufferFilled:(id)sender {
 	DLog(@"INITIAL BUFFER FILLED");
-	[controller launchOutputThread];
+	[controller launchOutputThreadForBufferChain:self];
 }
 
 - (InputNode *)inputNode {

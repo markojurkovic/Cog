@@ -46,6 +46,7 @@ FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityDetailsKey;
 	id delegate;
 
 	BOOL outputLaunched;
+	BOOL streamReplacementPending;
 	BOOL endOfInputReached;
 	BOOL startedPaused;
 	BOOL initialBufferFilled;
@@ -54,6 +55,7 @@ FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityDetailsKey;
 
 	atomic_bool resettingNow;
 	atomic_int refCount;
+	atomic_uint_fast64_t playbackGeneration;
 
 	int currentPlaybackStatus;
 
@@ -124,6 +126,7 @@ FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityDetailsKey;
 - (void)setShouldContinue:(BOOL)s;
 //- (BufferChain *)bufferChain;
 - (void)launchOutputThread;
+- (void)launchOutputThreadForBufferChain:(BufferChain *)chain;
 - (BOOL)selectNextBuffer;
 - (void)endOfInputPlayed;
 - (void)reportPlayCount;

@@ -92,6 +92,7 @@ using std::atomic_long;
 	AVAudioFormat *_deviceFormat;
 
 	AudioDeviceID outputDeviceID;
+	NSMutableDictionary<NSNumber *, NSNumber *> *sampleRateSupportCache;
 	AudioStreamBasicDescription deviceFormat;
 	AudioStreamBasicDescription renderFormat;
 	AudioStreamBasicDescription sourceFormat;
@@ -147,6 +148,8 @@ using std::atomic_long;
 - (void)pause;
 - (void)resume;
 - (void)stop;
+- (BOOL)beginStreamReplacement;
+- (void)finishStreamReplacement;
 
 - (void)fadeOut;
 - (void)fadeOutBackground;

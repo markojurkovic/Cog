@@ -203,6 +203,7 @@ static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
 
 @implementation OutputCoreAudio {
 	VisualizationController *visController;
+	BOOL streamReplacementPending;
 }
 
 static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
@@ -242,6 +243,8 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 		outputController = c;
 		volume = 1.0;
 		outputDeviceID = -1;
+		sampleRateSupportCache = [NSMutableDictionary new];
+		streamReplacementPending = NO;
 
 		secondsHdcdSustained = 0;
 
@@ -428,9 +431,27 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 }
 
 - (BOOL)processEndOfStream {
-	if(stopping || ([outputController endOfStream] == YES && [self signalEndOfStream:[outputController getTotalLatency]])) {
-		stopping = YES;
+	if(stopping) {
 		return YES;
+	}
+	if([outputController endOfStream] != YES) {
+		return NO;
+	}
+
+	// Serialize the final end-of-stream decision with manual replacement. The
+	// old chain may publish EOS after the replacement has already begun; in
+	// that case it must not shut down the retained AUHAL render thread.
+	@synchronized(self) {
+		if(stopping) {
+			return YES;
+		}
+		if(streamReplacementPending || [outputController endOfStream] != YES) {
+			return NO;
+		}
+		if([self signalEndOfStream:[outputController getTotalLatency]]) {
+			stopping = YES;
+			return YES;
+		}
 	}
 	return NO;
 }
@@ -563,6 +584,9 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		}
 
 		outputdevicechanged = NO;
+		@synchronized(sampleRateSupportCache) {
+			[sampleRateSupportCache removeAllObjects];
+		}
 
 		if(outputDeviceID != deviceID) {
 			if(currentdevicelistenerapplied) {
@@ -876,6 +900,14 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)deviceSupportsSampleRate:(double)sampleRate {
+	NSNumber *cacheKey = @(sampleRate);
+	@synchronized(sampleRateSupportCache) {
+		NSNumber *cached = sampleRateSupportCache[cacheKey];
+		if(cached) {
+			return [cached boolValue];
+		}
+	}
+
 	AudioObjectPropertyAddress theAddress = {
 		.mSelector = kAudioDevicePropertyAvailableNominalSampleRates,
 		.mScope = kAudioObjectPropertyScopeGlobal,
@@ -909,6 +941,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	}
 
 	free(ranges);
+	@synchronized(sampleRateSupportCache) {
+		sampleRateSupportCache[cacheKey] = @(supported);
+	}
 	return supported;
 }
 
@@ -953,7 +988,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	return NO;
 }
 
-- (BOOL)updateDeviceFormatNotifyingController:(BOOL)notifyController {
+- (BOOL)updateDeviceFormatLockedNotifyingController:(BOOL)notifyController {
 	AVAudioFormat *format = _au.outputBusses[0].format;
 	if(!format) {
 		return NO;
@@ -1092,6 +1127,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	return YES;
 }
 
+- (BOOL)updateDeviceFormatNotifyingController:(BOOL)notifyController {
+	@synchronized(self) {
+		return [self updateDeviceFormatLockedNotifyingController:notifyController];
+	}
+}
+
 - (BOOL)updateDeviceFormat {
 	return [self updateDeviceFormatNotifyingController:YES];
 }
@@ -1110,13 +1151,29 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
+	const uint32_t inputChannelConfig = [outputController currentInputChannelConfig];
+	const BOOL inputFormatValid = inputFormat.mFormatID != 0 &&
+	                              inputFormat.mSampleRate > 0.0 &&
+	                              inputFormat.mBitsPerChannel > 0 &&
+	                              inputFormat.mChannelsPerFrame > 0;
+	const BOOL sameInputFormat = sourceFormatValid && inputFormatValid &&
+	                             sourceChannelConfig == inputChannelConfig &&
+	                             memcmp(&sourceFormat, &inputFormat, sizeof(inputFormat)) == 0;
+
 	sourceFormat = inputFormat;
-	sourceChannelConfig = [outputController currentInputChannelConfig];
-	sourceFormatValid = inputFormat.mFormatID != 0 &&
-	                    inputFormat.mSampleRate > 0.0 &&
-	                    inputFormat.mBitsPerChannel > 0 &&
-	                    inputFormat.mChannelsPerFrame > 0;
+	sourceChannelConfig = inputChannelConfig;
+	sourceFormatValid = inputFormatValid;
 	hdcdDetected = NO;
+
+	// Keep AUHAL and the DAC clock untouched when the replacement stream has
+	// exactly the same source format. The output path was already negotiated
+	// for this representation, and fadeOutBackground has replaced its buffers.
+	if(sameInputFormat && _au && !outputdevicechanged) {
+		DLog(@"Input format unchanged; retaining AUHAL and the current device clock");
+		[faderNode setDoPMode:renderFormatDoPInteger];
+		[self refreshOutputStatus];
+		return YES;
+	}
 
 	const BOOL highPrecisionPCM = AudioFormatIsHighPrecisionPCM(inputFormat);
 	const BOOL usesDoPCarrier = !highPrecisionPCM && inputFormatUsesDoPCarrierRate(inputFormat);
@@ -1152,7 +1209,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				return NO;
 			}
 			outputdevicechanged = YES;
-			return [self updateDeviceFormatNotifyingController:NO];
+			BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
+			if(prepared) {
+				outputdevicechanged = NO;
+			}
+			return prepared;
 		}
 
 		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
@@ -1173,6 +1234,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	outputdevicechanged = YES;
 	BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
 	if(prepared) {
+		outputdevicechanged = NO;
 		[faderNode setDoPMode:YES];
 	}
 	return prepared;
@@ -1513,6 +1575,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		running = NO;
 		stopping = NO;
 		stopped = NO;
+		streamReplacementPending = NO;
 		paused = NO;
 		outputDeviceID = -1;
 		restarted = NO;
@@ -1613,7 +1676,13 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 - (void)updateLatency:(double)secondsPlayed {
 	double visLatency = [outputController getVisLatency];
 	double fullLatency = [outputController getTotalLatency];
-	if(secondsPlayed > 0) {
+	// A manual replacement reuses this Core Audio output while the outgoing
+	// render callback may still be completing. Do not let its final timestamp
+	// repopulate the new track's position after AudioPlayer reset it to zero;
+	// a concurrent device-format notification would otherwise seek the new
+	// decoder to that stale position (for example, 15 seconds into PCM after
+	// switching from a DSD track played for 15 seconds).
+	if(secondsPlayed > 0 && !streamReplacementPending) {
 		[outputController setAmountPlayed:streamTimestamp];
 	}
 	[visController postLatency:visLatency];
@@ -1640,6 +1709,22 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 - (void)stop {
 	commandStop = YES;
 	[self doStop];
+}
+
+- (BOOL)beginStreamReplacement {
+	@synchronized(self) {
+		if(_au == nil || !running || stopping || stopped || stopInvoked || streamReplacementPending) {
+			return NO;
+		}
+		streamReplacementPending = YES;
+		return YES;
+	}
+}
+
+- (void)finishStreamReplacement {
+	@synchronized(self) {
+		streamReplacementPending = NO;
+	}
 }
 
 - (void)doStop {
@@ -1899,6 +1984,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)faderFadeIn {
 	[self stopIdle];
+	// Stream replacement fades the new input at the DSP fader. Make sure the
+	// separate final-output fade gate is open as well: a DSD pause completes
+	// that gate as a hard fade, and reusing the output without clearing it
+	// otherwise leaves AUHAL running while it emits only carrier silence.
+	fadeLevel = 1.0f;
+	fadeTarget = 1.0f;
+	fadeStep = 0.0f;
+	fading = NO;
+	faded = NO;
 	if(playbackFadesEnabled() || doPActive) {
 		[faderNode fadeIn];
 	} else {

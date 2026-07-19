@@ -87,6 +87,8 @@
 - (void)resume;
 
 - (BOOL)isPaused;
+- (BOOL)beginStreamReplacement;
+- (void)finishStreamReplacement;
 
 - (void)sustainHDCD;
 

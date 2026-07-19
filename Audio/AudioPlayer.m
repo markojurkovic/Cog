@@ -44,6 +44,7 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		output = NULL;
 		bufferChain = nil;
 		outputLaunched = NO;
+		streamReplacementPending = NO;
 		endOfInputReached = NO;
 		stoppedRecently = NO;
 
@@ -57,6 +58,7 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 
 		atomic_init(&resettingNow, false);
 		atomic_init(&refCount, 0);
+		atomic_init(&playbackGeneration, 0);
 	}
 
 	return self;
@@ -96,9 +98,31 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 	ALog(@"Opening file for playback: %@ at seek offset %f%@", url, time, (paused) ? @", starting paused" : @"");
 
 	[self waitUntilCallbacksExit];
-	if(output) {
-		[output fadeOutBackground];
+	// Atomically claim a live output before its old chain can turn an empty
+	// buffer into a natural stop while the replacement decoder is being opened.
+	BOOL reusingOutput = outputLaunched && [output beginStreamReplacement];
+	if(output && !reusingOutput) {
+		[output setShouldContinue:NO];
+		[output close];
+		output = nil;
+		outputLaunched = NO;
 	}
+	streamReplacementPending = reusingOutput;
+	BOOL outputWasLaunched = reusingOutput && outputLaunched;
+	BOOL outputWasPaused = currentPlaybackStatus == CogStatusPaused;
+	if(reusingOutput) {
+		DLog(@"Reusing the active Core Audio output for the replacement stream");
+		[output fadeOutBackground];
+		if(outputWasLaunched) {
+			// Keep a DoP DAC locked with valid carrier silence until the
+			// replacement stream supplies a verified carrier frame.
+			[output beginSeek];
+		}
+	}
+	// Invalidates a natural-stop block queued by the previous stream, including
+	// one that raced with the handoff above. Such blocks execute on this thread
+	// only after the synchronous replacement operation returns.
+	atomic_fetch_add(&playbackGeneration, 1);
 	BOOL shouldFadeIn = resumeInterval || stoppedRecently || !output;
 	if(!output) {
 		output = [[OutputNode alloc] initWithController:self previous:nil];
@@ -107,6 +131,13 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		}
 	}
 	[output setVolume:volume];
+	if(!resumeInterval) {
+		// A reused output node still carries the previous track's position.
+		// Format negotiation may synchronously use that position to realign the
+		// new input; for a shorter cue-sheet fragment, this becomes an invalid
+		// seek and leaves a false error marker even though playback starts at 0.
+		[output resetAmountPlayed];
+	}
 	@synchronized(chainQueue) {
 		for(id anObject in chainQueue) {
 			[anObject setShouldContinue:NO];
@@ -147,11 +178,13 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		[self requestNextStream:userInfo];
 
 		if([nextStream isEqualTo:url]) {
+			[self stop];
 			return;
 		}
 
 		url = nextStream;
 		if(url == nil) {
+			[self stop];
 			return;
 		}
 
@@ -173,10 +206,10 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 	}
 
 	[self setShouldContinue:YES];
-
-	if(!resumeInterval) {
+	if(!outputWasLaunched) {
 		outputLaunched = NO;
 	}
+
 	startedPaused = paused;
 	initialBufferFilled = NO;
 	previousUserInfo = userInfo;
@@ -184,16 +217,24 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 	[bufferChain launchThreads];
 
 	if(paused) {
+		if(outputWasLaunched && !outputWasPaused) {
+			[output pause];
+		}
+		if(reusingOutput) {
+			[output faderFadeIn];
+		}
 		[self setPlaybackStatus:CogStatusPaused waitUntilDone:YES];
 		if(time > 0.0) {
 			[self updatePosition:userInfo];
 		}
-	} else if(shouldFadeIn) {
+	} else if(reusingOutput || shouldFadeIn) {
 		[output faderFadeIn];
 	}
 }
 
 - (void)stop {
+	atomic_fetch_add(&playbackGeneration, 1);
+
 	// Set shouldoContinue to NO on all things
 	[self setShouldContinue:NO];
 	[self setPlaybackStatus:CogStatusStopped waitUntilDone:YES];
@@ -213,6 +254,8 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		[output close];
 	}
 	output = nil;
+	outputLaunched = NO;
+	streamReplacementPending = NO;
 	stoppedRecently = YES;
 
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
@@ -361,11 +404,39 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 }
 
 - (void)launchOutputThread {
+	[self launchOutputThreadForBufferChain:bufferChain];
+}
+
+- (void)launchOutputThreadForBufferChain:(BufferChain *)chain {
+	// A superseded input thread can finish prebuffering after a manual track
+	// change. It must not release the new stream's EOS guard or start its output.
+	if(chain != bufferChain) {
+		return;
+	}
+
 	initialBufferFilled = YES;
+	BOOL finishingStreamReplacement = streamReplacementPending;
 	if(outputLaunched == NO && startedPaused == NO) {
 		[self setPlaybackStatus:CogStatusPlaying];
 		[output launchThread];
 		outputLaunched = YES;
+	} else if(outputLaunched && startedPaused == NO &&
+	          (finishingStreamReplacement || currentPlaybackStatus == CogStatusPaused)) {
+		// Core Audio can be stopped underneath a still-Playing logical status
+		// during a replacement. Reassert the hardware start after prebuffering;
+		// this is the same operation that made Pause followed by Play recover.
+		[output resume];
+		if(currentPlaybackStatus != CogStatusPlaying) {
+			[self setPlaybackStatus:CogStatusPlaying];
+		}
+	}
+	if(finishingStreamReplacement) {
+		// Keep the outgoing stream's late EOS from stopping the retained output
+		// until the replacement has produced data and its hardware is running.
+		// finishStreamReplacement also clears any stale EOS marker before making
+		// it observable again.
+		[output finishStreamReplacement];
+		streamReplacementPending = NO;
 	}
 }
 
@@ -611,8 +682,12 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 - (void)schedulePlaybackStopAfterOutputLatency {
 	double latency = 0;
 	if(output) latency = [output latency];
+	uint_fast64_t scheduledGeneration = atomic_load(&playbackGeneration);
 
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, latency * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		if(atomic_load(&self->playbackGeneration) != scheduledGeneration) {
+			return;
+		}
 		[self stop];
 
 		self->bufferChain = nil;
