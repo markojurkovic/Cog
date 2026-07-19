@@ -72,6 +72,9 @@
 - (uint32_t)deviceChannelConfig;
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat;
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat;
+- (uint32_t)currentInputChannelConfig;
+- (BOOL)currentConverterAppliesVolumeScaling;
+- (void)refreshOutputStatus;
 
 - (double)volume;
 - (void)setVolume:(double)v;

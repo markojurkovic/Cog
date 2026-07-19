@@ -21,6 +21,12 @@
 @class BufferChain;
 @class OutputNode;
 
+FOUNDATION_EXPORT NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification;
+FOUNDATION_EXPORT NSString *const CogCoreAudioOutputFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioDeviceFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityLosslessKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityDetailsKey;
+
 @interface AudioPlayer : NSObject {
 	BufferChain *bufferChain;
 	OutputNode *output;

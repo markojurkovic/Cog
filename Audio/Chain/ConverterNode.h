@@ -93,4 +93,6 @@
 
 - (void)refreshVolumeScaling;
 
+- (BOOL)appliesVolumeScaling;
+
 @end

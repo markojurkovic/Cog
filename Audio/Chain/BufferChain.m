@@ -209,6 +209,14 @@
 - (void)setRGInfo:(NSDictionary *)rgi {
 	rgInfo = rgi;
 	[converterNode setRGInfo:rgi];
+
+	// Initial output preparation happens before the converter receives the
+	// track's ReplayGain information. Refresh only for the active chain; queued
+	// preload chains must not replace the status for the track being heard.
+	AudioPlayer *audioPlayer = controller;
+	if([audioPlayer bufferChain] == self) {
+		[[audioPlayer output] refreshOutputStatus];
+	}
 }
 
 - (NSDictionary *)rgInfo {

@@ -7,6 +7,7 @@
 //
 
 #import "OutputCoreAudio.h"
+#import "AudioChunk.h"
 #import "OutputNode.h"
 
 #ifdef _DEBUG
@@ -30,9 +31,174 @@ extern void scale_by_volume(float *buffer, size_t count, float volume);
 
 static NSNotificationName CogPlaybackDidBeginNotificiation = @"CogPlaybackDidBeginNotificiation";
 
+NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification = @"CogCoreAudioOutputFormatDidChangeNotification";
+NSString *const CogCoreAudioOutputFormatDescriptionKey = @"CogCoreAudioOutputFormatDescription";
+NSString *const CogCoreAudioDeviceFormatDescriptionKey = @"CogCoreAudioDeviceFormatDescription";
+NSString *const CogCoreAudioSignalIntegrityLosslessKey = @"CogCoreAudioSignalIntegrityLossless";
+NSString *const CogCoreAudioSignalIntegrityDetailsKey = @"CogCoreAudioSignalIntegrityDetails";
+
 static BOOL playbackFadesEnabled(void) {
 	NSNumber *enabled = [[NSUserDefaults standardUserDefaults] objectForKey:@"enableFading"];
 	return !enabled || [enabled boolValue];
+}
+
+static NSArray<NSString *> *signalIntegrityPreferenceKeyPaths(void) {
+	static NSArray<NSString *> *keyPaths;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		keyPaths = @[
+			@"values.volumeScaling",
+			@"values.enableFading",
+			@"values.enableHDCD",
+			@"values.GraphicEQenable",
+			@"values.enableHrtf",
+			@"values.enableFSurround",
+			@"values.pitch",
+			@"values.tempo",
+			@"values.rubberbandEngine",
+		];
+	});
+	return keyPaths;
+}
+
+static BOOL pcmRepresentationPreservesSamples(AudioStreamBasicDescription source,
+                                               AudioStreamBasicDescription destination) {
+	if(source.mFormatID != kAudioFormatLinearPCM ||
+	   destination.mFormatID != kAudioFormatLinearPCM ||
+	   !source.mBitsPerChannel || !destination.mBitsPerChannel) {
+		return NO;
+	}
+
+	const BOOL sourceIsFloat = !!(source.mFormatFlags & kAudioFormatFlagIsFloat);
+	const BOOL destinationIsFloat = !!(destination.mFormatFlags & kAudioFormatFlagIsFloat);
+	if(sourceIsFloat) {
+		// Arbitrary floating-point samples are not generally integer-grid values.
+		return destinationIsFloat && destination.mBitsPerChannel >= source.mBitsPerChannel;
+	}
+
+	if(destinationIsFloat) {
+		const UInt32 significandBits = destination.mBitsPerChannel == 32 ? 24 :
+		                               destination.mBitsPerChannel == 64 ? 53 : 0;
+		return significandBits >= source.mBitsPerChannel;
+	}
+
+	return destination.mBitsPerChannel >= source.mBitsPerChannel;
+}
+
+static BOOL channelMappingPreservesSamples(AudioStreamBasicDescription source,
+                                           uint32_t sourceConfig,
+                                           AudioStreamBasicDescription destination,
+                                           uint32_t destinationConfig) {
+	if(source.mChannelsPerFrame != destination.mChannelsPerFrame) {
+		return NO;
+	}
+
+	// Decoder metadata may omit a channel mask even though AudioChunk assigns
+	// the conventional layout from the channel count before playback. Compare
+	// the effective layouts used by the audio chain, not the raw missing mask.
+	if(!sourceConfig) {
+		sourceConfig = [AudioChunk guessChannelConfig:source.mChannelsPerFrame];
+	}
+	if(!destinationConfig) {
+		destinationConfig = [AudioChunk guessChannelConfig:destination.mChannelsPerFrame];
+	}
+
+	return sourceConfig == destinationConfig ||
+	       (source.mChannelsPerFrame == 2 &&
+	        sourceConfig == (AudioChannelSideLeft | AudioChannelSideRight) &&
+	        destinationConfig == AudioConfigStereo);
+}
+
+static NSString *outputSampleRateDescription(double sampleRate) {
+	if(sampleRate >= 1000.0) {
+		const double sampleRateKHz = sampleRate / 1000.0;
+		if(fabs(sampleRateKHz - round(sampleRateKHz)) < 0.0001) {
+			return [NSString stringWithFormat:@"%.0f kHz", sampleRateKHz];
+		}
+		return [NSString stringWithFormat:@"%.1f kHz", sampleRateKHz];
+	}
+	return [NSString stringWithFormat:@"%.0f Hz", sampleRate];
+}
+
+static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOOL isDoP) {
+	NSString *formatName;
+	if(isDoP) {
+		formatName = @"DoP";
+	} else if(format.mFormatID == kAudioFormatLinearPCM) {
+		if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+			formatName = [NSString stringWithFormat:@"Float%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else if(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+			formatName = [NSString stringWithFormat:@"Int%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else {
+			formatName = [NSString stringWithFormat:@"UInt%u PCM", (unsigned int)format.mBitsPerChannel];
+		}
+	} else {
+		formatName = @"Core Audio";
+	}
+
+	const BOOL nonInterleaved = !!(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+	const UInt32 bytesPerSample = nonInterleaved ? format.mBytesPerFrame :
+	                                              (format.mChannelsPerFrame ? format.mBytesPerFrame / format.mChannelsPerFrame : 0);
+	const UInt32 containerBits = bytesPerSample * 8;
+	NSString *bitDepthDescription;
+	if(containerBits > format.mBitsPerChannel) {
+		bitDepthDescription = [NSString stringWithFormat:@"%u-bit (%u-bit container)",
+		                                                      (unsigned int)format.mBitsPerChannel,
+		                                                      (unsigned int)containerBits];
+	} else {
+		bitDepthDescription = [NSString stringWithFormat:@"%u-bit", (unsigned int)format.mBitsPerChannel];
+	}
+
+	return [NSString stringWithFormat:@"%@ · %@ · %@",
+	                                  formatName,
+	                                  outputSampleRateDescription(format.mSampleRate),
+	                                  bitDepthDescription];
+}
+
+static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
+	if(deviceID == kAudioObjectUnknown || deviceID == (AudioDeviceID)-1) {
+		return nil;
+	}
+
+	AudioObjectPropertyAddress streamsAddress = {
+		.mSelector = kAudioDevicePropertyStreams,
+		.mScope = kAudioDevicePropertyScopeOutput,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 streamsSize = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(deviceID, &streamsAddress, 0, NULL, &streamsSize);
+	if(status != noErr || streamsSize < sizeof(AudioStreamID)) {
+		return nil;
+	}
+
+	AudioStreamID *streams = (AudioStreamID *)malloc(streamsSize);
+	if(!streams) {
+		return nil;
+	}
+	status = AudioObjectGetPropertyData(deviceID, &streamsAddress, 0, NULL, &streamsSize, streams);
+	if(status != noErr) {
+		free(streams);
+		return nil;
+	}
+
+	NSMutableOrderedSet<NSString *> *descriptions = [NSMutableOrderedSet orderedSet];
+	const UInt32 streamCount = streamsSize / (UInt32)sizeof(AudioStreamID);
+	AudioObjectPropertyAddress formatAddress = {
+		.mSelector = kAudioStreamPropertyPhysicalFormat,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	for(UInt32 i = 0; i < streamCount; ++i) {
+		AudioStreamBasicDescription format = { 0 };
+		UInt32 formatSize = sizeof(format);
+		status = AudioObjectGetPropertyData(streams[i], &formatAddress, 0, NULL, &formatSize, &format);
+		if(status == noErr && formatSize == sizeof(format) && format.mFormatID) {
+			[descriptions addObject:outputFormatDescription(format, NO)];
+		}
+	}
+	free(streams);
+
+	return descriptions.count ? [[descriptions array] componentsJoinedByString:@" / "] : nil;
 }
 
 @implementation OutputCoreAudio {
@@ -90,6 +256,109 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 	return self;
 }
 
+- (NSDictionary *)signalIntegrityInfo {
+	if(!sourceFormatValid) {
+		return @{
+			CogCoreAudioSignalIntegrityDetailsKey: NSLocalizedString(@"Source sample information is not available.", @"Unknown Cog signal-integrity details")
+		};
+	}
+
+	NSMutableArray<NSString *> *reasons = [NSMutableArray array];
+	const BOOL sourceIsDSD = sourceFormat.mBitsPerChannel == 1;
+	if(sourceIsDSD) {
+		if(!renderFormatDoPInteger) {
+			[reasons addObject:NSLocalizedString(@"DSD-to-PCM conversion", @"Cog signal-integrity modification reason")];
+		}
+		if(sourceFormat.mChannelsPerFrame != renderFormat.mChannelsPerFrame) {
+			[reasons addObject:NSLocalizedString(@"channel conversion", @"Cog signal-integrity modification reason")];
+		}
+	} else {
+		if(fabs(sourceFormat.mSampleRate - renderFormat.mSampleRate) >= 0.5) {
+			[reasons addObject:[NSString stringWithFormat:NSLocalizedString(@"resampling from %@ to %@", @"Cog signal-integrity resampling reason"),
+			                                                    outputSampleRateDescription(sourceFormat.mSampleRate),
+			                                                    outputSampleRateDescription(renderFormat.mSampleRate)]];
+		}
+		if(!channelMappingPreservesSamples(sourceFormat,
+		                                  sourceChannelConfig,
+		                                  renderFormat,
+		                                  deviceChannelConfig)) {
+			[reasons addObject:NSLocalizedString(@"channel-layout conversion", @"Cog signal-integrity modification reason")];
+		}
+		if(!pcmRepresentationPreservesSamples(sourceFormat, renderFormat)) {
+			[reasons addObject:NSLocalizedString(@"sample-format precision reduction", @"Cog signal-integrity modification reason")];
+		}
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		if([outputController currentConverterAppliesVolumeScaling]) {
+			[reasons addObject:NSLocalizedString(@"ReplayGain or tagged volume scaling", @"Cog signal-integrity modification reason")];
+		}
+		if(volume != 1.0f) {
+			[reasons addObject:NSLocalizedString(@"Cog volume is not 100%", @"Cog signal-integrity modification reason")];
+		}
+		if(playbackFadesEnabled()) {
+			[reasons addObject:NSLocalizedString(@"transition fading is enabled", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"GraphicEQenable"]) {
+			[reasons addObject:NSLocalizedString(@"equalizer processing", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"enableHrtf"]) {
+			[reasons addObject:NSLocalizedString(@"HRTF processing", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"enableFSurround"] && sourceFormat.mChannelsPerFrame == 2) {
+			[reasons addObject:NSLocalizedString(@"FreeSurround processing", @"Cog signal-integrity modification reason")];
+		}
+
+		NSNumber *pitchSetting = [defaults objectForKey:@"pitch"];
+		NSNumber *tempoSetting = [defaults objectForKey:@"tempo"];
+		const double pitch = pitchSetting ? [pitchSetting doubleValue] : 1.0;
+		const double tempo = tempoSetting ? [tempoSetting doubleValue] : 1.0;
+		NSString *stretchEngine = [defaults stringForKey:@"rubberbandEngine"];
+		if(![stretchEngine isEqualToString:@"disabled"] &&
+		   (fabs(pitch - 1.0) >= 1e-7 || fabs(tempo - 1.0) >= 1e-7)) {
+			[reasons addObject:NSLocalizedString(@"time or pitch processing", @"Cog signal-integrity modification reason")];
+		}
+		if(hdcdDetected && [defaults boolForKey:@"enableHDCD"]) {
+			[reasons addObject:NSLocalizedString(@"HDCD decoding", @"Cog signal-integrity modification reason")];
+		}
+	}
+
+	const BOOL lossless = reasons.count == 0;
+	NSString *details;
+	if(lossless) {
+		details = NSLocalizedString(@"Decoded source sample values are preserved through Cog; representation-only changes may still be shown.", @"Lossless Cog signal-integrity details");
+	} else {
+		details = [NSString stringWithFormat:NSLocalizedString(@"Cog changes the decoded source samples: %@.", @"Modified Cog signal-integrity details"),
+		                                           [reasons componentsJoinedByString:@"; "]];
+	}
+	return @{
+		CogCoreAudioSignalIntegrityLosslessKey: @(lossless),
+		CogCoreAudioSignalIntegrityDetailsKey: details,
+	};
+}
+
+- (void)postOutputFormatDescription:(NSString *)description {
+	NSDictionary *userInfo = nil;
+	if(description) {
+		NSString *deviceDescription = physicalOutputFormatDescription(outputDeviceID);
+		NSMutableDictionary *formatInfo = [@{ CogCoreAudioOutputFormatDescriptionKey: description } mutableCopy];
+		[formatInfo addEntriesFromDictionary:[self signalIntegrityInfo]];
+		if(deviceDescription) {
+			formatInfo[CogCoreAudioDeviceFormatDescriptionKey] = deviceDescription;
+		}
+		userInfo = formatInfo;
+	}
+	dispatch_block_t postNotification = ^{
+		[[NSNotificationCenter defaultCenter] postNotificationName:CogCoreAudioOutputFormatDidChangeNotification
+		                                                    object:self
+		                                                  userInfo:userInfo];
+	};
+	if([NSThread isMainThread]) {
+		postNotification();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), postNotification);
+	}
+}
+
 static OSStatus
 default_device_changed(AudioObjectID inObjectID, UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses, void *inUserData) {
 	OutputCoreAudio *_self = (__bridge OutputCoreAudio *)inUserData;
@@ -132,6 +401,14 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			else
 				[self resume];
 		}
+	} else if([signalIntegrityPreferenceKeyPaths() containsObject:keyPath]) {
+		// ConverterNode and the DSP nodes observe the same preferences. Defer the
+		// refresh by one main-queue turn so their active state is updated first.
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if(!self->stopping) {
+				[self refreshOutputStatus];
+			}
+		});
 	}
 }
 
@@ -798,13 +1075,20 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		if(started) {
 			[_au startHardwareAndReturnError:&err];
-			if(err != nil)
+			if(err != nil) {
+				resetting = NO;
 				return NO;
+			}
 		}
 
 		resetting = NO;
 	}
 
+	// Logical tracks from the same source (for example, adjacent entries in a
+	// cue sheet) normally keep the existing AUHAL format. Re-publish it after
+	// every successful preparation so a track transition cannot leave a stale
+	// stopped-state indication merely because no hardware format changed.
+	[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
 	return YES;
 }
 
@@ -826,6 +1110,14 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
+	sourceFormat = inputFormat;
+	sourceChannelConfig = [outputController currentInputChannelConfig];
+	sourceFormatValid = inputFormat.mFormatID != 0 &&
+	                    inputFormat.mSampleRate > 0.0 &&
+	                    inputFormat.mBitsPerChannel > 0 &&
+	                    inputFormat.mChannelsPerFrame > 0;
+	hdcdDetected = NO;
+
 	const BOOL highPrecisionPCM = AudioFormatIsHighPrecisionPCM(inputFormat);
 	const BOOL usesDoPCarrier = !highPrecisionPCM && inputFormatUsesDoPCarrierRate(inputFormat);
 	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
@@ -866,6 +1158,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
 			return [self updateDeviceFormatNotifyingController:NO];
 		}
+		[self refreshOutputStatus];
 		return YES;
 	}
 
@@ -883,6 +1176,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		[faderNode setDoPMode:YES];
 	}
 	return prepared;
+}
+
+- (void)refreshOutputStatus {
+	if(renderFormat.mFormatID) {
+		[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
+	}
 }
 
 - (void)updateStreamFormat {
@@ -1224,6 +1523,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		renderFormatNativeHighPrecision = NO;
 		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		bzero(&renderFormat, sizeof(renderFormat));
+		bzero(&sourceFormat, sizeof(sourceFormat));
+		sourceChannelConfig = 0;
+		sourceFormatValid = NO;
+		hdcdDetected = NO;
 
 		cutOffInput = NO;
 		fadeTarget = 1.0f;
@@ -1297,6 +1600,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.outputDevice" options:0 context:kOutputCoreAudioContext];
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.suspendOutputOnPause" options:0 context:kOutputCoreAudioContext];
+		for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
+			[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:keyPath options:0 context:kOutputCoreAudioContext];
+		}
 
 		observersapplied = YES;
 		
@@ -1320,6 +1626,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)setVolume:(double)v {
 	volume = v * 0.01f;
+	[self refreshOutputStatus];
 }
 
 - (double)latency {
@@ -1345,6 +1652,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(observersapplied) {
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.outputDevice" context:kOutputCoreAudioContext];
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.suspendOutputOnPause" context:kOutputCoreAudioContext];
+			for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
+				[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:keyPath context:kOutputCoreAudioContext];
+			}
 			observersapplied = NO;
 		}
 		stopping = YES;
@@ -1446,6 +1756,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		}
 		prebufferReached = NO;
 		prebufferSignaled = NO;
+		[self postOutputFormatDescription:nil];
 		stopCompleted = YES;
 	}
 }
@@ -1475,6 +1786,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)sustainHDCD {
 	secondsHdcdSustained = 10.0;
+	if(!hdcdDetected) {
+		hdcdDetected = YES;
+		[self refreshOutputStatus];
+	}
 }
 
 - (void)setShouldPlayOutBuffer:(BOOL)s {

@@ -94,12 +94,16 @@ using std::atomic_long;
 	AudioDeviceID outputDeviceID;
 	AudioStreamBasicDescription deviceFormat;
 	AudioStreamBasicDescription renderFormat;
+	AudioStreamBasicDescription sourceFormat;
 	AudioStreamBasicDescription realStreamFormat; // stream format pre-hrtf
 	AudioStreamBasicDescription streamFormat; // stream format last seen in render callback
 
 	uint32_t deviceChannelConfig;
+	uint32_t sourceChannelConfig;
 	uint32_t realStreamChannelConfig;
 	uint32_t streamChannelConfig;
+	BOOL sourceFormatValid;
+	BOOL hdcdDetected;
 
 	BOOL preferDoPIntegerOutput;
 	BOOL renderFormatDoPInteger;
@@ -165,6 +169,7 @@ using std::atomic_long;
 - (uint32_t)deviceChannelConfig;
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat;
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat;
+- (void)refreshOutputStatus;
 
 - (DSPDownmixNode *)downmix;
 - (DSPFaderNode *)fader;

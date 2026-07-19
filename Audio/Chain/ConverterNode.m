@@ -534,6 +534,13 @@ static float db_to_scale(float db) {
 	}
 }
 
+- (BOOL)appliesVolumeScaling {
+	// Before setup, inputFormat is empty and volumeScale has not been
+	// initialized yet. Treat that as unknown/no scaling; BufferChain refreshes
+	// the output status after the converter and ReplayGain information are set.
+	return inputFormat.mFormatID != 0 && volumeScale != 1.0f;
+}
+
 - (BOOL)setupWithInputFormat:(AudioStreamBasicDescription)inf withInputConfig:(uint32_t)inputConfig outputFormat:(AudioStreamBasicDescription)outf isLossless:(BOOL)lossless {
 	// Make the converter
 	[mutex lock];
