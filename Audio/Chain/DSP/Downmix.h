@@ -15,6 +15,11 @@
 
 	uint32_t inConfig;
 	uint32_t outConfig;
+
+	double *inputScratch;
+	double *outputScratch;
+	size_t inputScratchCapacity;
+	size_t outputScratchCapacity;
 }
 
 - (id)initWithInputFormat:(AudioStreamBasicDescription)inf inputConfig:(uint32_t)iConfig andOutputFormat:(AudioStreamBasicDescription)outf outputConfig:(uint32_t)oConfig;

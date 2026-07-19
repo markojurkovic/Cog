@@ -29,7 +29,7 @@
 	uint32_t lastInputChannelConfig, inputChannelConfig;
 	uint32_t outputChannelConfig;
 
-	float outBuffer[4096 * 32];
+	double outBuffer[4096 * 32];
 }
 
 - (id _Nullable)initWithController:(id _Nonnull)c previous:(id _Nullable)p latency:(double)latency {
@@ -50,8 +50,8 @@
 - (BOOL)fullInit {
 	[mutex lock];
 	if(formatSet) {
-		AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat32(inputFormat);
-		AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat32(outputFormat);
+		AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat64(inputFormat);
+		AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat64(outputFormat);
 		downmix = [[DownmixProcessor alloc] initWithInputFormat:processingInputFormat inputConfig:inputChannelConfig andOutputFormat:processingOutputFormat outputConfig:outputChannelConfig];
 		if(!downmix) {
 			[mutex unlock];
@@ -193,7 +193,7 @@
 		return [self readChunk:4096];
 	}
 
-	AudioChunk *chunk = [self readChunkAsFloat32:4096];
+	AudioChunk *chunk = [self readChunkAsFloat64:4096];
 	if(!chunk || ![chunk frameCount]) {
 		[mutex unlock];
 		return nil;
@@ -203,12 +203,12 @@
 
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
-	const float *inSamples = (const float *)[sampleData bytes];
-	const AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat32(inputFormat);
-	const AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat32(outputFormat);
+	const double *inSamples = (const double *)[sampleData bytes];
+	const AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat64(inputFormat);
+	const AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat64(outputFormat);
 	uint8_t nextDoPMarker = 0x05;
 	if(fabs(inputFormat.mSampleRate - outputFormat.mSampleRate) < 1.0 &&
-	   audioBufferIsDoP(inSamples, inputFormat.mChannelsPerFrame, frameCount, &nextDoPMarker)) {
+	   audioBufferIsDoP64(inSamples, inputFormat.mChannelsPerFrame, frameCount, &nextDoPMarker)) {
 		AudioChunk *outputChunk = [AudioChunk new];
 		[outputChunk setFormat:processingOutputFormat];
 		if(outputChannelConfig) {
@@ -227,9 +227,9 @@
 			const size_t channelsToCopy = MIN(inputChannels, outputChannels);
 			const uint8_t firstMarker = (frameCount % 2) ? ((nextDoPMarker == 0x05) ? 0xFA : 0x05) : nextDoPMarker;
 			uint8_t marker = firstMarker;
-			fillDoPSilence(&outBuffer[0], outputChannels, frameCount, &marker);
+			fillDoPSilence64(&outBuffer[0], outputChannels, frameCount, &marker);
 			for(size_t frame = 0; frame < frameCount; ++frame) {
-				memcpy(&outBuffer[frame * outputChannels], &inSamples[frame * inputChannels], channelsToCopy * sizeof(float));
+				memcpy(&outBuffer[frame * outputChannels], &inSamples[frame * inputChannels], channelsToCopy * sizeof(double));
 			}
 			[outputChunk assignSamples:&outBuffer[0] frameCount:frameCount];
 		}

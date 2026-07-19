@@ -51,12 +51,12 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 
 	float *rsPtrs[32];
 	float rsInBuffer[4096 * 32];
-	float rsOutBuffer[65536 * 32];
+	double rsOutBuffer[65536 * 32];
 }
 
 - (BOOL)processingEnabled {
 	// Selecting an engine is not itself an effect. At unity pitch and tempo,
-	// bypass it so inactive playback remains a byte-for-byte float copy.
+	// bypass it so inactive playback remains a byte-for-byte copy.
 	return enableRubberband &&
 	       (pitch != 1.0 || tempo != 1.0);
 }
@@ -477,7 +477,7 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 	int channels = (int)(inputFormat.mChannelsPerFrame);
 
 	if(samplesToProcess > 0) {
-		AudioChunk *chunk = [self readAndMergeChunksAsFloat32:samplesToProcess];
+		AudioChunk *chunk = [self readAndMergeChunksAsFloat64:samplesToProcess];
 		if(!chunk || ![chunk frameCount]) {
 			[mutex unlock];
 			return nil;
@@ -491,9 +491,9 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 		size_t frameCount = [chunk frameCount];
 
 		NSData *sampleData = [chunk removeSamples:frameCount];
-		if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+		if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 			AudioChunk *outputChunk = [AudioChunk new];
-			[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+			[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
@@ -508,8 +508,10 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 
 		countIn += ((double)frameCount) / tempo;
 
+		// Rubber Band's public API is Float32-only. Keep the precision loss
+		// contained to this explicit third-party boundary.
 		for (size_t i = 0; i < channels; ++i) {
-			cblas_scopy((int)frameCount, ((const float *)[sampleData bytes]) + i, channels, rsPtrs[i], 1);
+			vDSP_vdpsp(((const double *)[sampleData bytes]) + i, channels, rsPtrs[i], 1, frameCount);
 		}
 
 		flushed = [[previousNode buffer] isEmpty] && [previousNode endOfStream] == YES;
@@ -540,7 +542,7 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 		if(samplesOut > blockSize) samplesOut = blockSize;
 		rubberband_retrieve(ts, (float * const *)rsPtrs, (int)samplesOut);
 		for(size_t i = 0; i < channels; ++i) {
-			cblas_scopy((int)samplesOut, rsPtrs[i], 1, &rsOutBuffer[samplesBuffered * channels + i], channels);
+			vDSP_vspdp(rsPtrs[i], 1, &rsOutBuffer[samplesBuffered * channels + i], channels, samplesOut);
 		}
 		samplesBuffered += samplesOut;
 	}
@@ -558,7 +560,7 @@ static void * kDSPRubberbandNodeContext = &kDSPRubberbandNodeContext;
 	AudioChunk *outputChunk = nil;
 	if(samplesBuffered > 0) {
 		outputChunk = [AudioChunk new];
-		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+		[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

@@ -14,8 +14,10 @@
 NS_ASSUME_NONNULL_BEGIN
 
 FOUNDATION_EXPORT BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format);
+FOUNDATION_EXPORT BOOL AudioFormatIsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription format);
+FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBasicDescription format);
 
 enum {

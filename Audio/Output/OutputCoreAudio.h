@@ -63,9 +63,9 @@ using std::atomic_long;
 	BOOL doPActive;
 	BOOL doPSeekPending;
 	uint8_t doPMarker;
-	float fadeLevel;
-	float fadeStep;
-	float fadeTarget;
+	double fadeLevel;
+	double fadeStep;
+	double fadeTarget;
 
 	BOOL prebufferReached;
 	BOOL prebufferSignaled;
@@ -86,8 +86,7 @@ using std::atomic_long;
 
 	BOOL suspendOutputOnPause;
 
-	float volume;
-	float eqPreamp;
+	double volume;
 
 	AVAudioFormat *_deviceFormat;
 
@@ -113,9 +112,9 @@ using std::atomic_long;
 	BOOL renderFormatNativeHighPrecision;
 	AudioStreamBasicDescription preferredNativeHighPrecisionFormat;
 
-	float *outputFloatScratch;
-	float *inputFloatScratch;
-	size_t outputFloatScratchCapacity;
+	double *outputDoubleScratch;
+	double *inputDoubleScratch;
+	size_t outputDoubleScratchCapacity;
 
 	AUAudioUnit *_au;
 

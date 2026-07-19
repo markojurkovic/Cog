@@ -125,7 +125,7 @@ static void transformPosition(float &elevation, float &azimuth, const simd_float
 	HrtfData *data;
 }
 + (impulseSetCache *)sharedController;
-- (void)getImpulse:(NSURL *)url outImpulse:(float **)outImpulse outSampleCount:(int *)outSampleCount sampleRate:(double)sampleRate channelCount:(int)channelCount channelConfig:(uint32_t)channelConfig withMatrix:(simd_float4x4)matrix;
+- (void)getImpulse:(NSURL *)url outImpulse:(double **)outImpulse outSampleCount:(int *)outSampleCount sampleRate:(double)sampleRate channelCount:(int)channelCount channelConfig:(uint32_t)channelConfig withMatrix:(simd_float4x4)matrix;
 @end
 
 @implementation impulseSetCache
@@ -152,7 +152,7 @@ static impulseSetCache *_sharedController = nil;
 	delete data;
 }
 
-- (void)getImpulse:(NSURL *)url outImpulse:(float **)outImpulse outSampleCount:(int *)outSampleCount sampleRate:(double)sampleRate channelCount:(int)channelCount channelConfig:(uint32_t)channelConfig withMatrix:(simd_float4x4)matrix {
+- (void)getImpulse:(NSURL *)url outImpulse:(double **)outImpulse outSampleCount:(int *)outSampleCount sampleRate:(double)sampleRate channelCount:(int)channelCount channelConfig:(uint32_t)channelConfig withMatrix:(simd_float4x4)matrix {
 	double sampleRateOfSource = 0;
 	int sampleCount = 0;
 
@@ -174,8 +174,8 @@ static impulseSetCache *_sharedController = nil;
 	}
 
 	try {
-		soxr_quality_spec_t q_spec = soxr_quality_spec(SOXR_HQ, 0);
-		soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
+		soxr_quality_spec_t q_spec = soxr_quality_spec(SOXR_HQ, SOXR_DOUBLE_PRECISION);
+		soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT64_I);
 		soxr_runtime_spec_t runtime_spec = soxr_runtime_spec(0);
 
 		bool resampling;
@@ -195,11 +195,11 @@ static impulseSetCache *_sharedController = nil;
 		}
 		actualSampleCount = (actualSampleCount + 15) & ~15;
 
-		*outImpulse = (float *)calloc(sizeof(float), actualSampleCount * channelCount * 2);
+		*outImpulse = (double *)calloc(sizeof(double), actualSampleCount * channelCount * 2);
 		if(!*outImpulse) {
 			throw std::bad_alloc();
 		}
-		float *hrtfData = *outImpulse;
+		double *hrtfData = *outImpulse;
 
 		for(uint32_t i = 0; i < channelCount; ++i) {
 			uint32_t channelFlag = [AudioChunk extractChannelFlag:i fromConfig:channelConfig];
@@ -223,8 +223,8 @@ static impulseSetCache *_sharedController = nil;
 					soxr_oneshot(sampleRateOfSource, sampleRate, 1, &hrtfLeft.impulse_response[0], sampleCountExact, NULL, &hrtfData[leftDelay + actualSampleCount * i * 2], sampleCountResampled, NULL, &io_spec, &q_spec, &runtime_spec);
 					soxr_oneshot(sampleRateOfSource, sampleRate, 1, &hrtfRight.impulse_response[0], sampleCountExact, NULL, &hrtfData[rightDelay + actualSampleCount * (i * 2 + 1)], sampleCountResampled, NULL, &io_spec, &q_spec, &runtime_spec);
 				} else {
-					cblas_scopy(sampleCountExact, &hrtfLeft.impulse_response[0], 1, &hrtfData[((hrtfLeft.delay + 2) >> 2) + actualSampleCount * i * 2], 1);
-					cblas_scopy(sampleCountExact, &hrtfRight.impulse_response[0], 1, &hrtfData[((hrtfRight.delay + 2) >> 2) + actualSampleCount * (i * 2 + 1)], 1);
+					vDSP_vspdp(&hrtfLeft.impulse_response[0], 1, &hrtfData[((hrtfLeft.delay + 2) >> 2) + actualSampleCount * i * 2], 1, sampleCountExact);
+					vDSP_vspdp(&hrtfRight.impulse_response[0], 1, &hrtfData[((hrtfRight.delay + 2) >> 2) + actualSampleCount * (i * 2 + 1)], 1, sampleCountExact);
 				}
 			}
 		}
@@ -268,14 +268,14 @@ static impulseSetCache *_sharedController = nil;
 		channelCount = channels;
 		self->config = config;
 
-		float *impulseBuffer = NULL;
+		double *impulseBuffer = NULL;
 		int sampleCount = 0;
 		[[impulseSetCache sharedController] getImpulse:url outImpulse:&impulseBuffer outSampleCount:&sampleCount sampleRate:sampleRate channelCount:channels channelConfig:config withMatrix:matrix];
 		if(!impulseBuffer) {
 			return nil;
 		}
 
-		mirroredImpulseResponses = (float **)calloc(sizeof(float *), channelCount * 2);
+		mirroredImpulseResponses = (double **)calloc(sizeof(double *), channelCount * 2);
 		if(!mirroredImpulseResponses) {
 			free(impulseBuffer);
 			return nil;
@@ -283,21 +283,21 @@ static impulseSetCache *_sharedController = nil;
 
 		for(int i = 0; i < channelCount * 2; ++i) {
 			mirroredImpulseResponses[i] = &impulseBuffer[sampleCount * i];
-			vDSP_vrvrs(mirroredImpulseResponses[i], 1, sampleCount);
+			vDSP_vrvrsD(mirroredImpulseResponses[i], 1, sampleCount);
 		}
 
 		paddedBufferSize = sampleCount;
 
-		paddedSignal[0] = (float *)calloc(sizeof(float), paddedBufferSize * 2);
+		paddedSignal[0] = (double *)calloc(sizeof(double), paddedBufferSize * 2);
 		if(!paddedSignal[0]) {
 			return nil;
 		}
 		paddedSignal[1] = paddedSignal[0] + paddedBufferSize;
 
-		prevInputs = (float **)calloc(channels, sizeof(float *));
+		prevInputs = (double **)calloc(channels, sizeof(double *));
 		if(!prevInputs)
 			return nil;
-		prevInputs[0] = (float *)calloc(sizeof(float), sampleCount * channelCount);
+		prevInputs[0] = (double *)calloc(sizeof(double), sampleCount * channelCount);
 		if(!prevInputs[0])
 			return nil;
 		for(int i = 1; i < channels; ++i) {
@@ -336,32 +336,32 @@ static impulseSetCache *_sharedController = nil;
 
 		free(mirroredImpulseResponses[0]);
 
-		float *impulseBuffer = NULL;
+		double *impulseBuffer = NULL;
 		int sampleCount = 0;
 		[[impulseSetCache sharedController] getImpulse:URL outImpulse:&impulseBuffer outSampleCount:&sampleCount sampleRate:sampleRate channelCount:channelCount channelConfig:config withMatrix:matrix];
 
 		for(int i = 0; i < channelCount * 2; ++i) {
 			mirroredImpulseResponses[i] = &impulseBuffer[sampleCount * i];
-			vDSP_vrvrs(mirroredImpulseResponses[i], 1, sampleCount);
+			vDSP_vrvrsD(mirroredImpulseResponses[i], 1, sampleCount);
 		}
 	}
 }
 
-- (void)process:(const float *)inBuffer sampleCount:(int)count toBuffer:(float *)outBuffer {
+- (void)process:(const double *)inBuffer sampleCount:(int)count toBuffer:(double *)outBuffer {
 	@synchronized (self) {
 		int sampleCount = paddedBufferSize;
 		while(count > 0) {
-			float left = 0, right = 0;
+			double left = 0, right = 0;
 			for(int i = 0; i < channelCount; ++i) {
-				float thisleft, thisright;
-				vDSP_vmul(prevInputs[i], 1, mirroredImpulseResponses[i * 2], 1, paddedSignal[0], 1, sampleCount);
-				vDSP_vmul(prevInputs[i], 1, mirroredImpulseResponses[i * 2 + 1], 1, paddedSignal[1], 1, sampleCount);
-				vDSP_sve(paddedSignal[0], 1, &thisleft, sampleCount);
-				vDSP_sve(paddedSignal[1], 1, &thisright, sampleCount);
+				double thisleft, thisright;
+				vDSP_vmulD(prevInputs[i], 1, mirroredImpulseResponses[i * 2], 1, paddedSignal[0], 1, sampleCount);
+				vDSP_vmulD(prevInputs[i], 1, mirroredImpulseResponses[i * 2 + 1], 1, paddedSignal[1], 1, sampleCount);
+				vDSP_sveD(paddedSignal[0], 1, &thisleft, sampleCount);
+				vDSP_sveD(paddedSignal[1], 1, &thisright, sampleCount);
 				left += thisleft;
 				right += thisright;
 
-				memmove(prevInputs[i], prevInputs[i] + 1, sizeof(float) * (sampleCount - 1));
+				memmove(prevInputs[i], prevInputs[i] + 1, sizeof(double) * (sampleCount - 1));
 				prevInputs[i][sampleCount - 1] = *inBuffer++;
 			}
 
@@ -375,7 +375,7 @@ static impulseSetCache *_sharedController = nil;
 
 - (void)reset {
 	for(int i = 0; i < channelCount; ++i) {
-		vDSP_vclr(prevInputs[i], 1, paddedBufferSize);
+		vDSP_vclrD(prevInputs[i], 1, paddedBufferSize);
 	}
 }
 

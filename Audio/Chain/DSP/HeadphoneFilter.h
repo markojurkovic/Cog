@@ -22,11 +22,11 @@
 	int channelCount;
 	uint32_t config;
 
-	float **mirroredImpulseResponses;
-	
-	float **prevInputs;
+	double **mirroredImpulseResponses;
 
-	float *paddedSignal[2];
+	double **prevInputs;
+
+	double *paddedSignal[2];
 }
 
 + (BOOL)validateImpulseFile:(NSURL *)url;
@@ -35,7 +35,7 @@
 
 - (void)reloadWithMatrix:(simd_float4x4)matrix;
 
-- (void)process:(const float *)inBuffer sampleCount:(int)count toBuffer:(float *)outBuffer;
+- (void)process:(const double *)inBuffer sampleCount:(int)count toBuffer:(double *)outBuffer;
 
 - (void)reset;
 

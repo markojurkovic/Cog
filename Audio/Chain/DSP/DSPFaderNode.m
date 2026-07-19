@@ -27,11 +27,11 @@
 	AudioStreamBasicDescription outputFormat;
 	uint32_t outputChannelConfig;
 
-	float fadeLevel, fadeStep;
+	double fadeLevel, fadeStep;
 	atomic_bool doPMode;
 
-	float inBuffer[512 * 32];
-	float outBuffer[512 * 32];
+	double inBuffer[512 * 32];
+	double outBuffer[512 * 32];
 }
 
 @synthesize timestamp;
@@ -162,7 +162,7 @@
 	const BOOL processingRequired = fadeStep || count;
 
 	BOOL inputRead = YES;
-	AudioChunk *chunk = processingRequired ? [self readChunkAsFloat32:512] : [self readChunk:512];
+	AudioChunk *chunk = processingRequired ? [self readChunkAsFloat64:512] : [self readChunk:512];
 	size_t frameCount = chunk ? [chunk frameCount] : 0;
 	if(frameCount && processingRequired) {
 		AudioStreamBasicDescription processingFormat = [chunk format];
@@ -172,7 +172,7 @@
 		frameCount = 0;
 	}
 	if(!frameCount && count && formatSet) {
-		AudioStreamBasicDescription processingFormat = AudioFormatAsFloat32(outputFormat);
+		AudioStreamBasicDescription processingFormat = AudioFormatAsFloat64(outputFormat);
 		[self setOutputFormat:processingFormat withChannelConfig:outputChannelConfig];
 		chunk = [AudioChunk new];
 		[chunk setFormat:processingFormat];
@@ -202,7 +202,7 @@
 		if(inputRead) {
 			NSData *sampleData = [chunk removeSamples:frameCount];
 			memcpy(inBuffer, [sampleData bytes], frameCount * outputFormat.mBytesPerPacket);
-			inputIsDoP = audioBufferIsDoP(inBuffer, outputFormat.mChannelsPerFrame, frameCount, NULL);
+			inputIsDoP = audioBufferIsDoP64(inBuffer, outputFormat.mChannelsPerFrame, frameCount, NULL);
 			if(!inputIsDoP) {
 				// DoP mode follows the current carrier instead of remaining latched
 				// after playback has moved back to PCM.
@@ -212,7 +212,7 @@
 			// [chunk removeSamples:frameCount];
 			// Only happens above, and since the samples aren't assigned, they don't need to be removed
 		}
-		float *nextBuffer = inBuffer;
+		double *nextBuffer = inBuffer;
 		if(atomic_load_explicit(&doPMode, memory_order_relaxed) || inputIsDoP) {
 			// Never apply a gain ramp or an old-track mix to a DoP carrier.
 			atomic_store_explicit(&doPMode, true, memory_order_relaxed);
@@ -223,7 +223,7 @@
 			[fadersLock unlock];
 		} else if(inputRead && fadeStep) {
 			bzero(outBuffer, frameCount * outputFormat.mBytesPerPacket);
-			BOOL stopping = fadeAudio(inBuffer, outBuffer, outputFormat.mChannelsPerFrame, frameCount, &fadeLevel, fadeStep, 1.0);
+			BOOL stopping = fadeAudio64(inBuffer, outBuffer, outputFormat.mChannelsPerFrame, frameCount, &fadeLevel, fadeStep, 1.0);
 			if(stopping) {
 				fadeStep = 0;
 				fadeLevel = 1.0;
@@ -258,9 +258,9 @@
 - (void)fadeIn {
 	fadeLevel = 0.0;
 	if(formatSet) {
-		fadeStep = (1.0f / outputFormat.mSampleRate) * (1000.0f / fadeTimeMS);
+		fadeStep = (1.0 / outputFormat.mSampleRate) * (1000.0 / fadeTimeMS);
 	} else {
-		fadeStep = 1000.0f / fadeTimeMS;
+		fadeStep = 1000.0 / fadeTimeMS;
 	}
 	waitForResetEvent = YES;
 }
@@ -277,7 +277,7 @@
 	atomic_store_explicit(&doPMode, enabled, memory_order_relaxed);
 }
 
-- (float)fadeLevel {
+- (double)fadeLevel {
 	return fadeLevel;
 }
 

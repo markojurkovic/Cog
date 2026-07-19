@@ -16,6 +16,8 @@
 
 #import <CogAudio/Node.h>
 
+void scale_by_volume_double(double *buffer, size_t count, double volume);
+
 @interface ConverterNode : Node {
 	NSDictionary *rgInfo;
 
@@ -50,7 +52,8 @@
 	BOOL doPStream;
 	BOOL nativePrecisionCandidate;
 
-	float volumeScale;
+	double volumeScale;
+	NSString *volumeScalingPreference;
 
 	void *floatBuffer;
 	size_t floatBufferSize;

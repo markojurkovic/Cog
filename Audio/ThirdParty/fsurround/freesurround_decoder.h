@@ -105,7 +105,7 @@ class freesurround_decoder {
 	 *		  The actual number of values depends on the number of output channels in the chosen
 	 *		  channel setup.
 	 */
-	float *decode(const float *input);
+	double *decode(const double *input);
 
 	/**
 	 * Flush the internal buffer.
@@ -125,26 +125,26 @@ class freesurround_decoder {
 	 * ear to ear, 270� wraps it around most of the head. The side and rear content of the sound
 	 * field is compressed accordingly behind the listerer. (default: 90, range: [0�..360�])
 	 */
-	void circular_wrap(float v);
+	void circular_wrap(double v);
 
 	/**
 	 * Allows to shift the soundfield forward or backward.
 	 * Value range: [-1.0..+1.0]. 0 is no offset, positive values move the sound
 	 * forward, negative values move it backwards. (default: 0)
 	 */
-	void shift(float v);
+	void shift(double v);
 
 	/**
 	 * Allows to scale the soundfield backwards.
 	 * Value range: [0.0..+5.0] -- 0 is all compressed to the front, 1 is no change, 5 is scaled 5x backwards (default: 1)
 	 */
-	void depth(float v);
+	void depth(double v);
 
 	/**
 	 * Allows to control the localization (i.e., focality) of sources.
 	 * Value range: [-1.0..+1.0] -- 0 means unchanged, positive means more localized, negative means more ambient (default: 0)
 	 */
-	void focus(float v);
+	void focus(double v);
 
 	// --- rendering parameters
 	// These parameters control how the sound field is mapped onto speakers.
@@ -155,19 +155,19 @@ class freesurround_decoder {
 	 * The default of 1.0 results in spec-conformant decoding ("movie mode") while a value of 0.7 is
 	 * better suited for music reproduction (which is usually mixed without a center channel).
 	 */
-	void center_image(float v);
+	void center_image(double v);
 
 	/**
 	 * Set the front stereo separation.
 	 * Value range: [0.0..inf] -- 1.0 is default, 0.0 is mono.
 	 */
-	void front_separation(float v);
+	void front_separation(double v);
 
 	/**
 	 * Set the rear stereo separation.
 	 * Value range: [0.0..inf] -- 1.0 is default, 0.0 is mono.
 	 */
-	void rear_separation(float v);
+	void rear_separation(double v);
 
 	// --- bass redirection (to LFE)
 
@@ -179,12 +179,12 @@ class freesurround_decoder {
 	/**
 	 * Set the lower end of the transition band, in Hz/Nyquist (default: 40/22050).
 	 */
-	void low_cutoff(float v);
+	void low_cutoff(double v);
 
 	/**
 	 * Set the upper end of the transition band, in Hz/Nyquist (default: 90/22050).
 	 */
-	void high_cutoff(float v);
+	void high_cutoff(double v);
 
 	// --- info
 

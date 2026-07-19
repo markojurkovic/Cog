@@ -21,7 +21,7 @@
 
 #import "AudioPlayer.h"
 
-extern void scale_by_volume(float *buffer, size_t count, float volume);
+extern void scale_by_volume_double(double *buffer, size_t count, double volume);
 
 static void * kDSPEqualizerNodeContext = &kDSPEqualizerNodeContext;
 
@@ -47,7 +47,7 @@ typedef struct {
 
 	int eqSectionCount;
 	biquadcoefficients *coefs;
-	vDSP_biquadm_Setup eqSetup;
+	vDSP_biquadm_SetupD eqSetup;
 
 	BOOL stopping, paused;
 	NSRecursiveLock *mutex;
@@ -60,7 +60,7 @@ typedef struct {
 	uint32_t lastInputChannelConfig, inputChannelConfig;
 	uint32_t outputChannelConfig;
 
-	float outBuffer[4096 * 32];
+	double outBuffer[4096 * 32];
 }
 
 static inline void setupOneBand(double frequency, float gainDB, double q, double sampleRate, biquadcoefficients *coefs) {
@@ -117,16 +117,15 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 
 	eqSectionCount = 31;
 
-	if(!eqSetup) {
-		eqSetup = vDSP_biquadm_CreateSetup((const double *)coefs, 31, channels);
-		if(!eqSetup) {
-			if(!equalizerBegin) [mutex unlock];
-			return;
-		}
-	} else {
-		vDSP_biquadm_ResetState(eqSetup);
-		vDSP_biquadm_SetCoefficientsDouble(eqSetup, (const double *)coefs, 0, 0, 31, channels);
+	vDSP_biquadm_SetupD newSetup = vDSP_biquadm_CreateSetupD((const double *)coefs, 31, channels);
+	if(!newSetup) {
+		if(!equalizerBegin) [mutex unlock];
+		return;
 	}
+	if(eqSetup) {
+		vDSP_biquadm_DestroySetupD(eqSetup);
+	}
+	eqSetup = newSetup;
 
 	if(!equalizerBegin) [mutex unlock];
 }
@@ -141,8 +140,11 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 			memcpy(&coefs[i * channels + j], &coefs[i * channels], sizeof(*coefs));
 		}
 		if(eqSetup) {
-			vDSP_biquadm_ResetState(eqSetup);
-			vDSP_biquadm_SetCoefficientsDouble(eqSetup, (const double *)(&coefs[i * channels]), i, 0, 1, channels);
+			vDSP_biquadm_SetupD newSetup = vDSP_biquadm_CreateSetupD((const double *)coefs, 31, channels);
+			if(newSetup) {
+				vDSP_biquadm_DestroySetupD(eqSetup);
+				eqSetup = newSetup;
+			}
 		}
 	}
 	if(!equalizerBegin) [mutex unlock];
@@ -253,7 +255,7 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 		if(equalizerInitialized) {
 			[[self audioPlayer] endEqualizer:(__bridge void *)self];
 			if(eqSetup) {
-				vDSP_biquadm_DestroySetup(eqSetup);
+				vDSP_biquadm_DestroySetupD(eqSetup);
 				eqSetup = NULL;
 			}
 			free(coefs); coefs = NULL;
@@ -361,7 +363,7 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 		return [self readChunk:4096];
 	}
 
-	AudioChunk *chunk = [self readChunkAsFloat32:4096];
+	AudioChunk *chunk = [self readChunkAsFloat64:4096];
 	if(!chunk || ![chunk frameCount]) {
 		[mutex unlock];
 		return nil;
@@ -377,10 +379,10 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 	if(frameCount) {
 		NSData *sampleData = [chunk removeSamples:frameCount];
 		
-		const float *inBuffer = (const float *)[sampleData bytes];
-		if(audioBufferIsDoP(inBuffer, channels, frameCount, NULL)) {
+		const double *inBuffer = (const double *)[sampleData bytes];
+		if(audioBufferIsDoP64(inBuffer, channels, frameCount, NULL)) {
 			outputChunk = [AudioChunk new];
-			[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+			[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
@@ -393,18 +395,18 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 			return outputChunk;
 		}
 
-		memcpy(outBuffer, inBuffer, frameCount * channels * sizeof(float));
+		memcpy(outBuffer, inBuffer, frameCount * channels * sizeof(double));
 
-		scale_by_volume(&outBuffer[0], frameCount * channels, equalizerPreamp);
+		scale_by_volume_double(&outBuffer[0], frameCount * channels, equalizerPreamp);
 
-		float * buffers[channels];
+		double * buffers[channels];
 		for(int i = 0; i < channels; ++i) {
 			buffers[i] = &outBuffer[i];
 		}
-		vDSP_biquadm(eqSetup, (const float **)buffers, channels, buffers, channels, (vDSP_Length)frameCount);
+		vDSP_biquadmD(eqSetup, (const double **)buffers, channels, buffers, channels, (vDSP_Length)frameCount);
 
 		outputChunk = [AudioChunk new];
-		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+		[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 		if(outputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

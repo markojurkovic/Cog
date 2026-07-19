@@ -11,10 +11,15 @@
 
 #import "OutputCoreAudio.h"
 
-float fadeTimeMS = 200.0f;
+double fadeTimeMS = 200.0;
 
 static uint8_t doPMarkerForSample(float sample) {
 	int32_t packed = (int32_t)llrint((double)sample * 2147483648.0);
+	return (uint8_t)(((uint32_t)packed) >> 24);
+}
+
+static uint8_t doPMarkerForSample64(double sample) {
+	int32_t packed = (int32_t)llrint(sample * 2147483648.0);
 	return (uint8_t)(((uint32_t)packed) >> 24);
 }
 
@@ -42,6 +47,26 @@ BOOL audioBufferIsDoP(const float *samples, size_t channels, size_t count, uint8
 	return YES;
 }
 
+BOOL audioBufferIsDoP64(const double *samples, size_t channels, size_t count, uint8_t *nextMarker) {
+	if(!samples || !channels || !count) return NO;
+
+	uint8_t previousMarker = 0;
+	for(size_t frame = 0; frame < count; ++frame) {
+		const uint8_t marker = doPMarkerForSample64(samples[frame * channels]);
+		if(marker != 0x05 && marker != 0xFA) return NO;
+		if(frame && marker == previousMarker) return NO;
+		for(size_t channel = 1; channel < channels; ++channel) {
+			if(doPMarkerForSample64(samples[frame * channels + channel]) != marker) return NO;
+		}
+		previousMarker = marker;
+	}
+
+	if(nextMarker) {
+		*nextMarker = (previousMarker == 0x05) ? 0xFA : 0x05;
+	}
+	return YES;
+}
+
 void fillDoPSilence(float *samples, size_t channels, size_t count, uint8_t *nextMarker) {
 	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
 	for(size_t frame = 0; frame < count; ++frame) {
@@ -49,6 +74,21 @@ void fillDoPSilence(float *samples, size_t channels, size_t count, uint8_t *next
 		int32_t signedPacked;
 		memcpy(&signedPacked, &packed, sizeof(signedPacked));
 		const float silence = (float)((double)signedPacked / 2147483648.0);
+		for(size_t channel = 0; channel < channels; ++channel) {
+			samples[frame * channels + channel] = silence;
+		}
+		marker = (marker == 0x05) ? 0xFA : 0x05;
+	}
+	*nextMarker = marker;
+}
+
+void fillDoPSilence64(double *samples, size_t channels, size_t count, uint8_t *nextMarker) {
+	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
+	for(size_t frame = 0; frame < count; ++frame) {
+		const uint32_t packed = ((uint32_t)marker << 24) | (0x69U << 16) | (0x69U << 8);
+		int32_t signedPacked;
+		memcpy(&signedPacked, &packed, sizeof(signedPacked));
+		const double silence = (double)signedPacked / 2147483648.0;
 		for(size_t channel = 0; channel < channels; ++channel) {
 			samples[frame * channels + channel] = silence;
 		}
@@ -79,17 +119,39 @@ BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_
 	return stopping;
 }
 
+BOOL fadeAudio64(const double *inSamples, double *outSamples, size_t channels, size_t count, double *fadeLevel, double fadeStep, double fadeTarget) {
+	double _fadeLevel = *fadeLevel;
+	BOOL towardZero = fadeStep < 0.0;
+	BOOL stopping = NO;
+	size_t maxCount = (size_t)floor(fabs(fadeTarget - _fadeLevel) / fabs(fadeStep));
+	if(maxCount) {
+		size_t countToDo = MIN(count, maxCount);
+		for(size_t i = 0; i < channels; ++i) {
+			_fadeLevel = *fadeLevel;
+			vDSP_vrampmuladdD(&inSamples[i], channels, &_fadeLevel, &fadeStep, &outSamples[i], channels, countToDo);
+		}
+	}
+	if(maxCount <= count) {
+		if(!towardZero && maxCount < count) {
+			vDSP_vaddD(&inSamples[maxCount * channels], 1, &outSamples[maxCount * channels], 1, &outSamples[maxCount * channels], 1, (count - maxCount) * channels);
+		}
+		stopping = YES;
+	}
+	*fadeLevel = _fadeLevel;
+	return stopping;
+}
+
 @implementation FadedBuffer {
-	float fadeLevel;
-	float fadeStep;
-	float fadeTarget;
+	double fadeLevel;
+	double fadeStep;
+	double fadeTarget;
 
 	ChunkList *lastBuffer;
 
 	NSArray *DSPs;
 }
 
-- (id)initWithBuffer:(ChunkList *)buffer withDSPs:(NSArray *)DSPs fadeStart:(float)fadeStart fadeTarget:(float)fadeTarget sampleRate:(double)sampleRate {
+- (id)initWithBuffer:(ChunkList *)buffer withDSPs:(NSArray *)DSPs fadeStart:(double)fadeStart fadeTarget:(double)fadeTarget sampleRate:(double)sampleRate {
 	self = [super init];
 	if(self) {
 		self->buffer = buffer;
@@ -127,7 +189,7 @@ BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_
 		lastBuffer = buffer;
 		const double maxFadeDurationMS = 1000.0 * [buffer listDuration];
 		const double fadeDuration = MIN(fadeTimeMS, maxFadeDurationMS);
-		fadeStep = ((fadeTarget - fadeLevel) / sampleRate) * (1000.0f / fadeDuration);
+		fadeStep = ((fadeTarget - fadeLevel) / sampleRate) * (1000.0 / fadeDuration);
 
 		Node *node = DSPs[0];
 		[node setPreviousNode:self];
@@ -141,11 +203,11 @@ BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_
 	}
 }
 
-- (BOOL)mix:(float *)outputBuffer sampleCount:(size_t)samples channelCount:(size_t)channels {
+- (BOOL)mix:(double *)outputBuffer sampleCount:(size_t)samples channelCount:(size_t)channels {
 	if(lastBuffer) {
 		size_t dspCount = [DSPs count];
 		Node *node = DSPs[dspCount - 1];
-		AudioChunk * chunk = [[node buffer] removeAndMergeSamples:samples callBlock:^BOOL{
+		AudioChunk * chunk = [[node buffer] removeAndMergeSamplesAsFloat64:samples callBlock:^BOOL{
 			if(![buffer isEmpty] && fadeStep) return false;
 			else return true;
 		}];
@@ -153,12 +215,12 @@ BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_
 			// Will always be input request size or less
 			size_t samplesToMix = [chunk frameCount];
 			NSData *sampleData = [chunk removeSamples:samplesToMix];
-			if(audioBufferIsDoP((const float *)[sampleData bytes], channels, samplesToMix, NULL)) {
+			if(audioBufferIsDoP64((const double *)[sampleData bytes], channels, samplesToMix, NULL)) {
 				// DoP is a bitstream disguised as PCM. Mixing or fading it corrupts
 				// both its marker bytes and its DSD payload, so use a hard cut.
 				return true;
 			}
-			BOOL stopping = fadeAudio((const float *)[sampleData bytes], outputBuffer, channels, samplesToMix, &fadeLevel, fadeStep, fadeTarget);
+			BOOL stopping = fadeAudio64((const double *)[sampleData bytes], outputBuffer, channels, samplesToMix, &fadeLevel, fadeStep, fadeTarget);
 			if(stopping) {
 				fadeStep = 0;
 				fadeLevel = fadeTarget;

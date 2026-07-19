@@ -18,7 +18,7 @@
 
 struct freesurround_params {
 	// the user-configurable parameters
-	float center_image, shift, depth, circular_wrap, focus, front_sep, rear_sep, bass_lo, bass_hi;
+	double center_image, shift, depth, circular_wrap, focus, front_sep, rear_sep, bass_lo, bass_hi;
 	bool use_lfe;
 	channel_setup channels_fs; // FreeSurround channel setup
 	std::vector<unsigned> chanmap; // FreeSurround -> WFX channel index translation (derived data for faster lookup)
@@ -125,7 +125,7 @@ struct freesurround_params {
 	return srate;
 }
 
-- (void)process:(const float *)samplesIn output:(float *)samplesOut count:(uint32_t)count {
+- (void)process:(const double *)samplesIn output:(double *)samplesOut count:(uint32_t)count {
 	freesurround_params *_params = (freesurround_params *)params;
 	freesurround_decoder *_decoder = (freesurround_decoder *)decoder;
 
@@ -137,18 +137,18 @@ struct freesurround_params {
 	}
 
 	if(count < 4096) {
-		cblas_scopy(count * 2, samplesIn, 1, &tempBuffer[0], 1);
-		vDSP_vclr(&tempBuffer[count * 2], 1, (4096 - count) * 2);
+		cblas_dcopy(count * 2, samplesIn, 1, &tempBuffer[0], 1);
+		vDSP_vclrD(&tempBuffer[count * 2], 1, (4096 - count) * 2);
 		samplesIn = &tempBuffer[0];
 	}
 
-	float *src = _decoder->decode(samplesIn);
+	double *src = _decoder->decode(samplesIn);
 
 	for(unsigned c = 0, num = channelCount; c < num; c++) {
 		unsigned idx = [AudioChunk channelIndexFromConfig:channelConfig forFlag:_params->chanmap[c]];
-		cblas_scopy(count, src + c, num, samplesOut + idx, num);
+		cblas_dcopy(count, src + c, num, samplesOut + idx, num);
 		if(zeroCount) {
-			vDSP_vclr(samplesOut + idx + count, num, zeroCount);
+			vDSP_vclrD(samplesOut + idx + count, num, zeroCount);
 		}
 	}
 }

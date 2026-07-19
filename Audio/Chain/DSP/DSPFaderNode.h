@@ -34,7 +34,7 @@
 - (void)waitForReset;
 - (void)setDoPMode:(BOOL)enabled;
 
-- (float)fadeLevel;
+- (double)fadeLevel;
 
 - (void)appendFadeOut:(FadedBuffer *_Nonnull)buffer;
 

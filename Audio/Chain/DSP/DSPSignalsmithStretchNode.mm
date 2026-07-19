@@ -19,7 +19,7 @@
 
 static void * kDSPSignalsmithStretchNodeContext = &kDSPSignalsmithStretchNodeContext;
 
-using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
+using Stretch = signalsmith::stretch::SignalsmithStretch<double>;
 
 @implementation DSPSignalsmithStretchNode {
 	BOOL enableStretch;
@@ -51,9 +51,9 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 
 	uint32_t lastInputChannelConfig, inputChannelConfig;
 
-	float rsInBuffer[32][4096];
-	float rsOutBuffer[32][65536];
-	float rsDeinterleaveBuffer[32 * 65536];
+	double rsInBuffer[32][4096];
+	double rsOutBuffer[32][65536];
+	double rsDeinterleaveBuffer[32 * 65536];
 }
 
 - (BOOL)processingEnabled {
@@ -312,7 +312,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 			ssize_t seekLength = ts->outputSeekLength(tempo);
 			if(seekLength > 65536)
 				seekLength = 65536;
-			AudioChunk *chunk = [self readAndMergeChunksAsFloat32:seekLength];
+			AudioChunk *chunk = [self readAndMergeChunksAsFloat64:seekLength];
 			if(!chunk || ![chunk frameCount]) {
 				[mutex unlock];
 				return nil;
@@ -326,9 +326,9 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 			size_t frameCount = [chunk frameCount];
 
 			NSData *sampleData = [chunk removeSamples:frameCount];
-			if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+			if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 				AudioChunk *outputChunk = [AudioChunk new];
-				[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+				[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 				if(inputChannelConfig) {
 					[outputChunk setChannelConfig:inputChannelConfig];
 				}
@@ -344,13 +344,13 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 			countIn += ((double)frameCount) / tempo;
 
 			for (size_t i = 0; i < channels; ++i) {
-				cblas_scopy((int)frameCount, ((const float *)[sampleData bytes]) + i, channels, rsOutBuffer[i], 1);
+				cblas_dcopy((int)frameCount, ((const double *)[sampleData bytes]) + i, channels, rsOutBuffer[i], 1);
 			}
 
 			ts->outputSeek(rsOutBuffer, (int)frameCount);
 		}
 
-		AudioChunk *chunk = [self readAndMergeChunksAsFloat32:samplesToProcess];
+		AudioChunk *chunk = [self readAndMergeChunksAsFloat64:samplesToProcess];
 		if(!chunk || ![chunk frameCount]) {
 			[mutex unlock];
 			return nil;
@@ -366,9 +366,9 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 		size_t frameCount = [chunk frameCount];
 
 		NSData *sampleData = [chunk removeSamples:frameCount];
-		if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+		if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 			AudioChunk *outputChunk = [AudioChunk new];
-			[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+			[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
@@ -384,7 +384,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 		countIn += ((double)frameCount) / tempo;
 
 		for (size_t i = 0; i < channels; ++i) {
-			cblas_scopy((int)frameCount, ((const float *)[sampleData bytes]) + i, channels, rsInBuffer[i], 1);
+			cblas_dcopy((int)frameCount, ((const double *)[sampleData bytes]) + i, channels, rsInBuffer[i], 1);
 		}
 
 		flushed = [[previousNode buffer] isEmpty] && [previousNode endOfStream] == YES;
@@ -400,7 +400,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 		ts->process(rsInBuffer, (int)frameCount, rsOutBuffer, (int)samplesToOutput);
 
 		for (size_t i = 0; i < channels; ++i) {
-			cblas_scopy((int)samplesToOutput, rsOutBuffer[i], 1, &rsDeinterleaveBuffer[i], channels);
+			cblas_dcopy((int)samplesToOutput, rsOutBuffer[i], 1, &rsDeinterleaveBuffer[i], channels);
 		}
 
 		if(flushed) {
@@ -409,7 +409,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 				toFlush = 65536 - samplesToOutput;
 			ts->flush(rsOutBuffer, (int)toFlush);
 			for (size_t i = 0; i < channels; ++i) {
-				cblas_scopy((int)toFlush, rsOutBuffer[i], 1, &rsDeinterleaveBuffer[i + channels * samplesToOutput], channels);
+				cblas_dcopy((int)toFlush, rsOutBuffer[i], 1, &rsDeinterleaveBuffer[i + channels * samplesToOutput], channels);
 			}
 			samplesToOutput += toFlush;
 		}
@@ -429,7 +429,7 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<float>;
 	AudioChunk *outputChunk = nil;
 	if(samplesBuffered > 0) {
 		outputChunk = [AudioChunk new];
-		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+		[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

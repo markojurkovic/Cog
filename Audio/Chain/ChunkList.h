@@ -50,6 +50,7 @@ NS_ASSUME_NONNULL_BEGIN
 	void *hdcd_decoder;
 
 	BOOL formatRead;
+	BOOL converterOutputFloat64;
 	
 	AudioStreamBasicDescription inputFormat;
 	AudioStreamBasicDescription floatFormat;
@@ -76,6 +77,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (AudioChunk *)removeSamples:(size_t)maxFrameCount;
 
 - (AudioChunk *)removeSamplesAsFloat32:(size_t)maxFrameCount;
+- (AudioChunk *)removeSamplesAsFloat64:(size_t)maxFrameCount;
 
 - (void)setOutputDSDAsDoP:(BOOL)enabled;
 
@@ -86,6 +88,7 @@ NS_ASSUME_NONNULL_BEGIN
 // Helpers
 - (AudioChunk *)removeAndMergeSamples:(size_t)maxFrameCount callBlock:(BOOL(NS_NOESCAPE ^ _Nonnull)(void))block;
 - (AudioChunk *)removeAndMergeSamplesAsFloat32:(size_t)maxFrameCount callBlock:(BOOL(NS_NOESCAPE ^ _Nonnull)(void))block;
+- (AudioChunk *)removeAndMergeSamplesAsFloat64:(size_t)maxFrameCount callBlock:(BOOL(NS_NOESCAPE ^ _Nonnull)(void))block;
 
 @end
 
