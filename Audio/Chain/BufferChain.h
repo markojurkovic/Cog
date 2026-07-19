@@ -23,6 +23,7 @@
 	id finalNode; // Final buffer in the chain.
 
 	id controller;
+	BOOL outputPreparationFailed;
 }
 
 - (id)initWithController:(id)c;
@@ -68,6 +69,8 @@
 - (BOOL)setTrack:(NSURL *)track;
 
 - (BOOL)isRunning;
+
+- (BOOL)outputPreparationFailed;
 
 - (id)controller;
 

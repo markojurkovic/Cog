@@ -495,7 +495,12 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	while(!stopping) {
 		@autoreleasepool {
 			if(outputdevicechanged) {
-				if([self updateDeviceFormat]) {
+				BOOL devicePrepared = [self updateDeviceFormat];
+				if(devicePrepared && !_au.renderResourcesAllocated) {
+					NSError *resourceError = nil;
+					devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+				}
+				if(devicePrepared) {
 					outputdevicechanged = NO;
 				} else {
 					usleep(2000);
@@ -523,7 +528,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				rendered = NO;
 			}
 
-			if(!started && !paused) {
+			if(!started && !paused && !streamReplacementPending) {
 				// Prevent this call from hanging when used in this thread, when buffer may be empty
 				// and waiting for this very thread to fill it
 				resetting = YES;
@@ -988,7 +993,23 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	return NO;
 }
 
-- (BOOL)updateDeviceFormatLockedNotifyingController:(BOOL)notifyController {
+- (double)currentDeviceSampleRate {
+	if(outputDeviceID == (AudioDeviceID)-1) {
+		return 0.0;
+	}
+
+	AudioObjectPropertyAddress theAddress = {
+		.mSelector = kAudioDevicePropertyNominalSampleRate,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	Float64 sampleRate = 0.0;
+	UInt32 propsize = sizeof(sampleRate);
+	OSStatus status = AudioObjectGetPropertyData(outputDeviceID, &theAddress, 0, NULL, &propsize, &sampleRate);
+	return status == noErr ? sampleRate : 0.0;
+}
+
+- (BOOL)updateDeviceFormatLockedNotifyingController:(BOOL)notifyController requestedSampleRate:(double)requestedSampleRate {
 	AVAudioFormat *format = _au.outputBusses[0].format;
 	if(!format) {
 		return NO;
@@ -998,10 +1019,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
 	const BOOL nativeFormatChanged = targetNativeHighPrecision &&
 	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
+	const BOOL requestedSampleRateChanged = requestedSampleRate > 0.0 &&
+	                                        fabs(renderFormat.mSampleRate - requestedSampleRate) >= 1.0;
 	if(!_deviceFormat || ![_deviceFormat isEqual:format] ||
 	   renderFormatDoPInteger != targetDoPInteger ||
 	   renderFormatNativeHighPrecision != targetNativeHighPrecision ||
-	   nativeFormatChanged) {
+	   nativeFormatChanged || requestedSampleRateChanged) {
 		NSError *err = nil;
 		AVAudioFormat *renderAVFormat;
 
@@ -1010,7 +1033,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		/// Seems some 3rd party devices return incorrect stuff...or I just don't like noninterleaved data.
 		deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsNonInterleaved;
-		if(preferDoPIntegerOutput && preferredDoPCarrierSampleRate > 0.0) {
+		if(requestedSampleRate > 0.0) {
+			// The device's nominal clock changes before AUHAL necessarily refreshes
+			// its output-bus AVAudioFormat. Bind the input bus to the clock requested
+			// by this transaction instead of copying a stale DoP carrier rate.
+			deviceFormat.mSampleRate = requestedSampleRate;
+		} else if(preferDoPIntegerOutput && preferredDoPCarrierSampleRate > 0.0) {
 			deviceFormat.mSampleRate = preferredDoPCarrierSampleRate;
 		} else if(targetNativeHighPrecision && preferredNativeHighPrecisionFormat.mSampleRate > 0.0) {
 			deviceFormat.mSampleRate = preferredNativeHighPrecisionFormat.mSampleRate;
@@ -1078,7 +1106,14 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(renderAVFormat) {
 			[_au.inputBusses[0] setFormat:renderAVFormat error:&err];
 		}
-		if((!renderAVFormat || err != nil) && (targetDoPInteger || targetNativeHighPrecision)) {
+		// DoP is already a packed bitstream at this point. A float fallback would
+		// corrupt it, so leave the previous bus representation in place and let the
+		// enclosing transaction restore the previous device clock.
+		if((!renderAVFormat || err != nil) && targetDoPInteger) {
+			resetting = NO;
+			return NO;
+		}
+		if((!renderAVFormat || err != nil) && targetNativeHighPrecision) {
 			preferDoPIntegerOutput = NO;
 			preferNativeHighPrecisionOutput = NO;
 			renderFormat = deviceFormat;
@@ -1108,14 +1143,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		[self setShouldReset:YES];
 		[outputLock unlock];
 
-		if(started) {
-			[_au startHardwareAndReturnError:&err];
-			if(err != nil) {
-				resetting = NO;
-				return NO;
-			}
-		}
-
 		resetting = NO;
 	}
 
@@ -1127,9 +1154,137 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	return YES;
 }
 
+- (BOOL)applyDeviceSampleRateAndFormat:(double)sampleRate {
+	@synchronized(self) {
+		// AUHAL owns the device stream while its render resources are allocated,
+		// even after a long pause has stopped the hardware. Release that ownership
+		// before asking the DAC to change clocks or carrier representation.
+		const BOOL hardwareWasRunning = [self hardwareIsRunning];
+		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		const BOOL previousPaused = paused;
+		const double previousSampleRate = [self currentDeviceSampleRate];
+		AVAudioFormat *previousInputFormat = _au.inputBusses[0].format;
+		AVAudioFormat *previousDeviceAVFormat = _deviceFormat;
+		const AudioStreamBasicDescription previousDeviceFormat = deviceFormat;
+		const AudioStreamBasicDescription previousRenderFormat = renderFormat;
+		const uint32_t previousDeviceChannelConfig = deviceChannelConfig;
+		const BOOL previousRenderFormatDoPInteger = renderFormatDoPInteger;
+		const BOOL previousRenderFormatNativeHighPrecision = renderFormatNativeHighPrecision;
+
+		resetting = YES;
+		if(hardwareWasRunning) {
+			[_au stopHardware];
+		}
+		if(renderResourcesWereAllocated) {
+			[_au deallocateRenderResources];
+		}
+
+		BOOL prepared = [self setDeviceSampleRate:sampleRate];
+		if(prepared) {
+			outputdevicechanged = YES;
+			prepared = [self updateDeviceFormatLockedNotifyingController:NO requestedSampleRate:sampleRate];
+		}
+
+		NSError *resourceError = nil;
+		if(prepared) {
+			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+		}
+		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
+		if(prepared && (!configuredInputFormat || fabs(configuredInputFormat.sampleRate - sampleRate) >= 1.0)) {
+			ALog(@"Core Audio retained a stale input-bus rate (requested %.0f Hz, got %.0f Hz)",
+			     sampleRate, configuredInputFormat ? configuredInputFormat.sampleRate : 0.0);
+			prepared = NO;
+		}
+
+		if(!prepared) {
+			ALog(@"Unable to apply Core Audio device format; restoring the previous output: %@", resourceError);
+			[_au stopHardware];
+			if(_au.renderResourcesAllocated) {
+				[_au deallocateRenderResources];
+			}
+
+			// Restore the preferences that describe the last format AUHAL actually
+			// rendered, rather than leaving a rejected DoP request latched.
+			preferDoPIntegerOutput = previousRenderFormatDoPInteger;
+			preferredDoPCarrierSampleRate = previousRenderFormatDoPInteger ? previousRenderFormat.mSampleRate : 0.0;
+			preferNativeHighPrecisionOutput = previousRenderFormatNativeHighPrecision;
+			if(previousRenderFormatNativeHighPrecision) {
+				preferredNativeHighPrecisionFormat = previousRenderFormat;
+			} else {
+				bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+			}
+
+			BOOL restored = YES;
+			if(previousSampleRate > 0.0 && fabs(previousSampleRate - [self currentDeviceSampleRate]) >= 1.0) {
+				restored = [self setDeviceSampleRate:previousSampleRate];
+			}
+			NSError *rollbackError = nil;
+			if(previousInputFormat) {
+				[_au.inputBusses[0] setFormat:previousInputFormat error:&rollbackError];
+				restored = restored && rollbackError == nil;
+			} else {
+				restored = NO;
+			}
+
+			_deviceFormat = previousDeviceAVFormat;
+			deviceFormat = previousDeviceFormat;
+			renderFormat = previousRenderFormat;
+			deviceChannelConfig = previousDeviceChannelConfig;
+			renderFormatDoPInteger = previousRenderFormatDoPInteger;
+			renderFormatNativeHighPrecision = previousRenderFormatNativeHighPrecision;
+			rollbackError = nil;
+			restored = [_au allocateRenderResourcesAndReturnError:&rollbackError] && rollbackError == nil && restored;
+			doPActive = previousRenderFormatDoPInteger;
+			doPSeekPending = previousRenderFormatDoPInteger;
+			doPMarker = 0x05;
+			[faderNode setDoPMode:previousRenderFormatDoPInteger];
+
+			// Let the output thread (or the replacement prebuffer callback) perform
+			// the hardware start outside this synchronous format transaction.
+			paused = previousPaused;
+			outputdevicechanged = !restored;
+			resetting = NO;
+			started = NO;
+			return NO;
+		}
+
+		outputdevicechanged = NO;
+		restarted = NO;
+		resetting = NO;
+		started = NO;
+		// A manual replacement resumes only after its new chain has prebuffered.
+		// Natural gapless transitions are restarted by the persistent output thread;
+		// neither path calls a potentially blocking driver start on the UI thread.
+		return YES;
+	}
+}
+
 - (BOOL)updateDeviceFormatNotifyingController:(BOOL)notifyController {
 	@synchronized(self) {
-		return [self updateDeviceFormatLockedNotifyingController:notifyController];
+		const BOOL hardwareWasRunning = [self hardwareIsRunning];
+		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		if(hardwareWasRunning) {
+			[_au stopHardware];
+		}
+		if(renderResourcesWereAllocated) {
+			[_au deallocateRenderResources];
+		}
+
+		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:0.0];
+		if(renderResourcesWereAllocated) {
+			NSError *resourceError = nil;
+			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil && prepared;
+		}
+		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
+		if(prepared && (!configuredInputFormat ||
+		                fabs(configuredInputFormat.sampleRate - renderFormat.mSampleRate) >= 1.0)) {
+			prepared = NO;
+		}
+		if(hardwareWasRunning) {
+			started = NO;
+			restarted = NO;
+		}
+		return prepared;
 	}
 }
 
@@ -1159,11 +1314,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	const BOOL sameInputFormat = sourceFormatValid && inputFormatValid &&
 	                             sourceChannelConfig == inputChannelConfig &&
 	                             memcmp(&sourceFormat, &inputFormat, sizeof(inputFormat)) == 0;
-
-	sourceFormat = inputFormat;
-	sourceChannelConfig = inputChannelConfig;
-	sourceFormatValid = inputFormatValid;
-	hdcdDetected = NO;
 
 	// Keep AUHAL and the DAC clock untouched when the replacement stream has
 	// exactly the same source format. The output path was already negotiated
@@ -1203,41 +1353,65 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		// A matching hardware clock is a prerequisite for bit-perfect PCM.
 		// Unsupported rates still play through the existing converter fallback.
 		if(sampleRateSupported) {
-			if(![self setDeviceSampleRate:sampleRate]) {
-				// The queued converter was intentionally configured for this
-				// source rate. Do not silently hand it to AUHAL for hidden SRC.
-				return NO;
-			}
-			outputdevicechanged = YES;
-			BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
+			// The queued converter was intentionally configured for this source
+			// rate. Do not silently hand it to AUHAL for hidden SRC if the clock
+			// and render-format transition cannot be completed together.
+			BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
 			if(prepared) {
-				outputdevicechanged = NO;
+				sourceFormat = inputFormat;
+				sourceChannelConfig = inputChannelConfig;
+				sourceFormatValid = inputFormatValid;
+				hdcdDetected = NO;
 			}
 			return prepared;
 		}
 
 		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
-			return [self updateDeviceFormatNotifyingController:NO];
+			const double currentSampleRate = [self currentDeviceSampleRate];
+			BOOL prepared = currentSampleRate > 0.0 ? [self applyDeviceSampleRateAndFormat:currentSampleRate] :
+			                                                [self updateDeviceFormatNotifyingController:NO];
+			if(!prepared) {
+				return NO;
+			}
 		}
+		sourceFormat = inputFormat;
+		sourceChannelConfig = inputChannelConfig;
+		sourceFormatValid = inputFormatValid;
+		hdcdDetected = NO;
 		[self refreshOutputStatus];
 		return YES;
 	}
 
-	if(![self setDeviceSampleRate:sampleRate]) {
-		return NO;
+	// The hardware may start before the decoder's first DoP frame has reached
+	// the final output buffer. Emit a valid carrier from the very first render
+	// instead of ordinary PCM zeroes, which some DSD DACs will not lock onto.
+	if(!doPActive) {
+		doPMarker = 0x05;
 	}
+	doPSeekPending = YES;
 
 	preferDoPIntegerOutput = YES;
 	preferNativeHighPrecisionOutput = NO;
 	bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 	preferredDoPCarrierSampleRate = sampleRate;
-	outputdevicechanged = YES;
-	BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
-	if(prepared) {
-		outputdevicechanged = NO;
+	BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+	if(prepared && renderFormatDoPInteger) {
+		sourceFormat = inputFormat;
+		sourceChannelConfig = inputChannelConfig;
+		sourceFormatValid = inputFormatValid;
+		hdcdDetected = NO;
 		[faderNode setDoPMode:YES];
+		return YES;
 	}
-	return prepared;
+
+	// Native DSD has already been packed as a DoP carrier by the converter.
+	// Continuing through a float fallback would corrupt its marker and payload
+	// bytes while still presenting the stream as successfully prepared.
+	doPSeekPending = NO;
+	preferDoPIntegerOutput = NO;
+	preferredDoPCarrierSampleRate = 0.0;
+	[faderNode setDoPMode:NO];
+	return NO;
 }
 
 - (void)refreshOutputStatus {
@@ -1515,9 +1689,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 					}
 				}
 			}
-			if(!directHighPrecision && _self->doPActive && renderedSamples < frameCount) {
+			if(!directHighPrecision && (_self->doPActive || _self->doPSeekPending) && renderedSamples < frameCount) {
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
-				// track changes, and brief underruns with standard DSD silence.
+				// initial startup, track changes, and brief underruns with standard
+				// DSD silence.
 				fillDoPSilence(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
 				outputContainsDoP = YES;
 			}
@@ -1637,9 +1812,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		[self audioOutputBlock];
 
-		[_au allocateRenderResourcesAndReturnError:&err];
-
 		if(![self updateDeviceFormat]) {
+			return NO;
+		}
+
+		err = nil;
+		if(![_au allocateRenderResourcesAndReturnError:&err] || err != nil) {
 			return NO;
 		}
 
@@ -1861,12 +2039,47 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		[_au stopHardware];
 }
 
+- (BOOL)hardwareIsRunning {
+	return _au != nil && _au.isRunning;
+}
+
 - (void)resume {
 	[self stopIdle];
-	NSError *err;
-	[_au startHardwareAndReturnError:&err];
+	NSError *err = nil;
+	if(_au && !_au.renderResourcesAllocated) {
+		if(![_au allocateRenderResourcesAndReturnError:&err] || err != nil) {
+			ALog(@"Unable to restore Core Audio render resources: %@", err);
+			paused = NO;
+			started = NO;
+			return;
+		}
+		err = nil;
+	}
+	BOOL hardwareStarted = [self hardwareIsRunning];
+	if(!hardwareStarted) {
+		hardwareStarted = [_au startHardwareAndReturnError:&err];
+		if(!hardwareStarted) {
+			hardwareStarted = [self hardwareIsRunning];
+		}
+	}
 	paused = NO;
-	started = YES;
+	started = hardwareStarted;
+	if(started) {
+		restarted = NO;
+	} else {
+		// Do not cache a track as successfully prepared when AUHAL cannot start.
+		// Re-run device-format discovery on the output thread and force the next
+		// manual attempt to negotiate its source format again.
+		sourceFormatValid = NO;
+		outputdevicechanged = YES;
+		if(!restarted) {
+			ALog(@"Unable to start Core Audio output; playback thread will retry: %@", err);
+			restarted = YES;
+		}
+		// Avoid a tight retry loop while a device is still settling after its
+		// sample-rate and integer-carrier format transition.
+		usleep(10000);
+	}
 }
 
 - (void)sustainHDCD {

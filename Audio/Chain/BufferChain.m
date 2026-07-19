@@ -29,27 +29,34 @@
 
 		inputNode = nil;
 		converterNode = nil;
+		outputPreparationFailed = NO;
 	}
 
 	return self;
 }
 
-- (AudioStreamBasicDescription)configuredOutputFormat:(AudioStreamBasicDescription)outputFormat forInputFormat:(AudioStreamBasicDescription)inputFormat resetBuffers:(BOOL)resetBuffers {
+- (BOOL)configureOutputFormat:(AudioStreamBasicDescription *)outputFormat forInputFormat:(AudioStreamBasicDescription)inputFormat resetBuffers:(BOOL)resetBuffers {
 	AudioPlayer *audioPlayer = controller;
 	OutputNode *outputNode = [audioPlayer output];
 	if(!outputNode) {
-		return outputFormat;
+		return YES;
 	}
 
 	if(resetBuffers) {
-		if([outputNode prepareForInputFormat:inputFormat]) {
-			return [outputNode format];
+		if(![outputNode prepareForInputFormat:inputFormat]) {
+			outputPreparationFailed = YES;
+			return NO;
 		}
+		*outputFormat = [outputNode format];
 	} else {
-		return [outputNode outputFormatForInputFormat:inputFormat];
+		*outputFormat = [outputNode outputFormatForInputFormat:inputFormat];
 	}
 
-	return outputFormat;
+	return YES;
+}
+
+- (BOOL)outputPreparationFailed {
+	return outputPreparationFailed;
 }
 
 - (BOOL)buildChain:(BOOL)resetBuffers {
@@ -101,7 +108,10 @@
 	if(![inputNode openWithSource:source])
 		return NO;
 
-	outputFormat = [self configuredOutputFormat:outputFormat forInputFormat:[inputNode nodeFormat] resetBuffers:resetBuffers];
+	if(![self configureOutputFormat:&outputFormat forInputFormat:[inputNode nodeFormat] resetBuffers:resetBuffers]) {
+		DLog(@"Couldn't prepare the output format...");
+		return NO;
+	}
 
 	if(![self initConverter:outputFormat])
 		return NO;
@@ -129,7 +139,10 @@
 	if(![inputNode openWithDecoder:[i decoder]])
 		return NO;
 
-	outputFormat = [self configuredOutputFormat:outputFormat forInputFormat:[inputNode nodeFormat] resetBuffers:resetBuffers];
+	if(![self configureOutputFormat:&outputFormat forInputFormat:[inputNode nodeFormat] resetBuffers:resetBuffers]) {
+		DLog(@"Couldn't prepare the output format...");
+		return NO;
+	}
 
 	if(![self initConverter:outputFormat])
 		return NO;

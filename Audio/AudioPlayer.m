@@ -158,15 +158,26 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 
 	NSURL *failedFragmentResource = nil;
 	BOOL advancedPastFailedStream = NO;
+	BOOL retriedOutputPreparation = NO;
 	while(YES) {
 		BOOL skipRepeatedProbe = failedFragmentResource && streamURLsShareUnderlyingResource(failedFragmentResource, url);
 		if(!skipRepeatedProbe && [bufferChain open:url withOutputFormat:[output format] withUserInfo:userInfo withRGInfo:rgi resetBuffers:YES]) {
 			break;
 		}
+		if(!skipRepeatedProbe && [bufferChain outputPreparationFailed] && !retriedOutputPreparation) {
+			// Device drivers can briefly reject a new clock/carrier immediately
+			// after rollback. Retry the same stream once; this is an output failure,
+			// not evidence that every fragment in the cue source is unreadable.
+			ALog(@"Retrying playback after Core Audio restored the previous device format");
+			[bufferChain setShouldContinue:NO];
+			bufferChain = [[BufferChain alloc] initWithController:self];
+			retriedOutputPreparation = YES;
+			continue;
+		}
 
 		if(skipRepeatedProbe) {
 			DLog(@"Skipping another logical track from failed source: %@", url);
-		} else {
+		} else if(![bufferChain outputPreparationFailed]) {
 			// Logical tracks with different fragments share one decoder source. If
 			// that source cannot be opened, probing every remaining fragment repeats
 			// the same expensive failure while this method blocks the main thread.
@@ -191,6 +202,7 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		userInfo = nextStreamUserInfo;
 		rgi = nextStreamRGInfo;
 		advancedPastFailedStream = YES;
+		retriedOutputPreparation = NO;
 
 		bufferChain = [[BufferChain alloc] initWithController:self];
 	}
