@@ -110,6 +110,13 @@ using std::atomic_long;
 	BOOL preferNativeHighPrecisionOutput;
 	BOOL renderFormatNativeHighPrecision;
 	AudioStreamBasicDescription preferredNativeHighPrecisionFormat;
+	BOOL preferIntegerPhysicalOutput;
+	BOOL renderFormatIntegerPhysical;
+	NSDictionary<NSNumber *, NSValue *> *preferredIntegerPhysicalFormats;
+	AudioStreamBasicDescription preferredIntegerClientFormat;
+	BOOL savedPhysicalFormatValid;
+	AudioDeviceID savedPhysicalFormatDeviceID;
+	NSDictionary<NSNumber *, NSValue *> *savedPhysicalFormats;
 
 	double *outputDoubleScratch;
 	double *inputDoubleScratch;
