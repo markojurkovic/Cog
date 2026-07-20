@@ -440,11 +440,11 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 		[self setPlaybackStatus:CogStatusPlaying];
 		[output launchThread];
 		outputLaunched = YES;
-	} else if(outputLaunched && startedPaused == NO &&
-	          (finishingStreamReplacement || currentPlaybackStatus == CogStatusPaused)) {
+	} else if(outputLaunched && startedPaused == NO && finishingStreamReplacement) {
 		// Core Audio can be stopped underneath a still-Playing logical status
-		// during a replacement. Reassert the hardware start after prebuffering;
-		// this is the same operation that made Pause followed by Play recover.
+		// during a replacement. Reassert the hardware start after prebuffering.
+		// A format-reset prebuffer while explicitly paused must not be treated as
+		// a user request to resume playback.
 		[output resume];
 		if(currentPlaybackStatus != CogStatusPlaying) {
 			[self setPlaybackStatus:CogStatusPlaying];
