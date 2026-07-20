@@ -157,6 +157,7 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 	}
 
 	NSURL *failedFragmentResource = nil;
+	NSMutableSet<NSURL *> *failedStreamURLs = [NSMutableSet set];
 	BOOL advancedPastFailedStream = NO;
 	BOOL retriedOutputPreparation = NO;
 	while(YES) {
@@ -184,11 +185,18 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 			failedFragmentResource = [[url fragment] length] ? streamURLWithoutFragment(url) : nil;
 		}
 		[self setError:YES forTrack:userInfo];
+		if(url) {
+			[failedStreamURLs addObject:url];
+		}
 		bufferChain = nil;
 
 		[self requestNextStream:userInfo];
 
-		if([nextStream isEqualTo:url]) {
+		// Repeat-all can otherwise cycle through an entirely unplayable playlist
+		// forever while this synchronous startup method keeps the UI occupied.
+		// Stop as soon as traversal returns to any stream already attempted by
+		// this play request.
+		if(nextStream && [failedStreamURLs containsObject:nextStream]) {
 			[self stop];
 			return;
 		}

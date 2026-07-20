@@ -201,9 +201,14 @@ static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
 	return descriptions.count ? [[descriptions array] componentsJoinedByString:@" / "] : nil;
 }
 
+@interface OutputCoreAudio ()
+- (double)currentDeviceSampleRate;
+@end
+
 @implementation OutputCoreAudio {
 	VisualizationController *visController;
 	BOOL streamReplacementPending;
+	BOOL outputDeviceIDChanged;
 }
 
 static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
@@ -610,12 +615,18 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			DLog(@"Device: %i\n", deviceID);
 			outputDeviceID = deviceID;
 
+			// AUHAL may immediately restart the new device with the old input-bus
+			// format. Keep that short transition silent until the output thread has
+			// renegotiated the active source for the new device capabilities.
+			resetting = YES;
 			NSError *nserr;
 			[_au setDeviceID:outputDeviceID error:&nserr];
 			if(nserr != nil) {
+				resetting = NO;
 				return (OSErr)[nserr code];
 			}
 
+			outputDeviceIDChanged = YES;
 			outputdevicechanged = YES;
 		}
 
@@ -960,6 +971,83 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	return supported;
 }
 
+- (double)bestPCMDeviceSampleRateForDSDInputFormat:(AudioStreamBasicDescription)inputFormat {
+	if(inputFormat.mBitsPerChannel != 1 || inputFormat.mSampleRate <= 0.0 ||
+	   outputDeviceID == (AudioDeviceID)-1) {
+		return 0.0;
+	}
+
+	// The DSD decoder's first PCM representation runs at one eighth of the
+	// 1-bit source clock. Rates above it add no source information, so prefer
+	// its power-of-two family (352.8, 176.4, 88.2, 44.1 kHz for DSD64) when the
+	// device exposes an exact match at or below that rate.
+	const double decodedPCMRate = inputFormat.mSampleRate / 8.0;
+	AudioObjectPropertyAddress theAddress = {
+		.mSelector = kAudioDevicePropertyAvailableNominalSampleRates,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+
+	UInt32 propsize = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(outputDeviceID, &theAddress, 0, NULL, &propsize);
+	if(status != noErr || !propsize) {
+		return [self currentDeviceSampleRate];
+	}
+
+	AudioValueRange *ranges = (AudioValueRange *)malloc(propsize);
+	if(!ranges) {
+		return [self currentDeviceSampleRate];
+	}
+	status = AudioObjectGetPropertyData(outputDeviceID, &theAddress, 0, NULL, &propsize, ranges);
+	if(status != noErr) {
+		free(ranges);
+		return [self currentDeviceSampleRate];
+	}
+
+	const UInt32 rangeCount = propsize / (UInt32)sizeof(AudioValueRange);
+	double highestUsefulRate = 0.0;
+	for(UInt32 i = 0; i < rangeCount; ++i) {
+		if(ranges[i].mMinimum <= decodedPCMRate + 1.0) {
+			highestUsefulRate = MAX(highestUsefulRate, MIN(ranges[i].mMaximum, decodedPCMRate));
+		}
+	}
+	if(highestUsefulRate <= 0.0) {
+		free(ranges);
+		return [self currentDeviceSampleRate];
+	}
+
+	double matchingRate = decodedPCMRate;
+	while(matchingRate > highestUsefulRate + 1.0) {
+		matchingRate *= 0.5;
+	}
+	if([self deviceSupportsSampleRate:matchingRate]) {
+		free(ranges);
+		return matchingRate;
+	}
+
+	// Some devices advertise only 48 kHz-family rates. In that case choose the
+	// supported rate nearest the ideal DSD-family target rather than dropping
+	// all the way to a much lower 44.1 kHz-family rate.
+	double closestRate = 0.0;
+	double closestDistance = INFINITY;
+	for(UInt32 i = 0; i < rangeCount; ++i) {
+		if(ranges[i].mMinimum > decodedPCMRate + 1.0) {
+			continue;
+		}
+		const double rangeMaximum = MIN(ranges[i].mMaximum, decodedPCMRate);
+		const double candidate = MIN(MAX(matchingRate, ranges[i].mMinimum), rangeMaximum);
+		const double distance = fabs(candidate - matchingRate);
+		if(distance < closestDistance ||
+		   (fabs(distance - closestDistance) < 1.0 && candidate > closestRate)) {
+			closestRate = candidate;
+			closestDistance = distance;
+		}
+	}
+
+	free(ranges);
+	return closestRate > 0.0 ? closestRate : [self currentDeviceSampleRate];
+}
+
 - (BOOL)setDeviceSampleRate:(double)sampleRate {
 	if(outputDeviceID == (AudioDeviceID)-1 || sampleRate <= 0.0) {
 		return NO;
@@ -1029,7 +1117,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
 	const BOOL requestedSampleRateChanged = requestedSampleRate > 0.0 &&
 	                                        fabs(renderFormat.mSampleRate - requestedSampleRate) >= 1.0;
-	if(!_deviceFormat || ![_deviceFormat isEqual:format] ||
+	if(outputDeviceIDChanged || !_deviceFormat || ![_deviceFormat isEqual:format] ||
 	   renderFormatDoPInteger != targetDoPInteger ||
 	   renderFormatNativeHighPrecision != targetNativeHighPrecision ||
 	   nativeFormatChanged || requestedSampleRateChanged) {
@@ -1278,7 +1366,43 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			[_au deallocateRenderResources];
 		}
 
-		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:0.0];
+		double requestedSampleRate = 0.0;
+		if(outputDeviceIDChanged && sourceFormatValid && sourceFormat.mBitsPerChannel == 1) {
+			// A device selection can cross the DoP capability boundary while a raw
+			// DSD track is active. Re-evaluate the representation before configuring
+			// AUHAL; retaining the old DoP input format makes Core Audio resample the
+			// carrier, which destroys its marker and payload bytes.
+			const double doPCarrierSampleRate = preferredDeviceSampleRateForInputFormat(sourceFormat);
+			const BOOL supportsDoPCarrier = [self deviceSupportsSampleRate:doPCarrierSampleRate];
+
+			preferNativeHighPrecisionOutput = NO;
+			bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+			if(supportsDoPCarrier && [self setDeviceSampleRate:doPCarrierSampleRate]) {
+				preferDoPIntegerOutput = YES;
+				preferredDoPCarrierSampleRate = doPCarrierSampleRate;
+				requestedSampleRate = doPCarrierSampleRate;
+				doPSeekPending = YES;
+				if(!doPActive) {
+					doPMarker = 0x05;
+				}
+			} else {
+				double pcmSampleRate = [self bestPCMDeviceSampleRateForDSDInputFormat:sourceFormat];
+				if(pcmSampleRate > 0.0 && [self setDeviceSampleRate:pcmSampleRate]) {
+					requestedSampleRate = pcmSampleRate;
+				} else {
+					pcmSampleRate = [self currentDeviceSampleRate];
+				}
+				DLog(@"DoP carrier rate %.0f Hz is unavailable after the output-device change; converting native DSD to %.0f Hz PCM", doPCarrierSampleRate, pcmSampleRate);
+				preferDoPIntegerOutput = NO;
+				preferredDoPCarrierSampleRate = 0.0;
+				doPSeekPending = NO;
+				doPActive = NO;
+				doPMarker = 0x05;
+				[faderNode setDoPMode:NO];
+			}
+		}
+
+		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:requestedSampleRate];
 		if(renderResourcesWereAllocated) {
 			NSError *resourceError = nil;
 			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil && prepared;
@@ -1292,6 +1416,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			started = NO;
 			restarted = NO;
 		}
+		if(prepared) {
+			outputDeviceIDChanged = NO;
+			resetting = NO;
+			[faderNode setDoPMode:renderFormatDoPInteger];
+		}
 		return prepared;
 	}
 }
@@ -1302,12 +1431,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat {
 	AudioStreamBasicDescription outputFormat = deviceFormat;
-	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	const BOOL nativeDSD = inputFormat.mBitsPerChannel == 1;
+	if(nativeDSD && ![self deviceSupportsSampleRate:sampleRate]) {
+		sampleRate = [self bestPCMDeviceSampleRateForDSDInputFormat:inputFormat];
+	}
 	// Preloaded chains are built before they become the active output. Build
-	// them at the source rate whenever the device supports it; selectNextBuffer
-	// switches the hardware at the actual track boundary. This keeps SOXR out
-	// of the inactive PCM path instead of baking a resample into the queue.
-	if([self deviceSupportsSampleRate:sampleRate]) {
+	// them at the best source-family rate the device supports; selectNextBuffer
+	// switches the hardware at the actual track boundary.
+	if(sampleRate > 0.0 && [self deviceSupportsSampleRate:sampleRate]) {
 		outputFormat.mSampleRate = sampleRate;
 	}
 	return outputFormat;
@@ -1333,10 +1465,25 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		return YES;
 	}
 
+	const BOOL nativeDSD = inputFormat.mBitsPerChannel == 1;
 	const BOOL highPrecisionPCM = AudioFormatIsHighPrecisionPCM(inputFormat);
-	const BOOL usesDoPCarrier = !highPrecisionPCM && inputFormatUsesDoPCarrierRate(inputFormat);
 	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
 	const BOOL sampleRateSupported = [self deviceSupportsSampleRate:sampleRate];
+	const double outputSampleRate = (nativeDSD && !sampleRateSupported) ?
+	                                    [self bestPCMDeviceSampleRateForDSDInputFormat:inputFormat] :
+	                                    sampleRate;
+	const BOOL outputSampleRateSupported = outputSampleRate > 0.0 &&
+	                                           [self deviceSupportsSampleRate:outputSampleRate];
+	// Native DSD can be converted to PCM when the selected device cannot run
+	// the required DoP carrier clock. An already packed DoP/PCM stream cannot
+	// be resampled without corrupting its marker and payload bytes, so keep the
+	// strict failure behavior for that representation.
+	const BOOL usesDoPCarrier = !highPrecisionPCM &&
+	                            inputFormatUsesDoPCarrierRate(inputFormat) &&
+	                            (!nativeDSD || sampleRateSupported);
+	if(nativeDSD && !sampleRateSupported) {
+		DLog(@"DoP carrier rate %.0f Hz is unavailable; converting native DSD to %.0f Hz PCM", sampleRate, outputSampleRate);
+	}
 
 	if(!usesDoPCarrier) {
 		// A pending DoP seek is only meaningful while another DoP carrier is
@@ -1360,11 +1507,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		// A matching hardware clock is a prerequisite for bit-perfect PCM.
 		// Unsupported rates still play through the existing converter fallback.
-		if(sampleRateSupported) {
+		if(outputSampleRateSupported) {
 			// The queued converter was intentionally configured for this source
 			// rate. Do not silently hand it to AUHAL for hidden SRC if the clock
 			// and render-format transition cannot be completed together.
-			BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+			BOOL prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
 			if(prepared) {
 				sourceFormat = inputFormat;
 				sourceChannelConfig = inputChannelConfig;
@@ -1762,6 +1909,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		stopping = NO;
 		stopped = NO;
 		streamReplacementPending = NO;
+		outputDeviceIDChanged = NO;
 		paused = NO;
 		outputDeviceID = -1;
 		restarted = NO;
