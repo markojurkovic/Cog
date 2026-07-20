@@ -325,7 +325,7 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 		   (fabs(pitch - 1.0) >= 1e-7 || fabs(tempo - 1.0) >= 1e-7)) {
 			[reasons addObject:NSLocalizedString(@"time or pitch processing", @"Cog signal-integrity modification reason")];
 		}
-		if(hdcdDetected && [defaults boolForKey:@"enableHDCD"]) {
+		if([outputController currentInputHDCDDetected] && [defaults boolForKey:@"enableHDCD"]) {
 			[reasons addObject:NSLocalizedString(@"HDCD decoding", @"Cog signal-integrity modification reason")];
 		}
 	}
@@ -1242,11 +1242,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		resetting = NO;
 	}
 
-	// Logical tracks from the same source (for example, adjacent entries in a
-	// cue sheet) normally keep the existing AUHAL format. Re-publish it after
-	// every successful preparation so a track transition cannot leave a stale
-	// stopped-state indication merely because no hardware format changed.
-	[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
 	return YES;
 }
 
@@ -1426,7 +1421,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)updateDeviceFormat {
-	return [self updateDeviceFormatNotifyingController:YES];
+	BOOL prepared = [self updateDeviceFormatNotifyingController:YES];
+	if(prepared) {
+		[self refreshOutputStatus];
+	}
+	return prepared;
 }
 
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat {
@@ -1516,7 +1515,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				sourceFormat = inputFormat;
 				sourceChannelConfig = inputChannelConfig;
 				sourceFormatValid = inputFormatValid;
-				hdcdDetected = NO;
+				[self refreshOutputStatus];
 			}
 			return prepared;
 		}
@@ -1532,7 +1531,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		sourceFormat = inputFormat;
 		sourceChannelConfig = inputChannelConfig;
 		sourceFormatValid = inputFormatValid;
-		hdcdDetected = NO;
 		[self refreshOutputStatus];
 		return YES;
 	}
@@ -1554,8 +1552,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		sourceFormat = inputFormat;
 		sourceChannelConfig = inputChannelConfig;
 		sourceFormatValid = inputFormatValid;
-		hdcdDetected = NO;
 		[faderNode setDoPMode:YES];
+		[self refreshOutputStatus];
 		return YES;
 	}
 
@@ -1923,7 +1921,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		bzero(&sourceFormat, sizeof(sourceFormat));
 		sourceChannelConfig = 0;
 		sourceFormatValid = NO;
-		hdcdDetected = NO;
 
 		cutOffInput = NO;
 		fadeTarget = 1.0;
@@ -2243,10 +2240,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)sustainHDCD {
 	secondsHdcdSustained = 10.0;
-	if(!hdcdDetected) {
-		hdcdDetected = YES;
-		[self refreshOutputStatus];
-	}
+	[self refreshOutputStatus];
 }
 
 - (void)setShouldPlayOutBuffer:(BOOL)s {

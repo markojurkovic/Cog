@@ -30,6 +30,7 @@
 		inputNode = nil;
 		converterNode = nil;
 		outputPreparationFailed = NO;
+		atomic_init(&hdcdDetected, false);
 	}
 
 	return self;
@@ -321,9 +322,23 @@
 }
 
 - (void)sustainHDCD {
-	OutputNode *outputNode = (OutputNode *)[controller output];
+	const BOOL firstDetection = !atomic_exchange_explicit(&hdcdDetected, true, memory_order_relaxed);
+	if(!firstDetection) {
+		return;
+	}
+
+	AudioPlayer *audioPlayer = controller;
+	if([audioPlayer bufferChain] != self) {
+		return;
+	}
+
+	OutputNode *outputNode = [audioPlayer output];
 	[outputNode sustainHDCD];
 	[controller sustainHDCD];
+}
+
+- (BOOL)hdcdDetected {
+	return atomic_load_explicit(&hdcdDetected, memory_order_relaxed);
 }
 
 - (void)restartPlaybackAtCurrentPosition {

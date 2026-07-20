@@ -74,6 +74,7 @@
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat;
 - (uint32_t)currentInputChannelConfig;
 - (BOOL)currentConverterAppliesVolumeScaling;
+- (BOOL)currentInputHDCDDetected;
 - (void)refreshOutputStatus;
 
 - (double)volume;

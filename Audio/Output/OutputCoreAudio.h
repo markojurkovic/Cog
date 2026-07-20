@@ -103,7 +103,6 @@ using std::atomic_long;
 	uint32_t realStreamChannelConfig;
 	uint32_t streamChannelConfig;
 	BOOL sourceFormatValid;
-	BOOL hdcdDetected;
 
 	BOOL preferDoPIntegerOutput;
 	BOOL renderFormatDoPInteger;
