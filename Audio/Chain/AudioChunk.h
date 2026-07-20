@@ -16,9 +16,11 @@ NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format);
+FOUNDATION_EXPORT BOOL AudioFormatIsDoPInteger(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBasicDescription format);
+FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsDoPInteger(AudioStreamBasicDescription format);
 
 enum {
 	AudioChannelFrontLeft = 1 << 0,
@@ -79,6 +81,7 @@ enum {
 	BOOL hdcd;
 	BOOL resetForward;
 	BOOL dsdDoPReverseBits;
+	BOOL doP;
 }
 
 @property AudioStreamBasicDescription format;
@@ -88,6 +91,7 @@ enum {
 @property BOOL lossless;
 @property BOOL resetForward;
 @property BOOL dsdDoPReverseBits;
+@property(getter=isDoP) BOOL doP;
 
 + (uint32_t)guessChannelConfig:(uint32_t)channelCount;
 + (uint32_t)channelIndexFromConfig:(uint32_t)channelConfig forFlag:(uint32_t)flag;

@@ -249,7 +249,7 @@
 
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
-	if(audioBufferIsDoP((const float *)[sampleData bytes], format.mChannelsPerFrame, frameCount, NULL)) {
+	if([chunk isDoP] && audioBufferIsDoP([sampleData bytes], format, frameCount, NULL)) {
 		[mutex unlock];
 		return;
 	}

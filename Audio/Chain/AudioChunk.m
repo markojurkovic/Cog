@@ -54,6 +54,21 @@ BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format) {
 	       format.mBytesPerPacket == format.mBytesPerFrame;
 }
 
+BOOL AudioFormatIsDoPInteger(AudioStreamBasicDescription format) {
+	const AudioFormatFlags nativeEndian = kAudioFormatFlagsNativeEndian & kAudioFormatFlagIsBigEndian;
+	return format.mFormatID == kAudioFormatLinearPCM &&
+	       !(format.mFormatFlags & kAudioFormatFlagIsFloat) &&
+	       !!(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+	       !!(format.mFormatFlags & kAudioFormatFlagIsAlignedHigh) &&
+	       !(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) &&
+	       (format.mFormatFlags & kAudioFormatFlagIsBigEndian) == nativeEndian &&
+	       format.mBitsPerChannel == 24 &&
+	       format.mChannelsPerFrame > 0 &&
+	       format.mFramesPerPacket == 1 &&
+	       format.mBytesPerFrame == sizeof(int32_t) * format.mChannelsPerFrame &&
+	       format.mBytesPerPacket == format.mBytesPerFrame;
+}
+
 AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription format) {
 	format.mFormatID = kAudioFormatLinearPCM;
 	format.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
@@ -89,6 +104,19 @@ AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBa
 	return format;
 }
 
+AudioStreamBasicDescription AudioFormatAsDoPInteger(AudioStreamBasicDescription format) {
+	format.mFormatID = kAudioFormatLinearPCM;
+	format.mFormatFlags = kAudioFormatFlagIsSignedInteger |
+	                      kAudioFormatFlagIsAlignedHigh |
+	                      kAudioFormatFlagsNativeEndian;
+	format.mBitsPerChannel = 24;
+	format.mFramesPerPacket = 1;
+	format.mBytesPerFrame = (UInt32)(sizeof(int32_t) * format.mChannelsPerFrame);
+	format.mBytesPerPacket = format.mBytesPerFrame;
+	format.mReserved = 0;
+	return format;
+}
+
 @implementation AudioChunk
 
 - (id)init {
@@ -101,6 +129,7 @@ AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBa
 		hdcd = NO;
 		resetForward = NO;
 		dsdDoPReverseBits = NO;
+		doP = NO;
 		streamTimestamp = 0.0;
 		streamTimeRatio = 1.0;
 	}
@@ -118,6 +147,7 @@ AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBa
 		hdcd = NO;
 		resetForward = NO;
 		dsdDoPReverseBits = [[properties objectForKey:@"dsdDoPReverseBits"] boolValue];
+		doP = NO;
 		streamTimestamp = 0.0;
 		streamTimeRatio = 1.0;
 	}
@@ -133,6 +163,7 @@ AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBa
 	if(hdcd) [outputChunk setHDCD];
 	if(resetForward) outputChunk.resetForward = YES;
 	outputChunk.dsdDoPReverseBits = dsdDoPReverseBits;
+	outputChunk.doP = doP;
 	[outputChunk setStreamTimestamp:streamTimestamp];
 	[outputChunk setStreamTimeRatio:streamTimeRatio];
 	[outputChunk assignData:chunkData];
@@ -224,6 +255,7 @@ static const uint32_t AudioChannelConfigTable[] = {
 @synthesize streamTimestamp;
 @synthesize streamTimeRatio;
 @synthesize dsdDoPReverseBits;
+@synthesize doP;
 
 - (AudioStreamBasicDescription)format {
 	return format;

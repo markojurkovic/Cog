@@ -1218,6 +1218,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 - (BOOL)findIntegerPhysicalFormatForPhysicalStream:(AudioStreamID)streamID
 	                                    sampleRate:(double)sampleRate
 	                                  requiredBits:(UInt32)requiredBits
+	                             requireDoPCarrier:(BOOL)requireDoPCarrier
 	                                         format:(AudioStreamBasicDescription *)selectedFormat {
 	AudioStreamBasicDescription currentFormat = { 0 };
 	if(![self readPhysicalFormat:&currentFormat fromStream:streamID]) return NO;
@@ -1229,7 +1230,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	UInt32 size = 0;
 	OSStatus status = AudioObjectGetPropertyDataSize(streamID, &address, 0, NULL, &size);
 	if(status != noErr || size < sizeof(AudioStreamRangedDescription)) {
+		const UInt32 currentContainerBits = AudioFormatBytesPerSample(currentFormat) * 8;
+		const BOOL currentSupportsDoP = !requireDoPCarrier ||
+		                                ((currentFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+		                                 (currentFormat.mBitsPerChannel == 24 || currentFormat.mBitsPerChannel == 32) &&
+		                                 (currentContainerBits == 24 || currentContainerBits == 32) &&
+		                                 (currentContainerBits == currentFormat.mBitsPerChannel ||
+		                                  (currentFormat.mFormatFlags & kAudioFormatFlagIsAlignedHigh)));
 		if(AudioFormatIsIntegerPCM(currentFormat) &&
+		   currentSupportsDoP &&
 		   currentFormat.mBitsPerChannel >= requiredBits &&
 		   fabs(currentFormat.mSampleRate - sampleRate) < 1.0) {
 			if(selectedFormat) *selectedFormat = currentFormat;
@@ -1255,6 +1264,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		const UInt32 containerBits = bytesPerSample * 8;
 		if(!RangedPhysicalFormatSupportsSampleRate(descriptions[i], sampleRate) ||
 		   !AudioFormatIsIntegerPCM(candidate) ||
+		   (requireDoPCarrier &&
+		    (!(candidate.mFormatFlags & kAudioFormatFlagIsSignedInteger) ||
+		     (candidate.mBitsPerChannel != 24 && candidate.mBitsPerChannel != 32) ||
+		     (containerBits != 24 && containerBits != 32) ||
+		     (containerBits != candidate.mBitsPerChannel &&
+		      !(candidate.mFormatFlags & kAudioFormatFlagIsAlignedHigh)))) ||
 		   candidate.mBitsPerChannel < requiredBits ||
 		   candidate.mBitsPerChannel > containerBits ||
 		   !bytesPerSample || bytesPerSample > 8 ||
@@ -1280,7 +1295,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (NSDictionary<NSNumber *, NSValue *> *)integerPhysicalFormatSetForSampleRate:(double)sampleRate
-	                                                               requiredBits:(UInt32)requiredBits {
+	                                                               requiredBits:(UInt32)requiredBits
+	                                                          requireDoPCarrier:(BOOL)requireDoPCarrier {
 	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
 	if(!streams.count) return nil;
 	NSMutableDictionary<NSNumber *, NSValue *> *formats = [NSMutableDictionary dictionary];
@@ -1289,6 +1305,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(![self findIntegerPhysicalFormatForPhysicalStream:streamNumber.unsignedIntValue
 		                                           sampleRate:sampleRate
 		                                         requiredBits:requiredBits
+		                                    requireDoPCarrier:requireDoPCarrier
 		                                                format:&format]) return nil;
 		formats[streamNumber] = PhysicalFormatValue(format);
 	}
@@ -1993,7 +2010,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		                                     AudioFormatIsIntegerPCM(inputFormat) &&
 		                                     inputFormat.mBitsPerChannel <= 32) ?
 		                                        [self integerPhysicalFormatSetForSampleRate:sampleRate
-		                                                                       requiredBits:inputFormat.mBitsPerChannel] : nil;
+		                                                                       requiredBits:inputFormat.mBitsPerChannel
+		                                                                  requireDoPCarrier:NO] : nil;
 		preferIntegerPhysicalOutput = preferredIntegerPhysicalFormats.count > 0;
 		if(!preferIntegerPhysicalOutput) {
 			preferredIntegerPhysicalFormats = nil;
@@ -2058,7 +2076,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 	preferredDoPCarrierSampleRate = sampleRate;
 	preferredIntegerPhysicalFormats = sampleRateSupported ?
-	                                      [self integerPhysicalFormatSetForSampleRate:sampleRate requiredBits:24] : nil;
+	                                      [self integerPhysicalFormatSetForSampleRate:sampleRate
+	                                                                             requiredBits:24
+	                                                                        requireDoPCarrier:YES] : nil;
 	preferIntegerPhysicalOutput = preferredIntegerPhysicalFormats.count > 0;
 	if(!preferIntegerPhysicalOutput) {
 		preferredIntegerPhysicalFormats = nil;
@@ -2212,6 +2232,89 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(_self->resetting) {
 			return 0;
 		}
+
+		const BOOL renderDirectDoP = _self->renderFormatDoPInteger && AudioFormatIsDoPInteger(*renderASBD);
+		if(renderDirectDoP) {
+			@autoreleasepool {
+				if(!_self->faded) {
+					while(renderedSamples < frameCount) {
+						[refLock lock];
+						AudioChunk *chunk = nil;
+						if(![_self->bufferNode.buffer isEmpty]) {
+							chunk = [self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+						}
+						[refLock unlock];
+
+						size_t chunkFrames = chunk ? [chunk frameCount] : 0;
+						if(chunkFrames) {
+							_self->prebufferReached = YES;
+							double streamTimestamp = [chunk streamTimestamp];
+							if(!streamTimestamp || _self->streamTimestamp > streamTimestamp) {
+								_self->prebufferSignaled = NO;
+							}
+							_self->streamTimestamp = streamTimestamp;
+
+							const AudioStreamBasicDescription chunkFormat = [chunk format];
+							NSData *sampleData = [chunk removeSamples:chunkFrames];
+							size_t inputTodo = MIN(chunkFrames, frameCount - renderedSamples);
+							uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+							                       renderedSamples * renderASBD->mBytesPerPacket;
+							uint8_t nextDoPMarker = 0x05;
+							const BOOL compatibleCarrier = AudioFormatIsDoPInteger(chunkFormat) &&
+							                               chunkFormat.mChannelsPerFrame == (UInt32)channels &&
+							                               chunkFormat.mBytesPerPacket == renderASBD->mBytesPerPacket;
+							const BOOL inputIsDoP = [chunk isDoP] && compatibleCarrier &&
+							                          audioBufferIsDoP([sampleData bytes], chunkFormat, inputTodo, &nextDoPMarker);
+
+							if(!inputIsDoP) {
+								// Never feed PCM or a damaged marker sequence to a DAC that is
+								// currently locked to DoP. Consume the transition and substitute
+								// valid DoP silence with the expected marker phase.
+								fillDoPSilence(destination, *renderASBD, inputTodo, &_self->doPMarker);
+							} else {
+								const uint8_t firstDoPMarker = (inputTodo % 2) ?
+								                                     ((nextDoPMarker == 0x05) ? 0xFA : 0x05) :
+								                                     nextDoPMarker;
+								const uint8_t *source = (const uint8_t *)[sampleData bytes];
+								if(firstDoPMarker != _self->doPMarker) {
+									// Drop a repeated marker at a buffer join instead of making the
+									// DAC lose DoP lock.
+									source += chunkFormat.mBytesPerPacket;
+									--inputTodo;
+								}
+								memcpy(destination, source, inputTodo * renderASBD->mBytesPerPacket);
+								_self->doPActive = YES;
+								_self->doPSeekPending = NO;
+								_self->doPMarker = nextDoPMarker;
+								if(_self->fading) {
+									_self->faded = _self->fadeStep < 0.0;
+									_self->fading = NO;
+									_self->fadeStep = 0.0f;
+									_self->fadeLevel = _self->faded ? 0.0f : 1.0f;
+								}
+							}
+							renderedSamples += (int)inputTodo;
+						}
+
+						if((_self->stopping && !_self->fadingstop) || _self->resetting ||
+						   _self->faded || !chunk || !chunkFrames) break;
+					}
+				}
+
+				if(renderedSamples < frameCount) {
+					uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+					                       renderedSamples * renderASBD->mBytesPerPacket;
+					fillDoPSilence(destination, *renderASBD, frameCount - renderedSamples, &_self->doPMarker);
+				}
+
+				[_self updateLatency:(double)renderedSamples / format->mSampleRate];
+#ifdef OUTPUT_LOG
+				NSData *outData = [NSData dataWithBytes:inputData->mBuffers[0].mData length:inputData->mBuffers[0].mDataByteSize];
+				[logFile writeData:outData];
+#endif
+			}
+			return 0;
+		}
 		
 		const BOOL renderAsFloat32 = AudioFormatIsFloat32(*renderASBD);
 		const BOOL renderAsFloat64 = AudioFormatIsFloat64(*renderASBD);
@@ -2316,12 +2419,14 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 							break;
 						}
 						uint8_t nextDoPMarker = 0x05;
-						BOOL inputIsDoP = audioBufferIsDoP64(samplePtr, channels, inputTodo, &nextDoPMarker);
+						AudioStreamBasicDescription floatDoPFormat = AudioFormatAsFloat64(chunkFormat);
+						BOOL inputIsDoP = [chunk isDoP] &&
+						                  audioBufferIsDoP(samplePtr, floatDoPFormat, inputTodo, &nextDoPMarker);
 
 						if(_self->doPSeekPending && !inputIsDoP) {
 							// Never expose transitional or stale PCM-looking data while a
 							// DoP seek is waiting for the first verified post-seek carrier.
-							fillDoPSilence64(outSamples + renderedSamples * channels, channels, inputTodo, &_self->doPMarker);
+							fillDoPSilence(outSamples + renderedSamples * channels, floatDoPFormat, inputTodo, &_self->doPMarker);
 							outputContainsDoP = YES;
 						} else if(inputIsDoP) {
 							// A DoP carrier must remain bit-perfect. Complete a pending
@@ -2371,7 +2476,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
 				// initial startup, track changes, and brief underruns with standard
 				// DSD silence.
-				fillDoPSilence64(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
+				AudioStreamBasicDescription floatDoPFormat = AudioFormatAsFloat64(*renderASBD);
+				fillDoPSilence(outSamples + renderedSamples * channels, floatDoPFormat, frameCount - renderedSamples, &_self->doPMarker);
 				outputContainsDoP = YES;
 			}
 

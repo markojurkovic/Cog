@@ -202,7 +202,7 @@
 		if(inputRead) {
 			NSData *sampleData = [chunk removeSamples:frameCount];
 			memcpy(inBuffer, [sampleData bytes], frameCount * outputFormat.mBytesPerPacket);
-			inputIsDoP = audioBufferIsDoP64(inBuffer, outputFormat.mChannelsPerFrame, frameCount, NULL);
+			inputIsDoP = [chunk isDoP] && audioBufferIsDoP(inBuffer, [chunk format], frameCount, NULL);
 			if(!inputIsDoP) {
 				// DoP mode follows the current carrier instead of remaining latched
 				// after playback has moved back to PCM.

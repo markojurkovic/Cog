@@ -378,11 +378,12 @@ static inline void setupOneBand(double frequency, float gainDB, double q, double
 	AudioChunk *outputChunk = nil;
 	if(frameCount) {
 		NSData *sampleData = [chunk removeSamples:frameCount];
-		
+		const AudioStreamBasicDescription chunkFormat = [chunk format];
 		const double *inBuffer = (const double *)[sampleData bytes];
-		if(audioBufferIsDoP64(inBuffer, channels, frameCount, NULL)) {
+		if([chunk isDoP] && audioBufferIsDoP([sampleData bytes], chunkFormat, frameCount, NULL)) {
 			outputChunk = [AudioChunk new];
-			[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
+			[outputChunk setFormat:chunkFormat];
+			[outputChunk setDoP:YES];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}
