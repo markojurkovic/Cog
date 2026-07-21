@@ -1194,6 +1194,9 @@
         }
       }
     },
+    "Exclusive" : {
+      "comment" : "Exclusive transport tooltip value"
+    },
     "Exclusive integer" : {
       "comment" : "Exclusive integer transport tooltip value"
     },
@@ -3738,7 +3741,7 @@
         }
       }
     },
-    "Use exclusive mode for end-to-end integer output" : {
+    "Use exclusive mode when supported" : {
 
     },
     "Use flat perspective in toolbar" : {
@@ -3873,9 +3876,6 @@
         }
       }
     },
-    "When an integer source and the selected device support it, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported devices continue using shared output." : {
-
-    },
     "When opening files" : {
       "localizations" : {
         "es" : {
@@ -3885,6 +3885,9 @@
           }
         }
       }
+    },
+    "When the source format and selected device support direct output, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported formats and devices continue using shared output." : {
+
     },
     "Window:" : {
       "comment" : "A label for the \"Window:\" picker in the RubberbandPaneView.",

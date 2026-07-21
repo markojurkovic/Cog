@@ -24,8 +24,9 @@ private final class OutputPrefs: ObservableObject {
     @Published var suspendOutputOnPause: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(suspendOutputOnPause, forKey: "suspendOutputOnPause") }
     }
-    @Published var exclusiveIntegerOutput: Bool {
-        didSet { guard isActive else { return }; UserDefaults.standard.set(exclusiveIntegerOutput, forKey: "exclusiveIntegerOutput") }
+    // Keep the historical defaults key so upgrades preserve the user's choice.
+    @Published var exclusiveOutput: Bool {
+        didSet { guard isActive else { return }; UserDefaults.standard.set(exclusiveOutput, forKey: "exclusiveIntegerOutput") }
     }
     @Published var enableFading: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(enableFading, forKey: "enableFading") }
@@ -48,7 +49,7 @@ private final class OutputPrefs: ObservableObject {
         enableFSurround = d.bool(forKey: "enableFSurround")
         volumeLimit = d.object(forKey: "volumeLimit") as? Bool ?? true
         suspendOutputOnPause = d.object(forKey: "suspendOutputOnPause") as? Bool ?? true
-        exclusiveIntegerOutput = d.object(forKey: "exclusiveIntegerOutput") as? Bool ?? false
+        exclusiveOutput = d.object(forKey: "exclusiveIntegerOutput") as? Bool ?? false
         enableFading = d.object(forKey: "enableFading") as? Bool ?? true
         enableHdcd = d.object(forKey: "enableHDCD") as? Bool ?? true
         halveDSDVolume = d.object(forKey: "halveDSDVolume") as? Bool ?? false
@@ -127,10 +128,10 @@ struct OutputPaneView: View {
             Toggle("Fade playback transitions", isOn: $prefs.enableFading)
             Section {
                 Toggle(
-                    "Use exclusive mode for end-to-end integer output",
-                    isOn: $prefs.exclusiveIntegerOutput
+                    "Use exclusive mode when supported",
+                    isOn: $prefs.exclusiveOutput
                 )
-                Text("When an integer source and the selected device support it, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported devices continue using shared output.")
+                Text("When the source format and selected device support direct output, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported formats and devices continue using shared output.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } header: {

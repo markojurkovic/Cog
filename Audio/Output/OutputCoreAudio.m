@@ -37,6 +37,7 @@ NSString *const CogCoreAudioOutputFormatDescriptionKey = @"CogCoreAudioOutputFor
 NSString *const CogCoreAudioVirtualFormatDescriptionKey = @"CogCoreAudioVirtualFormatDescription";
 NSString *const CogCoreAudioDeviceFormatDescriptionKey = @"CogCoreAudioDeviceFormatDescription";
 NSString *const CogCoreAudioEndToEndIntegerTransportKey = @"CogCoreAudioEndToEndIntegerTransport";
+NSString *const CogCoreAudioExclusiveTransportKey = @"CogCoreAudioExclusiveTransport";
 NSString *const CogCoreAudioHogModeOwnedKey = @"CogCoreAudioHogModeOwned";
 NSString *const CogCoreAudioSignalIntegrityLosslessKey = @"CogCoreAudioSignalIntegrityLossless";
 NSString *const CogCoreAudioSignalIntegrityDetailsKey = @"CogCoreAudioSignalIntegrityDetails";
@@ -226,6 +227,7 @@ static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
 - (void)destroyExclusiveIOProc;
 - (BOOL)startCurrentHardware:(NSError **)error;
 - (void)stopCurrentHardware;
+- (BOOL)currentOutputUsesExclusiveTransport;
 - (BOOL)currentOutputIsEndToEndInteger;
 - (BOOL)currentProcessOwnsHogMode;
 - (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat;
@@ -385,6 +387,7 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 			formatInfo[CogCoreAudioDeviceFormatDescriptionKey] = deviceDescription;
 		}
 		formatInfo[CogCoreAudioEndToEndIntegerTransportKey] = @([self currentOutputIsEndToEndInteger]);
+		formatInfo[CogCoreAudioExclusiveTransportKey] = @([self currentOutputUsesExclusiveTransport]);
 		formatInfo[CogCoreAudioHogModeOwnedKey] = @([self currentProcessOwnsHogMode]);
 		userInfo = formatInfo;
 	}
@@ -411,8 +414,23 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	OutputCoreAudio *_self = (__bridge OutputCoreAudio *)inUserData;
 	for(UInt32 i = 0; i < inNumberAddresses; ++i) {
 		switch(inAddresses[i].mSelector) {
-			case kAudioDevicePropertyDeviceIsAlive:
+			case kAudioDevicePropertyDeviceIsAlive: {
+				// Core Audio can send this notification while a live device changes
+				// ownership or stream format. Only abandon the selected device after
+				// reading an actual dead state; treating every notification as removal
+				// tears down Cog's own hog-mode transition.
+				AudioObjectPropertyAddress aliveAddress = {
+					.mSelector = kAudioDevicePropertyDeviceIsAlive,
+					.mScope = kAudioObjectPropertyScopeGlobal,
+					.mElement = kAudioObjectPropertyElementMaster
+				};
+				UInt32 alive = 0;
+				UInt32 size = sizeof(alive);
+				if(AudioObjectGetPropertyData(inObjectID, &aliveAddress, 0, NULL, &size, &alive) == noErr && alive) {
+					return noErr;
+				}
 				return [_self setOutputDeviceByID:-1];
+			}
 
 			case kAudioDevicePropertyNominalSampleRate:
 			case kAudioDevicePropertyStreamFormat:
@@ -443,7 +461,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				[self resume];
 		}
 	} else if([keyPath isEqualToString:@"values.exclusiveIntegerOutput"]) {
-		exclusiveIntegerOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
+		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
 		if(!stopping) outputdevicechanged = YES;
 	} else if([signalIntegrityPreferenceKeyPaths() containsObject:keyPath]) {
 		// ConverterNode and the DSP nodes observe the same preferences. Defer the
@@ -630,6 +648,20 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 
 			return err;
 		}
+		if(deviceID == kAudioObjectUnknown) {
+			// Some HAL drivers temporarily remove a hogged device from the shared
+			// system-default slot. That is not a real output-device change. Keep the
+			// device Cog already owns; a later valid default notification will still
+			// be handled normally.
+			if(outputDeviceID != kAudioObjectUnknown && outputDeviceID != (AudioDeviceID)-1 &&
+			   [self currentProcessOwnsHogMode]) {
+				DLog(@"Ignoring transient unknown default output while Cog owns device %u",
+				     (unsigned int)outputDeviceID);
+				return noErr;
+			}
+			DLog(@"THERE'S NO DEFAULT OUTPUT DEVICE");
+			return kAudioHardwareBadDeviceError;
+		}
 	}
 
 	if(_au) {
@@ -685,6 +717,9 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			preferExclusiveIntegerTransport = NO;
 			preferredIntegerTransportRequiresHog = NO;
 			preferredIntegerVirtualFormats = nil;
+			preferExclusiveFloatTransport = NO;
+			preferredFloatVirtualFormats = nil;
+			bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 			renderFormatEndToEndInteger = NO;
 			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
 
@@ -1541,6 +1576,76 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	return NO;
 }
 
+- (BOOL)findExclusiveFloatVirtualFormatSetForInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                           sampleRate:(double)sampleRate
+	                                        virtualFormats:(NSDictionary<NSNumber *, NSValue *> **)selectedVirtualFormats
+	                                           clientFormat:(AudioStreamBasicDescription *)selectedClientFormat {
+	const BOOL sourceIsFloat32 = AudioFormatIsFloat32(inputFormat);
+	const BOOL sourceIsFloat64 = AudioFormatIsFloat64(inputFormat);
+	if(!sourceIsFloat32 && !sourceIsFloat64) {
+		DLog(@"Exclusive float skipped: source is not canonical interleaved Float32/Float64 (%@)",
+		     outputFormatDescription(inputFormat, NO));
+		return NO;
+	}
+	if(inputFormat.mChannelsPerFrame != deviceFormat.mChannelsPerFrame) {
+		DLog(@"Exclusive float skipped: source has %u channels but the output client has %u",
+		     (unsigned int)inputFormat.mChannelsPerFrame,
+		     (unsigned int)deviceFormat.mChannelsPerFrame);
+		return NO;
+	}
+
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	// The direct callback currently maps exactly one interleaved output buffer.
+	// Aggregate and multi-stream devices keep using AUHAL until their individual
+	// channel buffers can be described without device-specific assumptions.
+	if(streams.count != 1) {
+		DLog(@"Exclusive float skipped: direct output requires one active stream, found %lu",
+		     (unsigned long)streams.count);
+		return NO;
+	}
+	const NSNumber *streamNumber = streams.firstObject;
+	NSArray<NSValue *> *availableFormats =
+	    [self availableStreamFormatsForStream:streamNumber.unsignedIntValue
+	                               selector:kAudioStreamPropertyAvailableVirtualFormats
+	                        currentSelector:kAudioStreamPropertyVirtualFormat];
+	BOOL found = NO;
+	AudioStreamBasicDescription bestFormat = { 0 };
+	uint64_t bestScore = UINT64_MAX;
+	for(NSValue *value in availableFormats) {
+		AudioStreamRangedDescription description = { 0 };
+		if(!GetRangedFormatValue(value, &description) ||
+		   !RangedPhysicalFormatSupportsSampleRate(description, sampleRate)) continue;
+		AudioStreamBasicDescription candidate = description.mFormat;
+		candidate.mSampleRate = sampleRate;
+		if(candidate.mChannelsPerFrame != inputFormat.mChannelsPerFrame ||
+		   (sourceIsFloat32 ? !AudioFormatIsFloat32(candidate) : !AudioFormatIsFloat64(candidate))) continue;
+
+		// Prefer a driver's explicitly non-mixable float mode, while accepting its
+		// ordinary float virtual format under verified hog ownership as well.
+		const uint64_t score = (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ? 0 : 1;
+		if(!found || score < bestScore) {
+			found = YES;
+			bestScore = score;
+			bestFormat = candidate;
+		}
+	}
+	if(!found) {
+		DLog(@"Exclusive float skipped: no matching Float%u virtual format at %.0f Hz with %u channels",
+		     sourceIsFloat32 ? 32u : 64u,
+		     sampleRate,
+		     (unsigned int)inputFormat.mChannelsPerFrame);
+		return NO;
+	}
+
+	AudioStreamBasicDescription clientFormat = bestFormat;
+	clientFormat.mFormatFlags &= ~kAudioFormatFlagIsNonMixable;
+	clientFormat.mReserved = 0;
+	if(selectedVirtualFormats) *selectedVirtualFormats = @{ streamNumber: PhysicalFormatValue(bestFormat) };
+	if(selectedClientFormat) *selectedClientFormat = clientFormat;
+	DLog(@"Exclusive float selected: %@", outputFormatDescription(clientFormat, NO));
+	return YES;
+}
+
 - (BOOL)findIntegerPhysicalFormatForPhysicalStream:(AudioStreamID)streamID
 	                                    sampleRate:(double)sampleRate
 	                                  requiredBits:(UInt32)requiredBits
@@ -1985,13 +2090,26 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	return YES;
 }
 
-- (BOOL)currentOutputIsEndToEndInteger {
+- (BOOL)currentOutputUsesExclusiveTransport {
 	if(!exclusiveIOProcID || exclusiveIOProcDeviceID != outputDeviceID) return NO;
 	const AudioStreamBasicDescription clientFormat = renderFormat;
-	if(!AudioFormatIsSignedIntegerPCM(clientFormat)) return NO;
 
 	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
 	if(!streams.count) return NO;
+	for(NSNumber *streamNumber in streams) {
+		AudioStreamBasicDescription virtualFormat = { 0 };
+		const AudioStreamID streamID = streamNumber.unsignedIntValue;
+		if(![self readVirtualFormat:&virtualFormat fromStream:streamID] ||
+		   !StreamFormatsHaveSameSampleRepresentation(clientFormat, virtualFormat, NO) ||
+		   fabs(clientFormat.mSampleRate - virtualFormat.mSampleRate) >= 1.0) return NO;
+	}
+	return [self currentProcessOwnsHogMode];
+}
+
+- (BOOL)currentOutputIsEndToEndInteger {
+	if(![self currentOutputUsesExclusiveTransport] || !AudioFormatIsSignedIntegerPCM(renderFormat)) return NO;
+
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
 	for(NSNumber *streamNumber in streams) {
 		AudioStreamBasicDescription virtualFormat = { 0 }, physicalFormat = { 0 };
 		const AudioStreamID streamID = streamNumber.unsignedIntValue;
@@ -2000,24 +2118,24 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		   !AudioFormatIsSignedIntegerPCM(virtualFormat) ||
 		   !AudioFormatIsSignedIntegerPCM(physicalFormat) ||
 		   !PhysicalFormatsMatch(virtualFormat, physicalFormat) ||
-		   !StreamFormatsHaveSameSampleRepresentation(clientFormat, virtualFormat, NO) ||
-		   fabs(clientFormat.mSampleRate - virtualFormat.mSampleRate) >= 1.0) return NO;
-		if(!(virtualFormat.mFormatFlags & kAudioFormatFlagIsNonMixable) ||
-		   ![self currentProcessOwnsHogMode]) return NO;
+		   !(virtualFormat.mFormatFlags & kAudioFormatFlagIsNonMixable)) return NO;
 	}
 	return YES;
 }
 
 - (BOOL)applyPreferredVirtualFormatSetAtSampleRate:(double)sampleRate {
-	if(preferExclusiveIntegerTransport) {
-		NSArray<NSNumber *> *streams = preferredIntegerVirtualFormats.allKeys;
+	NSDictionary<NSNumber *, NSValue *> *preferredVirtualFormats = preferExclusiveIntegerTransport ?
+	                                                                  preferredIntegerVirtualFormats :
+	                                                                  (preferExclusiveFloatTransport ? preferredFloatVirtualFormats : nil);
+	if(preferredVirtualFormats.count) {
+		NSArray<NSNumber *> *streams = preferredVirtualFormats.allKeys;
 		NSDictionary<NSNumber *, NSValue *> *currentFormats = [self currentVirtualFormatSetForStreams:streams];
-		if(currentFormats.count != preferredIntegerVirtualFormats.count) return NO;
+		if(currentFormats.count != preferredVirtualFormats.count) return NO;
 		BOOL alreadyConfigured = YES;
-		for(NSNumber *streamNumber in preferredIntegerVirtualFormats) {
+		for(NSNumber *streamNumber in preferredVirtualFormats) {
 			AudioStreamBasicDescription current = { 0 }, target = { 0 };
 			if(!GetPhysicalFormatValue(currentFormats[streamNumber], &current) ||
-			   !GetPhysicalFormatValue(preferredIntegerVirtualFormats[streamNumber], &target)) return NO;
+			   !GetPhysicalFormatValue(preferredVirtualFormats[streamNumber], &target)) return NO;
 			target.mSampleRate = sampleRate;
 			if(!PhysicalFormatsMatch(current, target)) alreadyConfigured = NO;
 		}
@@ -2029,7 +2147,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			savedVirtualFormatDeviceID = outputDeviceID;
 			savedVirtualFormats = currentFormats;
 		}
-		if([self setVirtualFormatSet:preferredIntegerVirtualFormats]) return YES;
+		if([self setVirtualFormatSet:preferredVirtualFormats]) return YES;
 		if(capturedOriginal) {
 			savedVirtualFormatValid = NO;
 			savedVirtualFormats = nil;
@@ -2056,11 +2174,14 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 
 - (BOOL)restoreSavedVirtualFormatSetAtCurrentSampleRate {
 	if(!savedVirtualFormatValid || savedVirtualFormatDeviceID != outputDeviceID) return YES;
-	const BOOL previousPreference = preferExclusiveIntegerTransport;
+	const BOOL previousIntegerPreference = preferExclusiveIntegerTransport;
+	const BOOL previousFloatPreference = preferExclusiveFloatTransport;
 	preferExclusiveIntegerTransport = NO;
+	preferExclusiveFloatTransport = NO;
 	const double sampleRate = [self currentDeviceSampleRate];
 	const BOOL restored = sampleRate > 0.0 && [self applyPreferredVirtualFormatSetAtSampleRate:sampleRate];
-	preferExclusiveIntegerTransport = previousPreference;
+	preferExclusiveIntegerTransport = previousIntegerPreference;
+	preferExclusiveFloatTransport = previousFloatPreference;
 	return restored;
 }
 
@@ -2123,6 +2244,9 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 - (void)configureSharedIntegerOutputAtSampleRate:(double)sampleRate
 	                                  requiredBits:(UInt32)requiredBits
 	                             requireDoPCarrier:(BOOL)requireDoPCarrier {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 	preferExclusiveIntegerTransport = NO;
 	preferredIntegerTransportRequiresHog = NO;
 	preferredIntegerVirtualFormats = nil;
@@ -2145,7 +2269,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 - (void)configurePreferredIntegerOutputAtSampleRate:(double)sampleRate
 	                                     requiredBits:(UInt32)requiredBits
 	                                requireDoPCarrier:(BOOL)requireDoPCarrier {
-	if(exclusiveIntegerOutput) {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	if(exclusiveOutputEnabled) {
 		NSDictionary<NSNumber *, NSValue *> *virtualFormats = nil;
 		NSDictionary<NSNumber *, NSValue *> *physicalFormats = nil;
 		AudioStreamBasicDescription clientFormat = { 0 };
@@ -2169,6 +2296,25 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	[self configureSharedIntegerOutputAtSampleRate:sampleRate
 	                                      requiredBits:requiredBits
 	                                 requireDoPCarrier:requireDoPCarrier];
+}
+
+- (void)configurePreferredFloatOutputForInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                      sampleRate:(double)sampleRate {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	if(!exclusiveOutputEnabled) return;
+
+	NSDictionary<NSNumber *, NSValue *> *virtualFormats = nil;
+	AudioStreamBasicDescription clientFormat = { 0 };
+	if([self findExclusiveFloatVirtualFormatSetForInputFormat:inputFormat
+	                                              sampleRate:sampleRate
+	                                           virtualFormats:&virtualFormats
+	                                              clientFormat:&clientFormat]) {
+		preferExclusiveFloatTransport = YES;
+		preferredFloatVirtualFormats = virtualFormats;
+		preferredFloatClientFormat = clientFormat;
+	}
 }
 
 - (BOOL)deviceSupportsSampleRate:(double)sampleRate {
@@ -2358,9 +2504,15 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
 	const BOOL targetIntegerPhysical = preferIntegerPhysicalOutput;
 	const BOOL targetEndToEndInteger = preferExclusiveIntegerTransport;
+	const BOOL targetExclusiveFloat = preferExclusiveFloatTransport && preferredFloatVirtualFormats.count > 0;
+	const BOOL targetExclusiveTransport = targetEndToEndInteger || targetExclusiveFloat;
 	AVAudioFormat *format = nil;
 	if(targetEndToEndInteger) {
 		AudioStreamBasicDescription exclusiveFormat = preferredIntegerClientFormat;
+		if(requestedSampleRate > 0.0) exclusiveFormat.mSampleRate = requestedSampleRate;
+		format = [[AVAudioFormat alloc] initWithStreamDescription:&exclusiveFormat];
+	} else if(targetExclusiveFloat) {
+		AudioStreamBasicDescription exclusiveFormat = preferredFloatClientFormat;
 		if(requestedSampleRate > 0.0) exclusiveFormat.mSampleRate = requestedSampleRate;
 		format = [[AVAudioFormat alloc] initWithStreamDescription:&exclusiveFormat];
 	} else {
@@ -2467,7 +2619,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 		resetting = YES;
 		[self stopCurrentHardware];
-		if(renderAVFormat && !targetEndToEndInteger) {
+		if(renderAVFormat && !targetExclusiveTransport) {
 			[_au.inputBusses[0] setFormat:renderAVFormat error:&err];
 		}
 		// DoP is already a packed bitstream at this point. A float fallback would
@@ -2539,6 +2691,9 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		const BOOL previousRenderFormatIntegerPhysical = renderFormatIntegerPhysical;
 		const BOOL previousRenderFormatEndToEndInteger = renderFormatEndToEndInteger;
 		const BOOL previousHogModeOwned = [self currentProcessOwnsHogMode];
+		const BOOL previousExclusiveFloat = previousExclusiveIOProcCreated && previousHogModeOwned &&
+		                                    (AudioFormatIsFloat32(previousRenderFormat) ||
+		                                     AudioFormatIsFloat64(previousRenderFormat));
 		if(previousHogModeOwned) {
 			hogModeOwned = YES;
 			hogModeDeviceID = outputDeviceID;
@@ -2561,7 +2716,13 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		const BOOL targetEndToEndInteger = preferExclusiveIntegerTransport &&
 		                                     preferredIntegerVirtualFormats.count > 0 &&
 		                                     preferredIntegerPhysicalFormats.count > 0;
-		const BOOL targetRequiresHog = targetEndToEndInteger && preferredIntegerTransportRequiresHog;
+		const BOOL targetExclusiveFloat = preferExclusiveFloatTransport &&
+		                                  preferredFloatVirtualFormats.count > 0 &&
+		                                  (AudioFormatIsFloat32(preferredFloatClientFormat) ||
+		                                   AudioFormatIsFloat64(preferredFloatClientFormat));
+		const BOOL targetExclusiveTransport = targetEndToEndInteger || targetExclusiveFloat;
+		const BOOL targetRequiresHog = targetExclusiveFloat ||
+		                              (targetEndToEndInteger && preferredIntegerTransportRequiresHog);
 
 		resetting = YES;
 		if(hardwareWasRunning) {
@@ -2575,10 +2736,11 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		}
 
 		BOOL prepared = !targetRequiresHog || [self acquireHogModeForCurrentDevice];
-		if(prepared && targetEndToEndInteger) {
-			// Capture both sides before either property is changed: some drivers update
-			// the companion stream format as a side effect of the first write.
-			if(!savedPhysicalFormatValid && previousPhysicalFormatsValid) {
+		if(prepared && targetExclusiveTransport) {
+			// Integer transport changes both sides of the stream. Float-exclusive
+			// transport changes only the client/virtual representation, leaving the
+			// driver's physical representation under its own generic negotiation.
+			if(targetEndToEndInteger && !savedPhysicalFormatValid && previousPhysicalFormatsValid) {
 				savedPhysicalFormatValid = YES;
 				savedPhysicalFormatDeviceID = outputDeviceID;
 				savedPhysicalFormats = previousPhysicalFormats;
@@ -2601,7 +2763,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		if(prepared && !targetRequiresHog && hogModeOwned) {
 			prepared = [self releaseHogModeForCurrentDevice];
 		}
-		if(prepared && !targetEndToEndInteger) {
+		if(prepared && !targetExclusiveTransport) {
 			prepared = [self ensureAUHALBoundToOutputDevice];
 		}
 		if(prepared) {
@@ -2611,21 +2773,25 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 
 		NSError *resourceError = nil;
 		if(prepared) {
-			if(targetEndToEndInteger) {
+			if(targetExclusiveTransport) {
 				prepared = [self createExclusiveIOProc];
 			} else {
 				prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
 			}
 		}
-		AVAudioFormat *configuredInputFormat = targetEndToEndInteger ? nil : _au.inputBusses[0].format;
-		if(prepared && !targetEndToEndInteger &&
+		AVAudioFormat *configuredInputFormat = targetExclusiveTransport ? nil : _au.inputBusses[0].format;
+		if(prepared && !targetExclusiveTransport &&
 		   (!configuredInputFormat || fabs(configuredInputFormat.sampleRate - sampleRate) >= 1.0)) {
 			ALog(@"Core Audio retained a stale input-bus rate (requested %.0f Hz, got %.0f Hz)",
 			     sampleRate, configuredInputFormat ? configuredInputFormat.sampleRate : 0.0);
 			prepared = NO;
 		}
+		if(prepared && targetExclusiveTransport && ![self currentOutputUsesExclusiveTransport]) {
+			ALog(@"Core Audio did not retain the requested exclusive client and virtual format");
+			prepared = NO;
+		}
 		if(prepared && targetEndToEndInteger && ![self currentOutputIsEndToEndInteger]) {
-			ALog(@"Core Audio did not retain a matching integer client, virtual, and physical format");
+			ALog(@"Core Audio did not retain a matching integer virtual and physical format");
 			prepared = NO;
 		}
 
@@ -2659,6 +2825,14 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			preferredIntegerTransportRequiresHog = previousHogModeOwned;
 			preferredIntegerVirtualFormats = previousRenderFormatEndToEndInteger && previousVirtualFormatsValid ?
 			                                     previousVirtualFormats : nil;
+			preferExclusiveFloatTransport = previousExclusiveFloat;
+			preferredFloatVirtualFormats = previousExclusiveFloat && previousVirtualFormatsValid ?
+			                                  previousVirtualFormats : nil;
+			if(previousExclusiveFloat) {
+				preferredFloatClientFormat = previousRenderFormat;
+			} else {
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+			}
 
 			BOOL restored = YES;
 			if(previousHogModeOwned && ![self currentProcessOwnsHogMode]) {
@@ -2692,7 +2866,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			renderFormatIntegerPhysical = previousRenderFormatIntegerPhysical;
 			renderFormatEndToEndInteger = previousRenderFormatEndToEndInteger;
 			NSError *rollbackError = nil;
-			if(previousRenderFormatEndToEndInteger && previousExclusiveIOProcCreated) {
+			if(previousExclusiveIOProcCreated) {
 				restored = [self createExclusiveIOProc] && restored;
 			} else {
 				restored = [self ensureAUHALBoundToOutputDevice] && restored;
@@ -2783,15 +2957,16 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			}
 		}
 
+		const BOOL preferExclusiveTransport = preferExclusiveIntegerTransport || preferExclusiveFloatTransport;
 		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:requestedSampleRate];
-		if(prepared && preferExclusiveIntegerTransport) {
+		if(prepared && preferExclusiveTransport) {
 			prepared = [self createExclusiveIOProc];
 		} else if(renderResourcesWereAllocated) {
 			NSError *resourceError = nil;
 			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil && prepared;
 		}
-		AVAudioFormat *configuredInputFormat = preferExclusiveIntegerTransport ? nil : _au.inputBusses[0].format;
-		if(prepared && !preferExclusiveIntegerTransport && (!configuredInputFormat ||
+		AVAudioFormat *configuredInputFormat = preferExclusiveTransport ? nil : _au.inputBusses[0].format;
+		if(prepared && !preferExclusiveTransport && (!configuredInputFormat ||
 		                fabs(configuredInputFormat.sampleRate - renderFormat.mSampleRate) >= 1.0)) {
 			prepared = NO;
 		}
@@ -2884,6 +3059,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	}
 
 	if(!usesDoPCarrier) {
+		DLog(@"Preparing PCM source %@ (exclusive enabled: %@, source rate supported: %@)",
+		     outputFormatDescription(inputFormat, NO),
+		     exclusiveOutputEnabled ? @"yes" : @"no",
+		     sampleRateSupported ? @"yes" : @"no");
 		// A pending DoP seek is only meaningful while another DoP carrier is
 		// expected. If playback moves to PCM before that carrier arrives, do not
 		// keep replacing PCM buffers with DoP silence indefinitely.
@@ -2906,13 +3085,25 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			[self configurePreferredIntegerOutputAtSampleRate:sampleRate
 			                                       requiredBits:inputFormat.mBitsPerChannel
 			                                  requireDoPCarrier:NO];
-		} else {
+		} else if(sampleRateSupported &&
+		          (AudioFormatIsFloat32(inputFormat) || AudioFormatIsFloat64(inputFormat))) {
 			preferExclusiveIntegerTransport = NO;
 			preferredIntegerTransportRequiresHog = NO;
 			preferredIntegerVirtualFormats = nil;
 			preferIntegerPhysicalOutput = NO;
 			preferredIntegerPhysicalFormats = nil;
 			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			[self configurePreferredFloatOutputForInputFormat:inputFormat sampleRate:sampleRate];
+		} else {
+			preferExclusiveIntegerTransport = NO;
+			preferredIntegerTransportRequiresHog = NO;
+			preferredIntegerVirtualFormats = nil;
+			preferExclusiveFloatTransport = NO;
+			preferredFloatVirtualFormats = nil;
+			preferIntegerPhysicalOutput = NO;
+			preferredIntegerPhysicalFormats = nil;
+			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 		}
 
 		// A matching hardware clock is a prerequisite for bit-perfect PCM.
@@ -2921,11 +3112,11 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			// The queued converter was intentionally configured for this source
 			// rate. Do not silently hand it to AUHAL for hidden SRC if the clock
 			// and render-format transition cannot be completed together.
-			const BOOL requestedExclusiveIntegerOutput = preferExclusiveIntegerTransport;
+			const BOOL requestedExclusiveOutput = preferExclusiveIntegerTransport || preferExclusiveFloatTransport;
 			const BOOL requestedIntegerPhysicalOutput = preferIntegerPhysicalOutput;
 			BOOL prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
-			if(!prepared && requestedExclusiveIntegerOutput) {
-				ALog(@"Exclusive integer output was unavailable; retrying with shared Core Audio output");
+			if(!prepared && requestedExclusiveOutput) {
+				ALog(@"Exclusive output was unavailable; retrying with shared Core Audio output");
 				preferDoPIntegerOutput = NO;
 				preferredDoPCarrierSampleRate = 0.0;
 				preferNativeHighPrecisionOutput = highPrecisionPCM && sampleRateSupported &&
@@ -2934,9 +3125,21 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 					preferredNativeHighPrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
 					preferredNativeHighPrecisionFormat.mSampleRate = sampleRate;
 				}
-				[self configureSharedIntegerOutputAtSampleRate:sampleRate
-				                                      requiredBits:inputFormat.mBitsPerChannel
-				                                 requireDoPCarrier:NO];
+				if(AudioFormatIsIntegerPCM(inputFormat)) {
+					[self configureSharedIntegerOutputAtSampleRate:sampleRate
+					                                      requiredBits:inputFormat.mBitsPerChannel
+					                                 requireDoPCarrier:NO];
+				} else {
+					preferExclusiveIntegerTransport = NO;
+					preferredIntegerTransportRequiresHog = NO;
+					preferredIntegerVirtualFormats = nil;
+					preferExclusiveFloatTransport = NO;
+					preferredFloatVirtualFormats = nil;
+					preferIntegerPhysicalOutput = NO;
+					preferredIntegerPhysicalFormats = nil;
+					bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+					bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+				}
 				prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
 			}
 			if(!prepared && requestedIntegerPhysicalOutput) {
@@ -2956,7 +3159,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 				preferExclusiveIntegerTransport = NO;
 				preferredIntegerTransportRequiresHog = NO;
 				preferredIntegerVirtualFormats = nil;
+				preferExclusiveFloatTransport = NO;
+				preferredFloatVirtualFormats = nil;
 				bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 				prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
 			}
 			if(prepared) {
@@ -2969,7 +3175,8 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		}
 
 		if(renderFormatDoPInteger || renderFormatNativeHighPrecision || renderFormatIntegerPhysical ||
-		   renderFormatEndToEndInteger || savedPhysicalFormatValid || savedVirtualFormatValid || hogModeOwned) {
+		   renderFormatEndToEndInteger || exclusiveIOProcID || savedPhysicalFormatValid ||
+		   savedVirtualFormatValid || hogModeOwned) {
 			const double currentSampleRate = [self currentDeviceSampleRate];
 			BOOL prepared = currentSampleRate > 0.0 ? [self applyDeviceSampleRateAndFormat:currentSampleRate] :
 			                                                [self updateDeviceFormatNotifyingController:NO];
@@ -3004,9 +3211,12 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		preferExclusiveIntegerTransport = NO;
 		preferredIntegerTransportRequiresHog = NO;
 		preferredIntegerVirtualFormats = nil;
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
 		preferIntegerPhysicalOutput = NO;
 		preferredIntegerPhysicalFormats = nil;
 		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 	}
 	const BOOL requestedExclusiveIntegerOutput = preferExclusiveIntegerTransport;
 	const BOOL requestedIntegerPhysicalOutput = preferIntegerPhysicalOutput;
@@ -3032,7 +3242,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		preferExclusiveIntegerTransport = NO;
 		preferredIntegerTransportRequiresHog = NO;
 		preferredIntegerVirtualFormats = nil;
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
 		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 		prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
 	}
 	if(prepared && renderFormatDoPInteger) {
@@ -3055,7 +3268,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	preferExclusiveIntegerTransport = NO;
 	preferredIntegerTransportRequiresHog = NO;
 	preferredIntegerVirtualFormats = nil;
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
 	bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 	[faderNode setDoPMode:NO];
 	return NO;
 }
@@ -3510,6 +3726,9 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		preferredIntegerTransportRequiresHog = NO;
 		preferredIntegerVirtualFormats = nil;
 		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 		savedPhysicalFormatValid = NO;
 		savedPhysicalFormatDeviceID = kAudioObjectUnknown;
 		savedPhysicalFormats = nil;
@@ -3570,7 +3789,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		}
 
 		suspendOutputOnPause = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"suspendOutputOnPause"];
-		exclusiveIntegerOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
+		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
 
 		[self audioOutputBlock];
 
@@ -3844,12 +4063,25 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			// Restore the device's mixable virtual format and retry through AUHAL so
 			// opting into exclusive mode can never turn a playable track into silence.
 			ALog(@"Direct HAL output could not start; retrying with shared Core Audio output: %@", err);
-			const BOOL requireDoPCarrier = renderFormatDoPInteger;
-			const UInt32 requiredBits = requireDoPCarrier ? 24 : sourceFormat.mBitsPerChannel;
-			[self configureSharedIntegerOutputAtSampleRate:renderFormat.mSampleRate
-			                                      requiredBits:requiredBits
-			                                 requireDoPCarrier:requireDoPCarrier];
+			if(AudioFormatIsFloat32(sourceFormat) || AudioFormatIsFloat64(sourceFormat)) {
+				preferExclusiveFloatTransport = NO;
+				preferredFloatVirtualFormats = nil;
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+				preferExclusiveIntegerTransport = NO;
+				preferredIntegerTransportRequiresHog = NO;
+				preferredIntegerVirtualFormats = nil;
+				preferIntegerPhysicalOutput = NO;
+				preferredIntegerPhysicalFormats = nil;
+				bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			} else {
+				const BOOL requireDoPCarrier = renderFormatDoPInteger;
+				const UInt32 requiredBits = requireDoPCarrier ? 24 : sourceFormat.mBitsPerChannel;
+				[self configureSharedIntegerOutputAtSampleRate:renderFormat.mSampleRate
+				                                      requiredBits:requiredBits
+				                                 requireDoPCarrier:requireDoPCarrier];
+			}
 			if([self applyDeviceSampleRateAndFormat:renderFormat.mSampleRate]) {
+				[self refreshOutputStatus];
 				err = nil;
 				hardwareStarted = [self startCurrentHardware:&err];
 			}
