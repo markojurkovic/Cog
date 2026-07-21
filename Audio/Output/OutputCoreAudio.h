@@ -92,20 +92,29 @@ using std::atomic_long;
 	AVAudioFormat *_deviceFormat;
 
 	AudioDeviceID outputDeviceID;
+	NSMutableDictionary<NSNumber *, NSNumber *> *sampleRateSupportCache;
 	AudioStreamBasicDescription deviceFormat;
 	AudioStreamBasicDescription renderFormat;
+	AudioStreamBasicDescription sourceFormat;
 	AudioStreamBasicDescription realStreamFormat; // stream format pre-hrtf
 	AudioStreamBasicDescription streamFormat; // stream format last seen in render callback
 
 	uint32_t deviceChannelConfig;
+	uint32_t sourceChannelConfig;
 	uint32_t realStreamChannelConfig;
 	uint32_t streamChannelConfig;
+	BOOL sourceFormatValid;
+	BOOL hdcdDetected;
 
 	BOOL preferDoPIntegerOutput;
 	BOOL renderFormatDoPInteger;
 	double preferredDoPCarrierSampleRate;
+	BOOL preferNativeHighPrecisionOutput;
+	BOOL renderFormatNativeHighPrecision;
+	AudioStreamBasicDescription preferredNativeHighPrecisionFormat;
 
 	float *outputFloatScratch;
+	float *inputFloatScratch;
 	size_t outputFloatScratchCapacity;
 
 	AUAudioUnit *_au;
@@ -139,6 +148,8 @@ using std::atomic_long;
 - (void)pause;
 - (void)resume;
 - (void)stop;
+- (BOOL)beginStreamReplacement;
+- (void)finishStreamReplacement;
 
 - (void)fadeOut;
 - (void)fadeOutBackground;
@@ -161,6 +172,7 @@ using std::atomic_long;
 - (uint32_t)deviceChannelConfig;
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat;
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat;
+- (void)refreshOutputStatus;
 
 - (DSPDownmixNode *)downmix;
 - (DSPFaderNode *)fader;

@@ -237,7 +237,7 @@ static void unregisterMotionListener(void) {
 			return NO;
 		}
 
-		outputFormat = inputFormat;
+		outputFormat = AudioFormatAsFloat32(inputFormat);
 		outputFormat.mChannelsPerFrame = 2;
 		outputFormat.mBytesPerFrame = sizeof(float) * outputFormat.mChannelsPerFrame;
 		outputFormat.mBytesPerPacket = outputFormat.mBytesPerFrame * outputFormat.mFramesPerPacket;
@@ -406,7 +406,7 @@ static void unregisterMotionListener(void) {
 	NSData *sampleData = [chunk removeSamples:frameCount];
 	if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:inputFormat];
+		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

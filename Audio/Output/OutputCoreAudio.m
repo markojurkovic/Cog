@@ -7,6 +7,7 @@
 //
 
 #import "OutputCoreAudio.h"
+#import "AudioChunk.h"
 #import "OutputNode.h"
 
 #ifdef _DEBUG
@@ -30,13 +31,179 @@ extern void scale_by_volume(float *buffer, size_t count, float volume);
 
 static NSNotificationName CogPlaybackDidBeginNotificiation = @"CogPlaybackDidBeginNotificiation";
 
+NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification = @"CogCoreAudioOutputFormatDidChangeNotification";
+NSString *const CogCoreAudioOutputFormatDescriptionKey = @"CogCoreAudioOutputFormatDescription";
+NSString *const CogCoreAudioDeviceFormatDescriptionKey = @"CogCoreAudioDeviceFormatDescription";
+NSString *const CogCoreAudioSignalIntegrityLosslessKey = @"CogCoreAudioSignalIntegrityLossless";
+NSString *const CogCoreAudioSignalIntegrityDetailsKey = @"CogCoreAudioSignalIntegrityDetails";
+
 static BOOL playbackFadesEnabled(void) {
 	NSNumber *enabled = [[NSUserDefaults standardUserDefaults] objectForKey:@"enableFading"];
 	return !enabled || [enabled boolValue];
 }
 
+static NSArray<NSString *> *signalIntegrityPreferenceKeyPaths(void) {
+	static NSArray<NSString *> *keyPaths;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		keyPaths = @[
+			@"values.volumeScaling",
+			@"values.enableFading",
+			@"values.enableHDCD",
+			@"values.GraphicEQenable",
+			@"values.enableHrtf",
+			@"values.enableFSurround",
+			@"values.pitch",
+			@"values.tempo",
+			@"values.rubberbandEngine",
+		];
+	});
+	return keyPaths;
+}
+
+static BOOL pcmRepresentationPreservesSamples(AudioStreamBasicDescription source,
+                                               AudioStreamBasicDescription destination) {
+	if(source.mFormatID != kAudioFormatLinearPCM ||
+	   destination.mFormatID != kAudioFormatLinearPCM ||
+	   !source.mBitsPerChannel || !destination.mBitsPerChannel) {
+		return NO;
+	}
+
+	const BOOL sourceIsFloat = !!(source.mFormatFlags & kAudioFormatFlagIsFloat);
+	const BOOL destinationIsFloat = !!(destination.mFormatFlags & kAudioFormatFlagIsFloat);
+	if(sourceIsFloat) {
+		// Arbitrary floating-point samples are not generally integer-grid values.
+		return destinationIsFloat && destination.mBitsPerChannel >= source.mBitsPerChannel;
+	}
+
+	if(destinationIsFloat) {
+		const UInt32 significandBits = destination.mBitsPerChannel == 32 ? 24 :
+		                               destination.mBitsPerChannel == 64 ? 53 : 0;
+		return significandBits >= source.mBitsPerChannel;
+	}
+
+	return destination.mBitsPerChannel >= source.mBitsPerChannel;
+}
+
+static BOOL channelMappingPreservesSamples(AudioStreamBasicDescription source,
+                                           uint32_t sourceConfig,
+                                           AudioStreamBasicDescription destination,
+                                           uint32_t destinationConfig) {
+	if(source.mChannelsPerFrame != destination.mChannelsPerFrame) {
+		return NO;
+	}
+
+	// Decoder metadata may omit a channel mask even though AudioChunk assigns
+	// the conventional layout from the channel count before playback. Compare
+	// the effective layouts used by the audio chain, not the raw missing mask.
+	if(!sourceConfig) {
+		sourceConfig = [AudioChunk guessChannelConfig:source.mChannelsPerFrame];
+	}
+	if(!destinationConfig) {
+		destinationConfig = [AudioChunk guessChannelConfig:destination.mChannelsPerFrame];
+	}
+
+	return sourceConfig == destinationConfig ||
+	       (source.mChannelsPerFrame == 2 &&
+	        sourceConfig == (AudioChannelSideLeft | AudioChannelSideRight) &&
+	        destinationConfig == AudioConfigStereo);
+}
+
+static NSString *outputSampleRateDescription(double sampleRate) {
+	if(sampleRate >= 1000.0) {
+		const double sampleRateKHz = sampleRate / 1000.0;
+		if(fabs(sampleRateKHz - round(sampleRateKHz)) < 0.0001) {
+			return [NSString stringWithFormat:@"%.0f kHz", sampleRateKHz];
+		}
+		return [NSString stringWithFormat:@"%.1f kHz", sampleRateKHz];
+	}
+	return [NSString stringWithFormat:@"%.0f Hz", sampleRate];
+}
+
+static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOOL isDoP) {
+	NSString *formatName;
+	if(isDoP) {
+		formatName = @"DoP";
+	} else if(format.mFormatID == kAudioFormatLinearPCM) {
+		if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+			formatName = [NSString stringWithFormat:@"Float%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else if(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+			formatName = [NSString stringWithFormat:@"Int%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else {
+			formatName = [NSString stringWithFormat:@"UInt%u PCM", (unsigned int)format.mBitsPerChannel];
+		}
+	} else {
+		formatName = @"Core Audio";
+	}
+
+	const BOOL nonInterleaved = !!(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+	const UInt32 bytesPerSample = nonInterleaved ? format.mBytesPerFrame :
+	                                              (format.mChannelsPerFrame ? format.mBytesPerFrame / format.mChannelsPerFrame : 0);
+	const UInt32 containerBits = bytesPerSample * 8;
+	NSString *bitDepthDescription;
+	if(containerBits > format.mBitsPerChannel) {
+		bitDepthDescription = [NSString stringWithFormat:@"%u-bit (%u-bit container)",
+		                                                      (unsigned int)format.mBitsPerChannel,
+		                                                      (unsigned int)containerBits];
+	} else {
+		bitDepthDescription = [NSString stringWithFormat:@"%u-bit", (unsigned int)format.mBitsPerChannel];
+	}
+
+	return [NSString stringWithFormat:@"%@ · %@ · %@",
+	                                  formatName,
+	                                  outputSampleRateDescription(format.mSampleRate),
+	                                  bitDepthDescription];
+}
+
+static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
+	if(deviceID == kAudioObjectUnknown || deviceID == (AudioDeviceID)-1) {
+		return nil;
+	}
+
+	AudioObjectPropertyAddress streamsAddress = {
+		.mSelector = kAudioDevicePropertyStreams,
+		.mScope = kAudioDevicePropertyScopeOutput,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 streamsSize = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(deviceID, &streamsAddress, 0, NULL, &streamsSize);
+	if(status != noErr || streamsSize < sizeof(AudioStreamID)) {
+		return nil;
+	}
+
+	AudioStreamID *streams = (AudioStreamID *)malloc(streamsSize);
+	if(!streams) {
+		return nil;
+	}
+	status = AudioObjectGetPropertyData(deviceID, &streamsAddress, 0, NULL, &streamsSize, streams);
+	if(status != noErr) {
+		free(streams);
+		return nil;
+	}
+
+	NSMutableOrderedSet<NSString *> *descriptions = [NSMutableOrderedSet orderedSet];
+	const UInt32 streamCount = streamsSize / (UInt32)sizeof(AudioStreamID);
+	AudioObjectPropertyAddress formatAddress = {
+		.mSelector = kAudioStreamPropertyPhysicalFormat,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	for(UInt32 i = 0; i < streamCount; ++i) {
+		AudioStreamBasicDescription format = { 0 };
+		UInt32 formatSize = sizeof(format);
+		status = AudioObjectGetPropertyData(streams[i], &formatAddress, 0, NULL, &formatSize, &format);
+		if(status == noErr && formatSize == sizeof(format) && format.mFormatID) {
+			[descriptions addObject:outputFormatDescription(format, NO)];
+		}
+	}
+	free(streams);
+
+	return descriptions.count ? [[descriptions array] componentsJoinedByString:@" / "] : nil;
+}
+
 @implementation OutputCoreAudio {
 	VisualizationController *visController;
+	BOOL streamReplacementPending;
 }
 
 static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
@@ -76,6 +243,8 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 		outputController = c;
 		volume = 1.0;
 		outputDeviceID = -1;
+		sampleRateSupportCache = [NSMutableDictionary new];
+		streamReplacementPending = NO;
 
 		secondsHdcdSustained = 0;
 
@@ -88,6 +257,109 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 	}
 
 	return self;
+}
+
+- (NSDictionary *)signalIntegrityInfo {
+	if(!sourceFormatValid) {
+		return @{
+			CogCoreAudioSignalIntegrityDetailsKey: NSLocalizedString(@"Source sample information is not available.", @"Unknown Cog signal-integrity details")
+		};
+	}
+
+	NSMutableArray<NSString *> *reasons = [NSMutableArray array];
+	const BOOL sourceIsDSD = sourceFormat.mBitsPerChannel == 1;
+	if(sourceIsDSD) {
+		if(!renderFormatDoPInteger) {
+			[reasons addObject:NSLocalizedString(@"DSD-to-PCM conversion", @"Cog signal-integrity modification reason")];
+		}
+		if(sourceFormat.mChannelsPerFrame != renderFormat.mChannelsPerFrame) {
+			[reasons addObject:NSLocalizedString(@"channel conversion", @"Cog signal-integrity modification reason")];
+		}
+	} else {
+		if(fabs(sourceFormat.mSampleRate - renderFormat.mSampleRate) >= 0.5) {
+			[reasons addObject:[NSString stringWithFormat:NSLocalizedString(@"resampling from %@ to %@", @"Cog signal-integrity resampling reason"),
+			                                                    outputSampleRateDescription(sourceFormat.mSampleRate),
+			                                                    outputSampleRateDescription(renderFormat.mSampleRate)]];
+		}
+		if(!channelMappingPreservesSamples(sourceFormat,
+		                                  sourceChannelConfig,
+		                                  renderFormat,
+		                                  deviceChannelConfig)) {
+			[reasons addObject:NSLocalizedString(@"channel-layout conversion", @"Cog signal-integrity modification reason")];
+		}
+		if(!pcmRepresentationPreservesSamples(sourceFormat, renderFormat)) {
+			[reasons addObject:NSLocalizedString(@"sample-format precision reduction", @"Cog signal-integrity modification reason")];
+		}
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		if([outputController currentConverterAppliesVolumeScaling]) {
+			[reasons addObject:NSLocalizedString(@"ReplayGain or tagged volume scaling", @"Cog signal-integrity modification reason")];
+		}
+		if(volume != 1.0f) {
+			[reasons addObject:NSLocalizedString(@"Cog volume is not 100%", @"Cog signal-integrity modification reason")];
+		}
+		if(playbackFadesEnabled()) {
+			[reasons addObject:NSLocalizedString(@"transition fading is enabled", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"GraphicEQenable"]) {
+			[reasons addObject:NSLocalizedString(@"equalizer processing", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"enableHrtf"]) {
+			[reasons addObject:NSLocalizedString(@"HRTF processing", @"Cog signal-integrity modification reason")];
+		}
+		if([defaults boolForKey:@"enableFSurround"] && sourceFormat.mChannelsPerFrame == 2) {
+			[reasons addObject:NSLocalizedString(@"FreeSurround processing", @"Cog signal-integrity modification reason")];
+		}
+
+		NSNumber *pitchSetting = [defaults objectForKey:@"pitch"];
+		NSNumber *tempoSetting = [defaults objectForKey:@"tempo"];
+		const double pitch = pitchSetting ? [pitchSetting doubleValue] : 1.0;
+		const double tempo = tempoSetting ? [tempoSetting doubleValue] : 1.0;
+		NSString *stretchEngine = [defaults stringForKey:@"rubberbandEngine"];
+		if(![stretchEngine isEqualToString:@"disabled"] &&
+		   (fabs(pitch - 1.0) >= 1e-7 || fabs(tempo - 1.0) >= 1e-7)) {
+			[reasons addObject:NSLocalizedString(@"time or pitch processing", @"Cog signal-integrity modification reason")];
+		}
+		if(hdcdDetected && [defaults boolForKey:@"enableHDCD"]) {
+			[reasons addObject:NSLocalizedString(@"HDCD decoding", @"Cog signal-integrity modification reason")];
+		}
+	}
+
+	const BOOL lossless = reasons.count == 0;
+	NSString *details;
+	if(lossless) {
+		details = NSLocalizedString(@"Decoded source sample values are preserved through Cog; representation-only changes may still be shown.", @"Lossless Cog signal-integrity details");
+	} else {
+		details = [NSString stringWithFormat:NSLocalizedString(@"Cog changes the decoded source samples: %@.", @"Modified Cog signal-integrity details"),
+		                                           [reasons componentsJoinedByString:@"; "]];
+	}
+	return @{
+		CogCoreAudioSignalIntegrityLosslessKey: @(lossless),
+		CogCoreAudioSignalIntegrityDetailsKey: details,
+	};
+}
+
+- (void)postOutputFormatDescription:(NSString *)description {
+	NSDictionary *userInfo = nil;
+	if(description) {
+		NSString *deviceDescription = physicalOutputFormatDescription(outputDeviceID);
+		NSMutableDictionary *formatInfo = [@{ CogCoreAudioOutputFormatDescriptionKey: description } mutableCopy];
+		[formatInfo addEntriesFromDictionary:[self signalIntegrityInfo]];
+		if(deviceDescription) {
+			formatInfo[CogCoreAudioDeviceFormatDescriptionKey] = deviceDescription;
+		}
+		userInfo = formatInfo;
+	}
+	dispatch_block_t postNotification = ^{
+		[[NSNotificationCenter defaultCenter] postNotificationName:CogCoreAudioOutputFormatDidChangeNotification
+		                                                    object:self
+		                                                  userInfo:userInfo];
+	};
+	if([NSThread isMainThread]) {
+		postNotification();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), postNotification);
+	}
 }
 
 static OSStatus
@@ -132,6 +404,14 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			else
 				[self resume];
 		}
+	} else if([signalIntegrityPreferenceKeyPaths() containsObject:keyPath]) {
+		// ConverterNode and the DSP nodes observe the same preferences. Defer the
+		// refresh by one main-queue turn so their active state is updated first.
+		dispatch_async(dispatch_get_main_queue(), ^{
+			if(!self->stopping) {
+				[self refreshOutputStatus];
+			}
+		});
 	}
 }
 
@@ -151,9 +431,27 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 }
 
 - (BOOL)processEndOfStream {
-	if(stopping || ([outputController endOfStream] == YES && [self signalEndOfStream:[outputController getTotalLatency]])) {
-		stopping = YES;
+	if(stopping) {
 		return YES;
+	}
+	if([outputController endOfStream] != YES) {
+		return NO;
+	}
+
+	// Serialize the final end-of-stream decision with manual replacement. The
+	// old chain may publish EOS after the replacement has already begun; in
+	// that case it must not shut down the retained AUHAL render thread.
+	@synchronized(self) {
+		if(stopping) {
+			return YES;
+		}
+		if(streamReplacementPending || [outputController endOfStream] != YES) {
+			return NO;
+		}
+		if([self signalEndOfStream:[outputController getTotalLatency]]) {
+			stopping = YES;
+			return YES;
+		}
 	}
 	return NO;
 }
@@ -197,7 +495,12 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	while(!stopping) {
 		@autoreleasepool {
 			if(outputdevicechanged) {
-				if([self updateDeviceFormat]) {
+				BOOL devicePrepared = [self updateDeviceFormat];
+				if(devicePrepared && !_au.renderResourcesAllocated) {
+					NSError *resourceError = nil;
+					devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+				}
+				if(devicePrepared) {
 					outputdevicechanged = NO;
 				} else {
 					usleep(2000);
@@ -225,7 +528,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				rendered = NO;
 			}
 
-			if(!started && !paused) {
+			if(!started && !paused && !streamReplacementPending) {
 				// Prevent this call from hanging when used in this thread, when buffer may be empty
 				// and waiting for this very thread to fill it
 				resetting = YES;
@@ -286,6 +589,9 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		}
 
 		outputdevicechanged = NO;
+		@synchronized(sampleRateSupportCache) {
+			[sampleRateSupportCache removeAllObjects];
+		}
 
 		if(outputDeviceID != deviceID) {
 			if(currentdevicelistenerapplied) {
@@ -504,7 +810,10 @@ static int32_t convertDoPFloatToS32(float sample) {
 static int32_t convertPCMFloatToS32(float sample) {
 	if(sample >= 1.0f) return (int32_t)(((uint32_t)INT32_MAX) & 0xFFFFFF00U);
 	if(sample <= -1.0f) return INT32_MIN;
-	return (int32_t)(((uint32_t)llrint((double)sample * 2147483647.0)) & 0xFFFFFF00U);
+	// Integer PCM is normalized by dividing by 2^31. Use the exact inverse
+	// here: multiplying by INT32_MAX loses one 24-bit LSB in the upper half
+	// of the positive range before the 24-bit carrier mask is applied.
+	return (int32_t)(((uint32_t)llrint((double)sample * 2147483648.0)) & 0xFFFFFF00U);
 }
 
 static void convertFloatBufferToS32(int32_t *output, const float *input, size_t count, BOOL isDoP) {
@@ -513,11 +822,59 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	}
 }
 
-- (BOOL)prepareOutputFloatScratchForRenderFormat:(AudioStreamBasicDescription)format {
-	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+static int32_t convertPCMFloatToFullS32(float sample) {
+	if(sample >= 1.0f) return INT32_MAX;
+	if(sample <= -1.0f) return INT32_MIN;
+	return (int32_t)llrint((double)sample * 2147483648.0);
+}
+
+static void convertFloatBufferToFullS32(int32_t *output, const float *input, size_t count) {
+	for(size_t i = 0; i < count; ++i) {
+		output[i] = convertPCMFloatToFullS32(input[i]);
+	}
+}
+
+static void convertFloatBufferToF64(double *output, const float *input, size_t count) {
+	vDSP_vspdp(input, 1, output, 1, count);
+}
+
+static BOOL convertPCMBufferToFloat32(float *output, const void *input, AudioStreamBasicDescription format, size_t count) {
+	if(AudioFormatIsFloat32(format)) {
+		memcpy(output, input, count * sizeof(float));
 		return YES;
 	}
+	if(!AudioFormatIsHighPrecisionPCM(format)) {
+		return NO;
+	}
 
+	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+		vDSP_vdpsp((const double *)input, 1, output, 1, count);
+	} else {
+		vDSP_vflt32((const int32_t *)input, 1, output, 1, count);
+		const float scale = 2147483648.0f;
+		vDSP_vsdiv(output, 1, &scale, output, 1, count);
+	}
+	return YES;
+}
+
+static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first, AudioStreamBasicDescription second) {
+	if(!AudioFormatIsHighPrecisionPCM(first) || !AudioFormatIsHighPrecisionPCM(second)) {
+		return NO;
+	}
+	const AudioStreamBasicDescription canonicalFirst = AudioFormatAsCanonicalHighPrecisionPCM(first);
+	if(first.mFormatFlags != canonicalFirst.mFormatFlags ||
+	   first.mBitsPerChannel != canonicalFirst.mBitsPerChannel ||
+	   first.mBytesPerFrame != canonicalFirst.mBytesPerFrame ||
+	   first.mBytesPerPacket != canonicalFirst.mBytesPerPacket) {
+		return NO;
+	}
+	return first.mChannelsPerFrame == second.mChannelsPerFrame &&
+	       first.mBytesPerPacket == second.mBytesPerPacket &&
+	       !!(first.mFormatFlags & kAudioFormatFlagIsFloat) ==
+	       !!(second.mFormatFlags & kAudioFormatFlagIsFloat);
+}
+
+- (BOOL)prepareOutputFloatScratchForRenderFormat:(AudioStreamBasicDescription)format {
 	const size_t maximumFrames = (size_t)_au.maximumFramesToRender;
 	const size_t channels = (size_t)format.mChannelsPerFrame;
 	if(!maximumFrames || !channels || maximumFrames > SIZE_MAX / channels) {
@@ -528,21 +885,34 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	if(requiredSamples > SIZE_MAX / sizeof(float)) {
 		return NO;
 	}
-	if(outputFloatScratch && outputFloatScratchCapacity >= requiredSamples) {
+	if(outputFloatScratch && inputFloatScratch && outputFloatScratchCapacity >= requiredSamples) {
 		return YES;
 	}
 
-	float *scratch = (float *)realloc(outputFloatScratch, requiredSamples * sizeof(float));
-	if(!scratch) {
+	float *outputScratch = (float *)realloc(outputFloatScratch, requiredSamples * sizeof(float));
+	if(!outputScratch) {
 		return NO;
 	}
+	outputFloatScratch = outputScratch;
 
-	outputFloatScratch = scratch;
+	float *inputScratch = (float *)realloc(inputFloatScratch, requiredSamples * sizeof(float));
+	if(!inputScratch) {
+		return NO;
+	}
+	inputFloatScratch = inputScratch;
 	outputFloatScratchCapacity = requiredSamples;
 	return YES;
 }
 
 - (BOOL)deviceSupportsSampleRate:(double)sampleRate {
+	NSNumber *cacheKey = @(sampleRate);
+	@synchronized(sampleRateSupportCache) {
+		NSNumber *cached = sampleRateSupportCache[cacheKey];
+		if(cached) {
+			return [cached boolValue];
+		}
+	}
+
 	AudioObjectPropertyAddress theAddress = {
 		.mSelector = kAudioDevicePropertyAvailableNominalSampleRates,
 		.mScope = kAudioObjectPropertyScopeGlobal,
@@ -576,6 +946,9 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	}
 
 	free(ranges);
+	@synchronized(sampleRateSupportCache) {
+		sampleRateSupportCache[cacheKey] = @(supported);
+	}
 	return supported;
 }
 
@@ -620,14 +993,38 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	return NO;
 }
 
-- (BOOL)updateDeviceFormatNotifyingController:(BOOL)notifyController {
+- (double)currentDeviceSampleRate {
+	if(outputDeviceID == (AudioDeviceID)-1) {
+		return 0.0;
+	}
+
+	AudioObjectPropertyAddress theAddress = {
+		.mSelector = kAudioDevicePropertyNominalSampleRate,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	Float64 sampleRate = 0.0;
+	UInt32 propsize = sizeof(sampleRate);
+	OSStatus status = AudioObjectGetPropertyData(outputDeviceID, &theAddress, 0, NULL, &propsize, &sampleRate);
+	return status == noErr ? sampleRate : 0.0;
+}
+
+- (BOOL)updateDeviceFormatLockedNotifyingController:(BOOL)notifyController requestedSampleRate:(double)requestedSampleRate {
 	AVAudioFormat *format = _au.outputBusses[0].format;
 	if(!format) {
 		return NO;
 	}
 
 	const BOOL targetDoPInteger = preferDoPIntegerOutput;
-	if(!_deviceFormat || ![_deviceFormat isEqual:format] || renderFormatDoPInteger != targetDoPInteger) {
+	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
+	const BOOL nativeFormatChanged = targetNativeHighPrecision &&
+	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
+	const BOOL requestedSampleRateChanged = requestedSampleRate > 0.0 &&
+	                                        fabs(renderFormat.mSampleRate - requestedSampleRate) >= 1.0;
+	if(!_deviceFormat || ![_deviceFormat isEqual:format] ||
+	   renderFormatDoPInteger != targetDoPInteger ||
+	   renderFormatNativeHighPrecision != targetNativeHighPrecision ||
+	   nativeFormatChanged || requestedSampleRateChanged) {
 		NSError *err = nil;
 		AVAudioFormat *renderAVFormat;
 
@@ -636,8 +1033,15 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 		/// Seems some 3rd party devices return incorrect stuff...or I just don't like noninterleaved data.
 		deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsNonInterleaved;
-		if(preferDoPIntegerOutput && preferredDoPCarrierSampleRate > 0.0) {
+		if(requestedSampleRate > 0.0) {
+			// The device's nominal clock changes before AUHAL necessarily refreshes
+			// its output-bus AVAudioFormat. Bind the input bus to the clock requested
+			// by this transaction instead of copying a stale DoP carrier rate.
+			deviceFormat.mSampleRate = requestedSampleRate;
+		} else if(preferDoPIntegerOutput && preferredDoPCarrierSampleRate > 0.0) {
 			deviceFormat.mSampleRate = preferredDoPCarrierSampleRate;
+		} else if(targetNativeHighPrecision && preferredNativeHighPrecisionFormat.mSampleRate > 0.0) {
+			deviceFormat.mSampleRate = preferredNativeHighPrecisionFormat.mSampleRate;
 		}
 		//    deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsFloat;
 		//    deviceFormat.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger;
@@ -685,15 +1089,33 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 				break;
 		}
 
-		renderFormat = targetDoPInteger ? DoPIntegerRenderFormatForDeviceFormat(deviceFormat) : deviceFormat;
+		if(targetDoPInteger) {
+			renderFormat = DoPIntegerRenderFormatForDeviceFormat(deviceFormat);
+		} else if(targetNativeHighPrecision) {
+			renderFormat = preferredNativeHighPrecisionFormat;
+			renderFormat.mSampleRate = deviceFormat.mSampleRate;
+			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerFrame = (UInt32)((renderFormat.mBitsPerChannel / 8) * renderFormat.mChannelsPerFrame);
+			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
+		} else {
+			renderFormat = deviceFormat;
+		}
 		renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 		resetting = YES;
 		[_au stopHardware];
 		if(renderAVFormat) {
 			[_au.inputBusses[0] setFormat:renderAVFormat error:&err];
 		}
+		// DoP is already a packed bitstream at this point. A float fallback would
+		// corrupt it, so leave the previous bus representation in place and let the
+		// enclosing transaction restore the previous device clock.
 		if((!renderAVFormat || err != nil) && targetDoPInteger) {
+			resetting = NO;
+			return NO;
+		}
+		if((!renderAVFormat || err != nil) && targetNativeHighPrecision) {
 			preferDoPIntegerOutput = NO;
+			preferNativeHighPrecisionOutput = NO;
 			renderFormat = deviceFormat;
 			renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 			err = nil;
@@ -710,6 +1132,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 			return NO;
 		}
 		renderFormatDoPInteger = targetDoPInteger && preferDoPIntegerOutput;
+		renderFormatNativeHighPrecision = targetNativeHighPrecision && preferNativeHighPrecisionOutput;
 
 		if(notifyController) {
 			[outputController setFormat:&deviceFormat channelConfig:deviceChannelConfig];
@@ -720,16 +1143,149 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		[self setShouldReset:YES];
 		[outputLock unlock];
 
-		if(started) {
-			[_au startHardwareAndReturnError:&err];
-			if(err != nil)
-				return NO;
-		}
-
 		resetting = NO;
 	}
 
+	// Logical tracks from the same source (for example, adjacent entries in a
+	// cue sheet) normally keep the existing AUHAL format. Re-publish it after
+	// every successful preparation so a track transition cannot leave a stale
+	// stopped-state indication merely because no hardware format changed.
+	[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
 	return YES;
+}
+
+- (BOOL)applyDeviceSampleRateAndFormat:(double)sampleRate {
+	@synchronized(self) {
+		// AUHAL owns the device stream while its render resources are allocated,
+		// even after a long pause has stopped the hardware. Release that ownership
+		// before asking the DAC to change clocks or carrier representation.
+		const BOOL hardwareWasRunning = [self hardwareIsRunning];
+		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		const BOOL previousPaused = paused;
+		const double previousSampleRate = [self currentDeviceSampleRate];
+		AVAudioFormat *previousInputFormat = _au.inputBusses[0].format;
+		AVAudioFormat *previousDeviceAVFormat = _deviceFormat;
+		const AudioStreamBasicDescription previousDeviceFormat = deviceFormat;
+		const AudioStreamBasicDescription previousRenderFormat = renderFormat;
+		const uint32_t previousDeviceChannelConfig = deviceChannelConfig;
+		const BOOL previousRenderFormatDoPInteger = renderFormatDoPInteger;
+		const BOOL previousRenderFormatNativeHighPrecision = renderFormatNativeHighPrecision;
+
+		resetting = YES;
+		if(hardwareWasRunning) {
+			[_au stopHardware];
+		}
+		if(renderResourcesWereAllocated) {
+			[_au deallocateRenderResources];
+		}
+
+		BOOL prepared = [self setDeviceSampleRate:sampleRate];
+		if(prepared) {
+			outputdevicechanged = YES;
+			prepared = [self updateDeviceFormatLockedNotifyingController:NO requestedSampleRate:sampleRate];
+		}
+
+		NSError *resourceError = nil;
+		if(prepared) {
+			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+		}
+		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
+		if(prepared && (!configuredInputFormat || fabs(configuredInputFormat.sampleRate - sampleRate) >= 1.0)) {
+			ALog(@"Core Audio retained a stale input-bus rate (requested %.0f Hz, got %.0f Hz)",
+			     sampleRate, configuredInputFormat ? configuredInputFormat.sampleRate : 0.0);
+			prepared = NO;
+		}
+
+		if(!prepared) {
+			ALog(@"Unable to apply Core Audio device format; restoring the previous output: %@", resourceError);
+			[_au stopHardware];
+			if(_au.renderResourcesAllocated) {
+				[_au deallocateRenderResources];
+			}
+
+			// Restore the preferences that describe the last format AUHAL actually
+			// rendered, rather than leaving a rejected DoP request latched.
+			preferDoPIntegerOutput = previousRenderFormatDoPInteger;
+			preferredDoPCarrierSampleRate = previousRenderFormatDoPInteger ? previousRenderFormat.mSampleRate : 0.0;
+			preferNativeHighPrecisionOutput = previousRenderFormatNativeHighPrecision;
+			if(previousRenderFormatNativeHighPrecision) {
+				preferredNativeHighPrecisionFormat = previousRenderFormat;
+			} else {
+				bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+			}
+
+			BOOL restored = YES;
+			if(previousSampleRate > 0.0 && fabs(previousSampleRate - [self currentDeviceSampleRate]) >= 1.0) {
+				restored = [self setDeviceSampleRate:previousSampleRate];
+			}
+			NSError *rollbackError = nil;
+			if(previousInputFormat) {
+				[_au.inputBusses[0] setFormat:previousInputFormat error:&rollbackError];
+				restored = restored && rollbackError == nil;
+			} else {
+				restored = NO;
+			}
+
+			_deviceFormat = previousDeviceAVFormat;
+			deviceFormat = previousDeviceFormat;
+			renderFormat = previousRenderFormat;
+			deviceChannelConfig = previousDeviceChannelConfig;
+			renderFormatDoPInteger = previousRenderFormatDoPInteger;
+			renderFormatNativeHighPrecision = previousRenderFormatNativeHighPrecision;
+			rollbackError = nil;
+			restored = [_au allocateRenderResourcesAndReturnError:&rollbackError] && rollbackError == nil && restored;
+			doPActive = previousRenderFormatDoPInteger;
+			doPSeekPending = previousRenderFormatDoPInteger;
+			doPMarker = 0x05;
+			[faderNode setDoPMode:previousRenderFormatDoPInteger];
+
+			// Let the output thread (or the replacement prebuffer callback) perform
+			// the hardware start outside this synchronous format transaction.
+			paused = previousPaused;
+			outputdevicechanged = !restored;
+			resetting = NO;
+			started = NO;
+			return NO;
+		}
+
+		outputdevicechanged = NO;
+		restarted = NO;
+		resetting = NO;
+		started = NO;
+		// A manual replacement resumes only after its new chain has prebuffered.
+		// Natural gapless transitions are restarted by the persistent output thread;
+		// neither path calls a potentially blocking driver start on the UI thread.
+		return YES;
+	}
+}
+
+- (BOOL)updateDeviceFormatNotifyingController:(BOOL)notifyController {
+	@synchronized(self) {
+		const BOOL hardwareWasRunning = [self hardwareIsRunning];
+		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		if(hardwareWasRunning) {
+			[_au stopHardware];
+		}
+		if(renderResourcesWereAllocated) {
+			[_au deallocateRenderResources];
+		}
+
+		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:0.0];
+		if(renderResourcesWereAllocated) {
+			NSError *resourceError = nil;
+			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil && prepared;
+		}
+		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
+		if(prepared && (!configuredInputFormat ||
+		                fabs(configuredInputFormat.sampleRate - renderFormat.mSampleRate) >= 1.0)) {
+			prepared = NO;
+		}
+		if(hardwareWasRunning) {
+			started = NO;
+			restarted = NO;
+		}
+		return prepared;
+	}
 }
 
 - (BOOL)updateDeviceFormat {
@@ -738,17 +1294,43 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat {
 	AudioStreamBasicDescription outputFormat = deviceFormat;
-	if(inputFormatUsesDoPCarrierRate(inputFormat)) {
-		const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
-		if([self deviceSupportsSampleRate:sampleRate]) {
-			outputFormat.mSampleRate = sampleRate;
-		}
+	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	// Preloaded chains are built before they become the active output. Build
+	// them at the source rate whenever the device supports it; selectNextBuffer
+	// switches the hardware at the actual track boundary. This keeps SOXR out
+	// of the inactive PCM path instead of baking a resample into the queue.
+	if([self deviceSupportsSampleRate:sampleRate]) {
+		outputFormat.mSampleRate = sampleRate;
 	}
 	return outputFormat;
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
-	if(!inputFormatUsesDoPCarrierRate(inputFormat)) {
+	const uint32_t inputChannelConfig = [outputController currentInputChannelConfig];
+	const BOOL inputFormatValid = inputFormat.mFormatID != 0 &&
+	                              inputFormat.mSampleRate > 0.0 &&
+	                              inputFormat.mBitsPerChannel > 0 &&
+	                              inputFormat.mChannelsPerFrame > 0;
+	const BOOL sameInputFormat = sourceFormatValid && inputFormatValid &&
+	                             sourceChannelConfig == inputChannelConfig &&
+	                             memcmp(&sourceFormat, &inputFormat, sizeof(inputFormat)) == 0;
+
+	// Keep AUHAL and the DAC clock untouched when the replacement stream has
+	// exactly the same source format. The output path was already negotiated
+	// for this representation, and fadeOutBackground has replaced its buffers.
+	if(sameInputFormat && _au && !outputdevicechanged) {
+		DLog(@"Input format unchanged; retaining AUHAL and the current device clock");
+		[faderNode setDoPMode:renderFormatDoPInteger];
+		[self refreshOutputStatus];
+		return YES;
+	}
+
+	const BOOL highPrecisionPCM = AudioFormatIsHighPrecisionPCM(inputFormat);
+	const BOOL usesDoPCarrier = !highPrecisionPCM && inputFormatUsesDoPCarrierRate(inputFormat);
+	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
+	const BOOL sampleRateSupported = [self deviceSupportsSampleRate:sampleRate];
+
+	if(!usesDoPCarrier) {
 		// A pending DoP seek is only meaningful while another DoP carrier is
 		// expected. If playback moves to PCM before that carrier arrives, do not
 		// keep replacing PCM buffers with DoP silence indefinitely.
@@ -757,27 +1339,85 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		doPMarker = 0x05;
 		[faderNode setDoPMode:NO];
 
-		if(preferDoPIntegerOutput || renderFormatDoPInteger) {
-			preferDoPIntegerOutput = NO;
-			preferredDoPCarrierSampleRate = 0.0;
-			return [self updateDeviceFormatNotifyingController:NO];
+		preferDoPIntegerOutput = NO;
+		preferredDoPCarrierSampleRate = 0.0;
+		preferNativeHighPrecisionOutput = highPrecisionPCM && sampleRateSupported &&
+		                                    inputFormat.mChannelsPerFrame == deviceFormat.mChannelsPerFrame;
+		if(preferNativeHighPrecisionOutput) {
+			preferredNativeHighPrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
+			preferredNativeHighPrecisionFormat.mSampleRate = sampleRate;
+		} else {
+			bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		}
+
+		// A matching hardware clock is a prerequisite for bit-perfect PCM.
+		// Unsupported rates still play through the existing converter fallback.
+		if(sampleRateSupported) {
+			// The queued converter was intentionally configured for this source
+			// rate. Do not silently hand it to AUHAL for hidden SRC if the clock
+			// and render-format transition cannot be completed together.
+			BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+			if(prepared) {
+				sourceFormat = inputFormat;
+				sourceChannelConfig = inputChannelConfig;
+				sourceFormatValid = inputFormatValid;
+				hdcdDetected = NO;
+			}
+			return prepared;
+		}
+
+		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
+			const double currentSampleRate = [self currentDeviceSampleRate];
+			BOOL prepared = currentSampleRate > 0.0 ? [self applyDeviceSampleRateAndFormat:currentSampleRate] :
+			                                                [self updateDeviceFormatNotifyingController:NO];
+			if(!prepared) {
+				return NO;
+			}
+		}
+		sourceFormat = inputFormat;
+		sourceChannelConfig = inputChannelConfig;
+		sourceFormatValid = inputFormatValid;
+		hdcdDetected = NO;
+		[self refreshOutputStatus];
 		return YES;
 	}
 
-	const double sampleRate = preferredDeviceSampleRateForInputFormat(inputFormat);
-	if(![self setDeviceSampleRate:sampleRate]) {
-		return NO;
+	// The hardware may start before the decoder's first DoP frame has reached
+	// the final output buffer. Emit a valid carrier from the very first render
+	// instead of ordinary PCM zeroes, which some DSD DACs will not lock onto.
+	if(!doPActive) {
+		doPMarker = 0x05;
 	}
+	doPSeekPending = YES;
 
 	preferDoPIntegerOutput = YES;
+	preferNativeHighPrecisionOutput = NO;
+	bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 	preferredDoPCarrierSampleRate = sampleRate;
-	outputdevicechanged = YES;
-	BOOL prepared = [self updateDeviceFormatNotifyingController:NO];
-	if(prepared) {
+	BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+	if(prepared && renderFormatDoPInteger) {
+		sourceFormat = inputFormat;
+		sourceChannelConfig = inputChannelConfig;
+		sourceFormatValid = inputFormatValid;
+		hdcdDetected = NO;
 		[faderNode setDoPMode:YES];
+		return YES;
 	}
-	return prepared;
+
+	// Native DSD has already been packed as a DoP carrier by the converter.
+	// Continuing through a float fallback would corrupt its marker and payload
+	// bytes while still presenting the stream as successfully prepared.
+	doPSeekPending = NO;
+	preferDoPIntegerOutput = NO;
+	preferredDoPCarrierSampleRate = 0.0;
+	[faderNode setDoPMode:NO];
+	return NO;
+}
+
+- (void)refreshOutputStatus {
+	if(renderFormat.mFormatID) {
+		[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
+	}
 }
 
 - (void)updateStreamFormat {
@@ -789,9 +1429,6 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 	streamFormat = realStreamFormat;
 	streamFormat.mChannelsPerFrame = channels;
-	streamFormat.mBytesPerFrame = sizeof(float) * channels;
-	streamFormat.mFramesPerPacket = 1;
-	streamFormat.mBytesPerPacket = sizeof(float) * channels;
 	streamChannelConfig = channelConfig;
 
 	AudioChannelLayoutTag tag = 0;
@@ -894,21 +1531,76 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 			return 0;
 		}
 		
-		const BOOL renderAsFloat = !!(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat);
-		float *outSamples = NULL;
-		if(renderAsFloat) {
-			outSamples = (float *)inputData->mBuffers[0].mData;
-		} else {
-			const size_t scratchSamples = (size_t)frameCount * channels;
-			if(!_self->outputFloatScratch || _self->outputFloatScratchCapacity < scratchSamples) {
-				return 0;
-			}
-			outSamples = _self->outputFloatScratch;
+		const BOOL renderAsFloat32 = AudioFormatIsFloat32(*renderASBD);
+		const BOOL renderAsHighPrecision = AudioFormatIsHighPrecisionPCM(*renderASBD);
+		const size_t scratchSamples = (size_t)frameCount * channels;
+		if(!_self->inputFloatScratch || !_self->outputFloatScratch ||
+		   _self->outputFloatScratchCapacity < scratchSamples) {
+			return 0;
+		}
+		float *outSamples = renderAsFloat32 ? (float *)inputData->mBuffers[0].mData : _self->outputFloatScratch;
+		if(!renderAsFloat32) {
 			bzero(outSamples, scratchSamples * sizeof(float));
 		}
 
+		const BOOL directHighPrecision = _self->renderFormatNativeHighPrecision &&
+		                                 renderAsHighPrecision &&
+		                                 !_self->fading && !_self->faded &&
+		                                 !_self->doPActive && !_self->doPSeekPending &&
+		                                 _self->volume == 1.0f;
+
 		@autoreleasepool {
-			if(!_self->faded) {
+			if(directHighPrecision) {
+				while(renderedSamples < frameCount) {
+					[refLock lock];
+					AudioChunk *chunk = nil;
+					if(![_self->bufferNode.buffer isEmpty]) {
+						chunk = [self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+					}
+					[refLock unlock];
+
+					size_t chunkFrames = chunk ? [chunk frameCount] : 0;
+					if(chunkFrames) {
+						_self->prebufferReached = YES;
+						double streamTimestamp = [chunk streamTimestamp];
+						if(!streamTimestamp || _self->streamTimestamp > streamTimestamp) {
+							_self->prebufferSignaled = NO;
+						}
+						_self->streamTimestamp = streamTimestamp;
+
+						const AudioStreamBasicDescription chunkFormat = [chunk format];
+						NSData *sampleData = [chunk removeSamples:chunkFrames];
+						const size_t inputTodo = MIN(chunkFrames, frameCount - renderedSamples);
+						const size_t sampleCount = inputTodo * channels;
+						uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+						                       renderedSamples * renderASBD->mBytesPerPacket;
+						BOOL renderedChunk = NO;
+
+						if(chunkFormat.mChannelsPerFrame != (UInt32)channels) {
+							chunkFrames = 0;
+						} else if(highPrecisionRepresentationsMatch(chunkFormat, *renderASBD)) {
+							memcpy(destination, [sampleData bytes], inputTodo * renderASBD->mBytesPerPacket);
+							renderedChunk = YES;
+						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, sampleCount)) {
+							if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
+								convertFloatBufferToF64((double *)destination, _self->inputFloatScratch, sampleCount);
+							} else {
+								convertFloatBufferToFullS32((int32_t *)destination, _self->inputFloatScratch, sampleCount);
+							}
+							renderedChunk = YES;
+						}
+						if(renderedChunk) {
+							renderedSamples += (int)inputTodo;
+						} else {
+							chunkFrames = 0;
+						}
+					}
+
+					if((_self->stopping && !_self->fadingstop) || _self->resetting || !chunk || !chunkFrames) {
+						break;
+					}
+				}
+			} else if(!_self->faded) {
 				while(renderedSamples < frameCount) {
 					[refLock lock];
 					AudioChunk *chunk = nil;
@@ -929,11 +1621,24 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 						_self->streamTimestamp = streamTimestamp;
 
 						_frameCount = [chunk frameCount];
+						const AudioStreamBasicDescription chunkFormat = [chunk format];
 						NSData *sampleData = [chunk removeSamples:_frameCount];
-						float *samplePtr = (float *)[sampleData bytes];
 						size_t inputTodo = MIN(_frameCount, frameCount - renderedSamples);
+						if(chunkFormat.mChannelsPerFrame != (UInt32)channels) {
+							break;
+						}
+						float *samplePtr = NULL;
+						if(AudioFormatIsFloat32(chunkFormat)) {
+							samplePtr = (float *)[sampleData bytes];
+						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, inputTodo * channels)) {
+							samplePtr = _self->inputFloatScratch;
+						}
+						if(!samplePtr) {
+							break;
+						}
 						uint8_t nextDoPMarker = 0x05;
-						BOOL inputIsDoP = audioBufferIsDoP(samplePtr, channels, inputTodo, &nextDoPMarker);
+						BOOL inputIsDoP = AudioFormatIsFloat32(chunkFormat) &&
+						                  audioBufferIsDoP(samplePtr, channels, inputTodo, &nextDoPMarker);
 
 						if(_self->doPSeekPending && !inputIsDoP) {
 							// Never expose transitional or stale PCM-looking data while a
@@ -984,20 +1689,27 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 					}
 				}
 			}
-			if(_self->doPActive && renderedSamples < frameCount) {
+			if(!directHighPrecision && (_self->doPActive || _self->doPSeekPending) && renderedSamples < frameCount) {
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
-				// track changes, and brief underruns with standard DSD silence.
+				// initial startup, track changes, and brief underruns with standard
+				// DSD silence.
 				fillDoPSilence(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
 				outputContainsDoP = YES;
 			}
 
 			double secondsRendered = (double)renderedSamples / format->mSampleRate;
 
-			if(!outputContainsDoP) {
+			if(!directHighPrecision && !outputContainsDoP) {
 				scale_by_volume(outSamples, frameCount * channels, _self->volume);
 			}
 
-			if(!renderAsFloat) {
+			if(!directHighPrecision && _self->renderFormatNativeHighPrecision) {
+				if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
+					convertFloatBufferToF64((double *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+				} else {
+					convertFloatBufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+				}
+			} else if(!directHighPrecision && !renderAsFloat32) {
 				convertFloatBufferToS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels, outputContainsDoP);
 			}
 
@@ -1010,7 +1722,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		}
 
 #ifdef _DEBUG
-		if(renderAsFloat) {
+		if(renderAsFloat32) {
 			[BadSampleCleaner cleanSamples:(float *)inputData->mBuffers[0].mData
 									amount:inputData->mBuffers[0].mDataByteSize / sizeof(float)
 								  location:@"final output"];
@@ -1038,13 +1750,21 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		running = NO;
 		stopping = NO;
 		stopped = NO;
+		streamReplacementPending = NO;
 		paused = NO;
 		outputDeviceID = -1;
 		restarted = NO;
 		preferDoPIntegerOutput = NO;
 		renderFormatDoPInteger = NO;
 		preferredDoPCarrierSampleRate = 0.0;
+		preferNativeHighPrecisionOutput = NO;
+		renderFormatNativeHighPrecision = NO;
+		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		bzero(&renderFormat, sizeof(renderFormat));
+		bzero(&sourceFormat, sizeof(sourceFormat));
+		sourceChannelConfig = 0;
+		sourceFormatValid = NO;
+		hdcdDetected = NO;
 
 		cutOffInput = NO;
 		fadeTarget = 1.0f;
@@ -1092,9 +1812,12 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 		[self audioOutputBlock];
 
-		[_au allocateRenderResourcesAndReturnError:&err];
-
 		if(![self updateDeviceFormat]) {
+			return NO;
+		}
+
+		err = nil;
+		if(![_au allocateRenderResourcesAndReturnError:&err] || err != nil) {
 			return NO;
 		}
 
@@ -1118,6 +1841,9 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.outputDevice" options:0 context:kOutputCoreAudioContext];
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.suspendOutputOnPause" options:0 context:kOutputCoreAudioContext];
+		for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
+			[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:keyPath options:0 context:kOutputCoreAudioContext];
+		}
 
 		observersapplied = YES;
 		
@@ -1128,7 +1854,13 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 - (void)updateLatency:(double)secondsPlayed {
 	double visLatency = [outputController getVisLatency];
 	double fullLatency = [outputController getTotalLatency];
-	if(secondsPlayed > 0) {
+	// A manual replacement reuses this Core Audio output while the outgoing
+	// render callback may still be completing. Do not let its final timestamp
+	// repopulate the new track's position after AudioPlayer reset it to zero;
+	// a concurrent device-format notification would otherwise seek the new
+	// decoder to that stale position (for example, 15 seconds into PCM after
+	// switching from a DSD track played for 15 seconds).
+	if(secondsPlayed > 0 && !streamReplacementPending) {
 		[outputController setAmountPlayed:streamTimestamp];
 	}
 	[visController postLatency:visLatency];
@@ -1141,6 +1873,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 - (void)setVolume:(double)v {
 	volume = v * 0.01f;
+	[self refreshOutputStatus];
 }
 
 - (double)latency {
@@ -1156,6 +1889,22 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 	[self doStop];
 }
 
+- (BOOL)beginStreamReplacement {
+	@synchronized(self) {
+		if(_au == nil || !running || stopping || stopped || stopInvoked || streamReplacementPending) {
+			return NO;
+		}
+		streamReplacementPending = YES;
+		return YES;
+	}
+}
+
+- (void)finishStreamReplacement {
+	@synchronized(self) {
+		streamReplacementPending = NO;
+	}
+}
+
 - (void)doStop {
 	if(stopInvoked) {
 		return;
@@ -1166,6 +1915,9 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		if(observersapplied) {
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.outputDevice" context:kOutputCoreAudioContext];
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.suspendOutputOnPause" context:kOutputCoreAudioContext];
+			for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
+				[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:keyPath context:kOutputCoreAudioContext];
+			}
 			observersapplied = NO;
 		}
 		stopping = YES;
@@ -1228,8 +1980,12 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		if(outputFloatScratch) {
 			free(outputFloatScratch);
 			outputFloatScratch = NULL;
-			outputFloatScratchCapacity = 0;
 		}
+		if(inputFloatScratch) {
+			free(inputFloatScratch);
+			inputFloatScratch = NULL;
+		}
+		outputFloatScratchCapacity = 0;
 		if(running) {
 			while(!stopped) {
 				stopping = YES;
@@ -1263,6 +2019,7 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		}
 		prebufferReached = NO;
 		prebufferSignaled = NO;
+		[self postOutputFormatDescription:nil];
 		stopCompleted = YES;
 	}
 }
@@ -1282,16 +2039,55 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 		[_au stopHardware];
 }
 
+- (BOOL)hardwareIsRunning {
+	return _au != nil && _au.isRunning;
+}
+
 - (void)resume {
 	[self stopIdle];
-	NSError *err;
-	[_au startHardwareAndReturnError:&err];
+	NSError *err = nil;
+	if(_au && !_au.renderResourcesAllocated) {
+		if(![_au allocateRenderResourcesAndReturnError:&err] || err != nil) {
+			ALog(@"Unable to restore Core Audio render resources: %@", err);
+			paused = NO;
+			started = NO;
+			return;
+		}
+		err = nil;
+	}
+	BOOL hardwareStarted = [self hardwareIsRunning];
+	if(!hardwareStarted) {
+		hardwareStarted = [_au startHardwareAndReturnError:&err];
+		if(!hardwareStarted) {
+			hardwareStarted = [self hardwareIsRunning];
+		}
+	}
 	paused = NO;
-	started = YES;
+	started = hardwareStarted;
+	if(started) {
+		restarted = NO;
+	} else {
+		// Do not cache a track as successfully prepared when AUHAL cannot start.
+		// Re-run device-format discovery on the output thread and force the next
+		// manual attempt to negotiate its source format again.
+		sourceFormatValid = NO;
+		outputdevicechanged = YES;
+		if(!restarted) {
+			ALog(@"Unable to start Core Audio output; playback thread will retry: %@", err);
+			restarted = YES;
+		}
+		// Avoid a tight retry loop while a device is still settling after its
+		// sample-rate and integer-carrier format transition.
+		usleep(10000);
+	}
 }
 
 - (void)sustainHDCD {
 	secondsHdcdSustained = 10.0;
+	if(!hdcdDetected) {
+		hdcdDetected = YES;
+		[self refreshOutputStatus];
+	}
 }
 
 - (void)setShouldPlayOutBuffer:(BOOL)s {
@@ -1401,6 +2197,15 @@ static void convertFloatBufferToS32(int32_t *output, const float *input, size_t 
 
 - (void)faderFadeIn {
 	[self stopIdle];
+	// Stream replacement fades the new input at the DSP fader. Make sure the
+	// separate final-output fade gate is open as well: a DSD pause completes
+	// that gate as a hard fade, and reusing the output without clearing it
+	// otherwise leaves AUHAL running while it emits only carrier silence.
+	fadeLevel = 1.0f;
+	fadeTarget = 1.0f;
+	fadeStep = 0.0f;
+	fading = NO;
+	faded = NO;
 	if(playbackFadesEnabled() || doPActive) {
 		[faderNode fadeIn];
 	} else {

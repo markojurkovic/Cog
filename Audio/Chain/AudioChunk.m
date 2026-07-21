@@ -9,6 +9,54 @@
 
 #import "CoreAudioUtils.h"
 
+BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format) {
+	return format.mFormatID == kAudioFormatLinearPCM &&
+	       !!(format.mFormatFlags & kAudioFormatFlagIsFloat) &&
+	       !(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) &&
+	       format.mBitsPerChannel == 32 &&
+	       format.mBytesPerFrame == sizeof(float) * format.mChannelsPerFrame &&
+	       format.mBytesPerPacket == format.mBytesPerFrame * format.mFramesPerPacket;
+}
+
+BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format) {
+	if(format.mFormatID != kAudioFormatLinearPCM ||
+	   (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ||
+	   format.mFramesPerPacket != 1) {
+		return NO;
+	}
+
+	const BOOL isFloat = !!(format.mFormatFlags & kAudioFormatFlagIsFloat);
+	const size_t bytesPerSample = isFloat ? sizeof(double) : sizeof(int32_t);
+	return ((isFloat && format.mBitsPerChannel == 64) ||
+	        (!isFloat && format.mBitsPerChannel == 32)) &&
+	       format.mBytesPerFrame == bytesPerSample * format.mChannelsPerFrame &&
+	       format.mBytesPerPacket == format.mBytesPerFrame;
+}
+
+AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription format) {
+	format.mFormatID = kAudioFormatLinearPCM;
+	format.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
+	format.mBitsPerChannel = 32;
+	format.mFramesPerPacket = 1;
+	format.mBytesPerFrame = (UInt32)(sizeof(float) * format.mChannelsPerFrame);
+	format.mBytesPerPacket = format.mBytesPerFrame;
+	format.mReserved = 0;
+	return format;
+}
+
+AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBasicDescription format) {
+	const BOOL isFloat = !!(format.mFormatFlags & kAudioFormatFlagIsFloat);
+	format.mFormatID = kAudioFormatLinearPCM;
+	format.mFormatFlags = isFloat ? kAudioFormatFlagsNativeFloatPacked :
+	                                (kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian);
+	format.mBitsPerChannel = isFloat ? 64 : 32;
+	format.mFramesPerPacket = 1;
+	format.mBytesPerFrame = (UInt32)((isFloat ? sizeof(double) : sizeof(int32_t)) * format.mChannelsPerFrame);
+	format.mBytesPerPacket = format.mBytesPerFrame;
+	format.mReserved = 0;
+	return format;
+}
+
 @implementation AudioChunk
 
 - (id)init {
@@ -49,6 +97,7 @@
 	AudioChunk *outputChunk = [AudioChunk new];
 	[outputChunk setFormat:format];
 	[outputChunk setChannelConfig:channelConfig];
+	[outputChunk setLossless:lossless];
 	if(hdcd) [outputChunk setHDCD];
 	if(resetForward) outputChunk.resetForward = YES;
 	outputChunk.dsdDoPReverseBits = dsdDoPReverseBits;

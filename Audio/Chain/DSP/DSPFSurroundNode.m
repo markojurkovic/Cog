@@ -96,7 +96,7 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 			[mutex unlock];
 			return NO;
 		}
-		outputFormat = inputFormat;
+		outputFormat = AudioFormatAsFloat32(inputFormat);
 		outputFormat.mChannelsPerFrame = [fsurround channelCount];
 		outputFormat.mBytesPerFrame = sizeof(float) * outputFormat.mChannelsPerFrame;
 		outputFormat.mBytesPerPacket = outputFormat.mBytesPerFrame * outputFormat.mFramesPerPacket;
@@ -233,7 +233,7 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 	NSData *sampleData = [chunk removeSamples:frameCount];
 	if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:inputFormat];
+		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}

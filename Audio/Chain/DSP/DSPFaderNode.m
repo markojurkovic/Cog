@@ -28,7 +28,7 @@
 	uint32_t outputChannelConfig;
 
 	float fadeLevel, fadeStep;
-	BOOL doPMode;
+	atomic_bool doPMode;
 
 	float inBuffer[512 * 32];
 	float outBuffer[512 * 32];
@@ -43,6 +43,7 @@
 		fadersLock = [NSLock new];
 		faders = [NSMutableArray new];
 		fadeLevel = 1.0;
+		atomic_init(&doPMode, false);
 	}
 	return self;
 }
@@ -155,20 +156,28 @@
 		}
 	}
 		
-	BOOL inputRead = YES;
-	AudioChunk *chunk = [self readChunkAsFloat32:512];
-	size_t frameCount = chunk ? [chunk frameCount] : 0;
-	if(waitForResetEvent && frameCount && !chunk.resetForward) {
-		frameCount = 0;
-	}
 	[fadersLock lock];
 	size_t count = [faders count];
 	[fadersLock unlock];
+	const BOOL processingRequired = fadeStep || count;
+
+	BOOL inputRead = YES;
+	AudioChunk *chunk = processingRequired ? [self readChunkAsFloat32:512] : [self readChunk:512];
+	size_t frameCount = chunk ? [chunk frameCount] : 0;
+	if(frameCount && processingRequired) {
+		AudioStreamBasicDescription processingFormat = [chunk format];
+		[self setOutputFormat:processingFormat withChannelConfig:[chunk channelConfig]];
+	}
+	if(waitForResetEvent && frameCount && !chunk.resetForward) {
+		frameCount = 0;
+	}
 	if(!frameCount && count && formatSet) {
+		AudioStreamBasicDescription processingFormat = AudioFormatAsFloat32(outputFormat);
+		[self setOutputFormat:processingFormat withChannelConfig:outputChannelConfig];
 		chunk = [AudioChunk new];
-		[chunk setFormat:outputFormat];
+		[chunk setFormat:processingFormat];
 		[chunk setChannelConfig:outputChannelConfig];
-		bzero(inBuffer, 512 * outputFormat.mBytesPerPacket);
+		bzero(inBuffer, 512 * processingFormat.mBytesPerPacket);
 		frameCount = 512;
 		inputRead = NO;
 	}
@@ -197,16 +206,16 @@
 			if(!inputIsDoP) {
 				// DoP mode follows the current carrier instead of remaining latched
 				// after playback has moved back to PCM.
-				doPMode = NO;
+				atomic_store_explicit(&doPMode, false, memory_order_relaxed);
 			}
 		} else {
 			// [chunk removeSamples:frameCount];
 			// Only happens above, and since the samples aren't assigned, they don't need to be removed
 		}
 		float *nextBuffer = inBuffer;
-		if(doPMode || inputIsDoP) {
+		if(atomic_load_explicit(&doPMode, memory_order_relaxed) || inputIsDoP) {
 			// Never apply a gain ramp or an old-track mix to a DoP carrier.
-			doPMode = YES;
+			atomic_store_explicit(&doPMode, true, memory_order_relaxed);
 			fadeStep = 0;
 			fadeLevel = 1.0;
 			[fadersLock lock];
@@ -261,9 +270,11 @@
 }
 
 - (void)setDoPMode:(BOOL)enabled {
-	[mutex lock];
-	doPMode = enabled;
-	[mutex unlock];
+	// Output preparation can run before the fader has input. The worker holds
+	// mutex while waiting for that input, so taking it here deadlocks startup:
+	// playback cannot supply input until preparation returns. This flag is
+	// independent of the fader's buffered state and only needs atomic access.
+	atomic_store_explicit(&doPMode, enabled, memory_order_relaxed);
 }
 
 - (float)fadeLevel {

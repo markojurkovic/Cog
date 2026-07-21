@@ -21,6 +21,12 @@
 @class BufferChain;
 @class OutputNode;
 
+FOUNDATION_EXPORT NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification;
+FOUNDATION_EXPORT NSString *const CogCoreAudioOutputFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioDeviceFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityLosslessKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioSignalIntegrityDetailsKey;
+
 @interface AudioPlayer : NSObject {
 	BufferChain *bufferChain;
 	OutputNode *output;
@@ -40,6 +46,7 @@
 	id delegate;
 
 	BOOL outputLaunched;
+	BOOL streamReplacementPending;
 	BOOL endOfInputReached;
 	BOOL startedPaused;
 	BOOL initialBufferFilled;
@@ -48,6 +55,7 @@
 
 	atomic_bool resettingNow;
 	atomic_int refCount;
+	atomic_uint_fast64_t playbackGeneration;
 
 	int currentPlaybackStatus;
 
@@ -118,6 +126,7 @@
 - (void)setShouldContinue:(BOOL)s;
 //- (BufferChain *)bufferChain;
 - (void)launchOutputThread;
+- (void)launchOutputThreadForBufferChain:(BufferChain *)chain;
 - (BOOL)selectNextBuffer;
 - (void)endOfInputPlayed;
 - (void)reportPlayCount;

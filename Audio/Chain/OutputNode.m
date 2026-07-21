@@ -317,6 +317,22 @@
 	return prepared;
 }
 
+- (uint32_t)currentInputChannelConfig {
+	AudioPlayer *audioPlayer = controller;
+	BufferChain *bufferChain = [audioPlayer bufferChain];
+	return bufferChain ? [bufferChain inputConfig] : 0;
+}
+
+- (BOOL)currentConverterAppliesVolumeScaling {
+	AudioPlayer *audioPlayer = controller;
+	ConverterNode *converter = [[audioPlayer bufferChain] converter];
+	return converter ? [converter appliesVolumeScaling] : NO;
+}
+
+- (void)refreshOutputStatus {
+	[output refreshOutputStatus];
+}
+
 - (void)setFormat:(AudioStreamBasicDescription *)f channelConfig:(uint32_t)channelConfig {
 	if(!shouldContinue) return;
 
@@ -413,6 +429,19 @@
 
 - (BOOL)isPaused {
 	return paused;
+}
+
+- (BOOL)beginStreamReplacement {
+	if([output beginStreamReplacement]) {
+		[self setEndOfStream:NO];
+		return YES;
+	}
+	return NO;
+}
+
+- (void)finishStreamReplacement {
+	[self setEndOfStream:NO];
+	[output finishStreamReplacement];
 }
 
 - (void)sustainHDCD {

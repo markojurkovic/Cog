@@ -42,6 +42,7 @@
 	size_t resamplerRemain;
 
 	DownmixProcessor *downmixer;
+	ChunkList *visualizationConverter;
 
 	VisualizationController *visController;
 
@@ -72,6 +73,7 @@
 		durationPrebuffer = latency * 0.25;
 
 		visController = [VisualizationController sharedController];
+		visualizationConverter = [[ChunkList alloc] initWithMaximumDuration:1.0];
 
 		inWrite = NO;
 		inPeek = NO;
@@ -113,6 +115,7 @@
 	paused = YES;
 	[mutex lock];
 	[buffer reset];
+	[visualizationConverter reset];
 	[self fullShutdown];
 	paused = NO;
 	[mutex unlock];
@@ -184,7 +187,7 @@
 		}
 		@autoreleasepool {
 			AudioChunk *chunk = nil;
-			chunk = [self readAndMergeChunksAsFloat32:512];
+			chunk = [self readAndMergeChunks:512];
 			if(!chunk || ![chunk frameCount]) {
 				if([previousNode endOfStream] == YES) {
 					usleep(500);
@@ -192,7 +195,10 @@
 					continue;
 				}
 			} else {
-				[self processVis:[chunk copy]];
+				const size_t frameCount = [chunk frameCount];
+				[visualizationConverter addChunk:[chunk copy]];
+				AudioChunk *visualizationChunk = [visualizationConverter removeSamplesAsFloat32:frameCount];
+				[self processVis:visualizationChunk];
 				[self writeChunk:chunk];
 				chunk = nil;
 			}

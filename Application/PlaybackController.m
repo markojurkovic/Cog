@@ -322,9 +322,6 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 }
 
 - (void)playEntry:(PlaylistEntry *)pe startPaused:(BOOL)paused andSeekTo:(id)offset {
-	if(playbackStatus != CogStatusStopped && playbackStatus != CogStatusStopping)
-		[self stop:self];
-
 	if(!pe.url) {
 		pe.error = YES;
 		pe.errorMessage = NSLocalizedStringFromTableInBundle(@"ErrorMessageBadFile", nil, [NSBundle bundleForClass:[self class]], @"");
