@@ -10,12 +10,33 @@
 #import "CoreAudioUtils.h"
 
 BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format) {
+	const AudioFormatFlags layoutFlags = kAudioFormatFlagIsFloat |
+	                                     kAudioFormatFlagIsBigEndian |
+	                                     kAudioFormatFlagIsSignedInteger |
+	                                     kAudioFormatFlagIsPacked |
+	                                     kAudioFormatFlagIsAlignedHigh |
+	                                     kAudioFormatFlagIsNonInterleaved;
 	return format.mFormatID == kAudioFormatLinearPCM &&
-	       !!(format.mFormatFlags & kAudioFormatFlagIsFloat) &&
-	       !(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) &&
+	       (format.mFormatFlags & layoutFlags) == kAudioFormatFlagsNativeFloatPacked &&
 	       format.mBitsPerChannel == 32 &&
+	       format.mFramesPerPacket == 1 &&
 	       format.mBytesPerFrame == sizeof(float) * format.mChannelsPerFrame &&
-	       format.mBytesPerPacket == format.mBytesPerFrame * format.mFramesPerPacket;
+	       format.mBytesPerPacket == format.mBytesPerFrame;
+}
+
+BOOL AudioFormatIsFloat64(AudioStreamBasicDescription format) {
+	const AudioFormatFlags layoutFlags = kAudioFormatFlagIsFloat |
+	                                     kAudioFormatFlagIsBigEndian |
+	                                     kAudioFormatFlagIsSignedInteger |
+	                                     kAudioFormatFlagIsPacked |
+	                                     kAudioFormatFlagIsAlignedHigh |
+	                                     kAudioFormatFlagIsNonInterleaved;
+	return format.mFormatID == kAudioFormatLinearPCM &&
+	       (format.mFormatFlags & layoutFlags) == kAudioFormatFlagsNativeFloatPacked &&
+	       format.mBitsPerChannel == 64 &&
+	       format.mFramesPerPacket == 1 &&
+	       format.mBytesPerFrame == sizeof(double) * format.mChannelsPerFrame &&
+	       format.mBytesPerPacket == format.mBytesPerFrame;
 }
 
 BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format) {
@@ -39,6 +60,17 @@ AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription for
 	format.mBitsPerChannel = 32;
 	format.mFramesPerPacket = 1;
 	format.mBytesPerFrame = (UInt32)(sizeof(float) * format.mChannelsPerFrame);
+	format.mBytesPerPacket = format.mBytesPerFrame;
+	format.mReserved = 0;
+	return format;
+}
+
+AudioStreamBasicDescription AudioFormatAsFloat64(AudioStreamBasicDescription format) {
+	format.mFormatID = kAudioFormatLinearPCM;
+	format.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
+	format.mBitsPerChannel = 64;
+	format.mFramesPerPacket = 1;
+	format.mBytesPerFrame = (UInt32)(sizeof(double) * format.mChannelsPerFrame);
 	format.mBytesPerPacket = format.mBytesPerFrame;
 	format.mReserved = 0;
 	return format;

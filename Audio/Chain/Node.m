@@ -461,6 +461,75 @@ static uint64_t _Node_serial;
 	return ret;
 }
 
+- (AudioChunk *)readChunkAsFloat64:(size_t)maxFrames {
+	inRead = YES;
+	if(!shouldContinue || [self paused]) {
+		inRead = NO;
+		return [AudioChunk new];
+	}
+
+	[accessLock lock];
+
+	while(shouldContinue && ![self paused] &&
+		  [[previousNode buffer] isEmpty] && [previousNode endOfStream] == NO) {
+		[accessLock unlock];
+		[writeSemaphore signal];
+		[[previousNode readSemaphore] timedWait:2000];
+		[accessLock lock];
+		if(!resetBarrier && [previousNode shouldReset] == YES) {
+			break;
+		}
+	}
+
+	if(!shouldContinue || [self paused]) {
+		[accessLock unlock];
+		inRead = NO;
+		return [AudioChunk new];
+	}
+
+	if([[previousNode buffer] isEmpty] && [previousNode endOfStream] == YES) {
+		[accessLock unlock];
+		inRead = NO;
+		return [AudioChunk new];
+	}
+
+	if(!resetBarrier && [previousNode shouldReset] == YES) {
+		@autoreleasepool {
+			[buffer reset];
+		}
+
+		shouldReset = YES;
+		[previousNode setShouldReset:NO];
+
+		[[previousNode writeSemaphore] signal];
+	}
+
+	AudioChunk *ret;
+
+	@autoreleasepool {
+		ret = [[previousNode buffer] removeSamplesAsFloat64:maxFrames];
+	}
+
+	[accessLock unlock];
+
+	if([ret frameCount]) {
+		[[previousNode writeSemaphore] signal];
+	}
+
+#ifdef LOG_CHAINS
+	if(logFileIn) {
+		AudioChunk *chunkCopy = [ret copy];
+		size_t frameCount = [chunkCopy frameCount];
+		NSData *chunkData = [chunkCopy removeSamples:frameCount];
+		[logFileIn writeData:chunkData];
+	}
+#endif
+
+	inRead = NO;
+
+	return ret;
+}
+
 - (AudioChunk *)readAndMergeChunks:(size_t)maxFrames {
 	inMerge = YES;
 	if(!shouldContinue || [self paused]) {
@@ -537,6 +606,63 @@ static uint64_t _Node_serial;
 
 	@autoreleasepool {
 		ret = [[previousNode buffer] removeAndMergeSamplesAsFloat32:maxFrames callBlock:^BOOL{
+			if(!resetBarrier && [previousNode shouldReset] == YES) {
+				@autoreleasepool {
+					[buffer reset];
+				}
+
+				shouldReset = YES;
+				[previousNode setShouldReset:NO];
+			}
+
+			[accessLock unlock];
+			[[previousNode writeSemaphore] signal];
+			[[previousNode readSemaphore] timedWait:2000];
+			[accessLock lock];
+
+			return !shouldContinue || [self paused] || ([[previousNode buffer] isEmpty] && [previousNode endOfStream] == YES);
+		}];
+	}
+
+	[accessLock unlock];
+
+	if([ret frameCount]) {
+		[[previousNode writeSemaphore] signal];
+
+#ifdef LOG_CHAINS
+		if(logFileIn) {
+			AudioChunk *chunkCopy = [ret copy];
+			size_t frameCount = [chunkCopy frameCount];
+			NSData *chunkData = [chunkCopy removeSamples:frameCount];
+			[logFileIn writeData:chunkData];
+		}
+#endif
+	}
+
+	inMerge = NO;
+
+	return ret;
+}
+
+- (AudioChunk *)readAndMergeChunksAsFloat64:(size_t)maxFrames {
+	inMerge = YES;
+	if(!shouldContinue || [self paused]) {
+		inMerge = NO;
+		return [AudioChunk new];
+	}
+
+	[accessLock lock];
+
+	if([[previousNode buffer] isEmpty] && [previousNode endOfStream] == YES) {
+		[accessLock unlock];
+		inMerge = NO;
+		return [AudioChunk new];
+	}
+
+	AudioChunk *ret;
+
+	@autoreleasepool {
+		ret = [[previousNode buffer] removeAndMergeSamplesAsFloat64:maxFrames callBlock:^BOOL{
 			if(!resetBarrier && [previousNode shouldReset] == YES) {
 				@autoreleasepool {
 					[buffer reset];

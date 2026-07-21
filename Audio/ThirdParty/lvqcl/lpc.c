@@ -15,6 +15,7 @@
  */
 
 #include <memory.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include "lpc.h"
@@ -217,4 +218,165 @@ void lpc_extrapolate2(float *const data, const size_t data_len, const int nch, c
 				data[(i + data_len) * nch + c] = tdata[min_data_len + i];
 		}
 	}
+}
+
+static void apply_window_double(double *const data, const size_t data_len) {
+	const double n2 = (data_len + 1) / 2.0;
+	for(int i = 0; i < (int)data_len; i++) {
+		double k = (i + 1 - n2) / n2;
+		data[data_len - 1 - i] *= 1.0 - k * k;
+	}
+}
+
+static double vorbis_lpc_from_data_double(double *data, double *lpci, int n, int m, double *aut, double *lpc) {
+	double error;
+	double epsilon;
+	int i, j;
+
+	j = m + 1;
+	while(j--) {
+		double d = 0;
+		for(i = j; i < n; i++) d += data[i] * data[i - j];
+		aut[j] = d;
+	}
+
+	error = aut[0] * (1. + 1e-10);
+	epsilon = 1e-9 * aut[0] + 1e-10;
+
+	for(i = 0; i < m; i++) {
+		double r = -aut[i + 1];
+
+		if(error < epsilon) {
+			memset(lpc + i, 0, (m - i) * sizeof(*lpc));
+			goto done;
+		}
+
+		for(j = 0; j < i; j++) r -= lpc[j] * aut[i - j];
+		r /= error;
+
+		lpc[i] = r;
+		for(j = 0; j < i / 2; j++) {
+			double tmp = lpc[j];
+			lpc[j] += r * lpc[i - 1 - j];
+			lpc[i - 1 - j] += r * tmp;
+		}
+		if(i & 1) lpc[j] += lpc[j] * r;
+
+		error *= 1. - r * r;
+	}
+
+done:
+	{
+		double g = .99;
+		double damp = g;
+		for(j = 0; j < m; j++) {
+			lpc[j] *= damp;
+			damp *= g;
+		}
+	}
+
+	for(j = 0; j < m; j++) lpci[j] = lpc[j];
+	return error;
+}
+
+static void vorbis_lpc_predict_double(double *coeff, double *prime, int m, double *data, long n, double *work) {
+	long i, j, o, p;
+	double y;
+
+	if(!prime)
+		for(i = 0; i < m; i++)
+			work[i] = 0.;
+	else
+		for(i = 0; i < m; i++)
+			work[i] = prime[i];
+
+	for(i = 0; i < n; i++) {
+		y = 0;
+		o = i;
+		p = m;
+		for(j = 0; j < m; j++)
+			y -= work[o++] * coeff[--p];
+
+		data[i] = work[o] = y;
+	}
+}
+
+int lpc_extrapolate2_double(double *const data, const size_t data_len, const int nch, const int lpc_order, const size_t extra_bkwd, const size_t extra_fwd, void **extrapolate_buffer, size_t *extrapolate_buffer_size) {
+	const size_t min_data_len = (data_len < lpc_order) ? lpc_order : data_len;
+
+	const size_t tdata_size = sizeof(double) * (extra_bkwd + min_data_len + extra_fwd);
+	const size_t aut_size = sizeof(double) * (lpc_order + 1);
+	const size_t lpc_size = sizeof(double) * lpc_order;
+	const size_t lpci_size = sizeof(double) * lpc_order;
+	const size_t work_size = sizeof(double) * (extra_bkwd + lpc_order + extra_fwd);
+
+	const size_t new_size = tdata_size + aut_size + lpc_size + lpci_size + work_size;
+
+	if(new_size > *extrapolate_buffer_size) {
+		void *new_buffer = realloc(*extrapolate_buffer, new_size);
+		if(!new_buffer) return 0;
+		*extrapolate_buffer = new_buffer;
+		*extrapolate_buffer_size = new_size;
+	}
+
+	uint8_t *scratch = (uint8_t *)(*extrapolate_buffer);
+	double *aut = (double *)scratch;
+	double *lpc = (double *)(scratch + aut_size);
+	double *tdata = (double *)(scratch + aut_size + lpc_size);
+	double *lpci = (double *)(scratch + aut_size + lpc_size + tdata_size);
+	double *work = (double *)(scratch + aut_size + lpc_size + tdata_size + lpci_size);
+
+	for(int c = 0; c < nch; c++) {
+		if(extra_bkwd) {
+			for(int i = 0; i < (int)data_len; i++)
+				tdata[min_data_len - 1 - i] = data[i * nch + c];
+			if(data_len < min_data_len)
+				for(int i = (int)data_len; i < (int)min_data_len; i++)
+					tdata[min_data_len - 1 - i] = 0.0;
+		} else {
+			const ssize_t len_diff = min_data_len - data_len;
+			if(len_diff <= 0) {
+				for(int i = 0; i < (int)data_len; i++)
+					tdata[i] = data[i * nch + c];
+			} else {
+				for(int i = 0; i < (int)len_diff; i++)
+					tdata[i] = 0.0;
+				for(int i = 0; i < (int)data_len; i++)
+					tdata[len_diff + i] = data[i * nch + c];
+			}
+		}
+
+		apply_window_double(tdata, min_data_len);
+		vorbis_lpc_from_data_double(tdata, lpci, (int)min_data_len, lpc_order, aut, lpc);
+
+		if(extra_bkwd) {
+			for(int i = 0; i < (int)data_len; i++)
+				tdata[min_data_len - 1 - i] = data[i * nch + c];
+			if(data_len < min_data_len)
+				for(int i = (int)data_len; i < (int)min_data_len; i++)
+					tdata[min_data_len - 1 - i] = 0.0;
+		} else {
+			const ssize_t len_diff = min_data_len - data_len;
+			if(len_diff <= 0) {
+				for(int i = 0; i < (int)data_len; i++)
+					tdata[i] = data[i * nch + c];
+			} else {
+				for(int i = 0; i < (int)len_diff; i++)
+					tdata[i] = 0.0;
+				for(int i = 0; i < (int)data_len; i++)
+					tdata[len_diff + i] = data[i * nch + c];
+			}
+		}
+
+		vorbis_lpc_predict_double(lpci, tdata + min_data_len - lpc_order, lpc_order, tdata + min_data_len, extra_fwd + extra_bkwd, work);
+
+		if(extra_bkwd) {
+			for(int i = 0; i < (int)extra_bkwd; i++)
+				data[(-i - 1) * nch + c] = tdata[min_data_len + i];
+		} else {
+			for(int i = 0; i < (int)extra_fwd; i++)
+				data[(i + data_len) * nch + c] = tdata[min_data_len + i];
+		}
+	}
+	return 1;
 }

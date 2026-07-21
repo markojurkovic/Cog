@@ -41,6 +41,9 @@ using std::atomic_long;
 	OutputNode *outputController;
 
 	BOOL rsDone;
+	BOOL rsEndDrainPending;
+	BOOL rsEndDrainComplete;
+	BOOL rsOldIsEndDrain;
 	void *rsstate, *rsold;
 	
 	double lastClippedSampleRate;
@@ -72,8 +75,8 @@ using std::atomic_long;
 	BOOL observersapplied;
 	BOOL outputdevicechanged;
 
-	float volume;
-	float eqPreamp;
+	double volume;
+	double eqPreamp;
 
 	AudioDeviceID outputDeviceID;
 	AudioStreamBasicDescription realStreamFormat; // stream format pre-hrtf
@@ -121,16 +124,21 @@ using std::atomic_long;
 	
 	BOOL shouldPlayOutBuffer;
 
-	float *samplePtr;
-	float tempBuffer[512 * 32];
-	float rsTempBuffer[4096 * 32];
-	float inputBuffer[4096 * 32]; // 4096 samples times maximum supported channel count
-	float fsurroundBuffer[8192 * 6];
-	float hrtfBuffer[4096 * 2];
-	float eqBuffer[4096 * 32];
+	double *samplePtr;
+	double tempBuffer[512 * 32];
+	double rsTempBuffer[4096 * 32];
+	double inputBuffer[4096 * 32]; // 4096 samples times maximum supported channel count
+	double fsurroundBuffer[8192 * 6];
+	double hrtfBuffer[8192 * 2];
 
-	float visAudio[4096];
-	float visTemp[8192];
+	// Apple GraphicEQ and AVSampleBufferAudioRenderer are configured for Float32.
+	// Keep their buffers at the API boundary; all processing on either side is Float64.
+	float eqBuffer[4096 * 32];
+	float deviceBuffer[8192 * 32];
+
+	double visAudio[4096];
+	double visTemp[8192];
+	float visOutput[8192];
 
 #ifdef OUTPUT_LOG
 	FILE *_logFile;

@@ -24,8 +24,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #pragma warning(disable : 4244)
 
 #define pi _pi
-const float _pi = 3.141592654f;
-const float epsilon = 0.000001f;
+const double _pi = 3.14159265358979323846;
+const double epsilon = 0.000001;
 using namespace std;
 
 #undef min
@@ -56,7 +56,7 @@ class decoder_impl {
 	decoder_impl(channel_setup setup, unsigned N)
 	: N(N),
 	  wnd(N), inbuf(3 * N), setup(setup), C((unsigned)chn_alloc[setup].size()),
-	  buffer_empty(true), lt(N), rt(N), dst(N), dstf(N),
+	  buffer_empty(true), lt(N), rt(N), dst(N),
 	  dftsetupF(vDSP_DFT_zrop_CreateSetupD(0, N, vDSP_DFT_FORWARD)),
 	  dftsetupB(vDSP_DFT_zrop_CreateSetupD(0, N, vDSP_DFT_INVERSE)) {
 		_dsp_complexalloc(&lf, N/2 + 1);
@@ -99,22 +99,22 @@ class decoder_impl {
 	}
 
 	// decode a stereo chunk, produces a multichannel chunk of the same size (lagged)
-	float *decode(const float *input) {
+	double *decode(const double *input) {
 		// append incoming data to the end of the input buffer
-		memcpy(&inbuf[N], &input[0], 8 * N);
+		memcpy(&inbuf[N], &input[0], 2 * N * sizeof(double));
 		// process first and second half, overlapped
 		buffered_decode(&inbuf[0]);
 		buffered_decode(&inbuf[N]);
 		// shift last half of the input to the beginning (for overlapping with a future block)
-		memcpy(&inbuf[0], &inbuf[2 * N], 4 * N);
+		memcpy(&inbuf[0], &inbuf[2 * N], N * sizeof(double));
 		buffer_empty = false;
 		return &outbuf[0];
 	}
 
 	// flush the internal buffers
 	void flush() {
-		memset(&outbuf[0], 0, outbuf.size() * 4);
-		memset(&inbuf[0], 0, inbuf.size() * 4);
+		memset(&outbuf[0], 0, outbuf.size() * sizeof(double));
+		memset(&inbuf[0], 0, inbuf.size() * sizeof(double));
 		buffer_empty = true;
 	}
 
@@ -124,31 +124,31 @@ class decoder_impl {
 	}
 
 	// set soundfield & rendering parameters
-	void set_circular_wrap(float v) {
+	void set_circular_wrap(double v) {
 		circular_wrap = v;
 	}
-	void set_shift(float v) {
+	void set_shift(double v) {
 		shift = v;
 	}
-	void set_depth(float v) {
+	void set_depth(double v) {
 		depth = v;
 	}
-	void set_focus(float v) {
+	void set_focus(double v) {
 		focus = v;
 	}
-	void set_center_image(float v) {
+	void set_center_image(double v) {
 		center_image = v;
 	}
-	void set_front_separation(float v) {
+	void set_front_separation(double v) {
 		front_separation = v;
 	}
-	void set_rear_separation(float v) {
+	void set_rear_separation(double v) {
 		rear_separation = v;
 	}
-	void set_low_cutoff(float v) {
+	void set_low_cutoff(double v) {
 		lo_cut = v * (N / 2);
 	}
-	void set_high_cutoff(float v) {
+	void set_high_cutoff(double v) {
 		hi_cut = v * (N / 2);
 	}
 	void set_bass_redirection(bool v) {
@@ -157,7 +157,7 @@ class decoder_impl {
 
 	private:
 	// helper functions
-	static inline float sqr(double x) {
+	static inline double sqr(double x) {
 		return x * x;
 	}
 	static inline double amplitude(const DSPDoubleSplitComplex &cpx, size_t index) {
@@ -170,16 +170,16 @@ class decoder_impl {
 		cpx.realp[index] = a * cos(p);
 		cpx.imagp[index] = a * sin(p);
 	}
-	static inline float min(double a, double b) {
+	static inline double min(double a, double b) {
 		return a < b ? a : b;
 	}
-	static inline float max(double a, double b) {
+	static inline double max(double a, double b) {
 		return a > b ? a : b;
 	}
-	static inline float clamp(double x) {
+	static inline double clamp(double x) {
 		return max(-1, min(1, x));
 	}
-	static inline float sign(double x) {
+	static inline double sign(double x) {
 		return x < 0 ? -1 : (x > 0 ? 1 : 0);
 	}
 	// get the distance of the soundfield edge, along a given angle
@@ -194,10 +194,10 @@ class decoder_impl {
 	}
 
 	// decode a block of data and overlap-add it into outbuf
-	void buffered_decode(const float *input) {
+	void buffered_decode(const double *input) {
 		// demultiplex and apply window function
-		vDSP_vspdp(input, 2, &lt[0], 1, N);
-		vDSP_vspdp(input + 1, 2, &rt[0], 1, N);
+		cblas_dcopy(N, input, 2, &lt[0], 1);
+		cblas_dcopy(N, input + 1, 2, &rt[0], 1);
 		vDSP_vmulD(&lt[0], 1, &wnd[0], 1, &lt[0], 1, N);
 		vDSP_vmulD(&rt[0], 1, &wnd[0], 1, &rt[0], 1, N);
 
@@ -251,7 +251,7 @@ class decoder_impl {
 			// map position to channel volumes
 			for(unsigned c = 0; c < C - 1; c++) {
 				// look up channel map at respective position (with bilinear interpolation) and build the signal
-				const vector<float *> &a = chn_alloc[setup][c];
+				const vector<double *> &a = chn_alloc[setup][c];
 				polar(amp_total * ((1 - x) * (1 - y) * a[q][p] + x * (1 - y) * a[q][p + 1] + (1 - x) * y * a[q + 1][p] + x * y * a[q + 1][p + 1]),
 				      phase_of[1 + (int)sign(chn_xsf[setup][c])], signal[c], f);
 			}
@@ -273,9 +273,9 @@ class decoder_impl {
 		}
 
 		// shift the last 2/3 to the first 2/3 of the output buffer
-		memmove(&outbuf[0], &outbuf[C * N / 2], N * C * 4);
+		memmove(&outbuf[0], &outbuf[C * N / 2], N * C * sizeof(double));
 		// and clear the rest
-		memset(&outbuf[C * N], 0, C * 4 * N / 2);
+		memset(&outbuf[C * N], 0, C * N / 2 * sizeof(double));
 		// backtransform each channel and overlap-add
 		for(unsigned c = 0; c < C; c++) {
 			// back-transform into time domain
@@ -283,8 +283,7 @@ class decoder_impl {
 			vDSP_ztocD(&signal[c], 1, (DSPDoubleComplex *)(&dst[0]), 2, N / 2);
 			// add the result to the last 2/3 of the output buffer, windowed (and remultiplex)
 			vDSP_vmulD(&dst[0], 1, &wnd[0], 1, &dst[0], 1, N);
-			vDSP_vdpsp(&dst[0], 1, &dstf[0], 1, N);
-			vDSP_vadd(&outbuf[C * N / 2 + c], C, &dstf[0], 1, &outbuf[C * N / 2 + c], C, N);
+			vDSP_vaddD(&outbuf[C * N / 2 + c], C, &dst[0], 1, &outbuf[C * N / 2 + c], C, N);
 		}
 	}
 
@@ -335,26 +334,25 @@ class decoder_impl {
 	channel_setup setup; // the channel setup
 
 	// parameters
-	float circular_wrap; // angle of the front soundstage around the listener (90�=default)
-	float shift; // forward/backward offset of the soundstage
-	float depth; // backward extension of the soundstage
-	float focus; // localization of the sound events
-	float center_image; // presence of the center speaker
-	float front_separation; // front stereo separation
-	float rear_separation; // rear stereo separation
-	float lo_cut, hi_cut; // LFE cutoff frequencies
+	double circular_wrap; // angle of the front soundstage around the listener (90�=default)
+	double shift; // forward/backward offset of the soundstage
+	double depth; // backward extension of the soundstage
+	double focus; // localization of the sound events
+	double center_image; // presence of the center speaker
+	double front_separation; // front stereo separation
+	double rear_separation; // rear stereo separation
+	double lo_cut, hi_cut; // LFE cutoff frequencies
 	bool use_lfe; // whether to use the LFE channel
 
 	// FFT data structures
 	vector<double> lt, rt, dst; // left total, right total (source arrays), time-domain destination buffer array
-	vector<float> dstf; // float conversion destination array
 	DSPDoubleSplitComplex lf, rf; // left total / right total in frequency domain
 	vDSP_DFT_SetupD dftsetupF, dftsetupB; // FFT objects
 
 	// buffers
 	bool buffer_empty; // whether the buffer is currently empty or dirty
-	vector<float> inbuf; // stereo input buffer (multiplexed)
-	vector<float> outbuf; // multichannel output buffer (multiplexed)
+	vector<double> inbuf; // stereo input buffer (multiplexed)
+	vector<double> outbuf; // multichannel output buffer (multiplexed)
 	vector<double> wnd; // the window function, precomputed
 	vector<DSPDoubleSplitComplex> signal; // the signal to be constructed in every channel, in the frequency domain
 };
@@ -366,37 +364,37 @@ freesurround_decoder::freesurround_decoder(channel_setup setup, unsigned blocksi
 freesurround_decoder::~freesurround_decoder() {
 	delete impl;
 }
-float *freesurround_decoder::decode(const float *input) {
+double *freesurround_decoder::decode(const double *input) {
 	return impl->decode(input);
 }
 void freesurround_decoder::flush() {
 	impl->flush();
 }
-void freesurround_decoder::circular_wrap(float v) {
+void freesurround_decoder::circular_wrap(double v) {
 	impl->set_circular_wrap(v);
 }
-void freesurround_decoder::shift(float v) {
+void freesurround_decoder::shift(double v) {
 	impl->set_shift(v);
 }
-void freesurround_decoder::depth(float v) {
+void freesurround_decoder::depth(double v) {
 	impl->set_depth(v);
 }
-void freesurround_decoder::focus(float v) {
+void freesurround_decoder::focus(double v) {
 	impl->set_focus(v);
 }
-void freesurround_decoder::center_image(float v) {
+void freesurround_decoder::center_image(double v) {
 	impl->set_center_image(v);
 }
-void freesurround_decoder::front_separation(float v) {
+void freesurround_decoder::front_separation(double v) {
 	impl->set_front_separation(v);
 }
-void freesurround_decoder::rear_separation(float v) {
+void freesurround_decoder::rear_separation(double v) {
 	impl->set_rear_separation(v);
 }
-void freesurround_decoder::low_cutoff(float v) {
+void freesurround_decoder::low_cutoff(double v) {
 	impl->set_low_cutoff(v);
 }
-void freesurround_decoder::high_cutoff(float v) {
+void freesurround_decoder::high_cutoff(double v) {
 	impl->set_high_cutoff(v);
 }
 void freesurround_decoder::bass_redirection(bool v) {

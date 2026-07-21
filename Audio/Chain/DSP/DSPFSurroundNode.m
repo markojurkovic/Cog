@@ -37,8 +37,8 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 	uint32_t lastInputChannelConfig, inputChannelConfig;
 	uint32_t outputChannelConfig;
 
-	float inBuffer[4096 * 2];
-	float outBuffer[8192 * 6];
+	double inBuffer[4096 * 2];
+	double outBuffer[8192 * 6];
 }
 
 - (id _Nullable)initWithController:(id _Nonnull)c previous:(id _Nullable)p latency:(double)latency {
@@ -96,9 +96,9 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 			[mutex unlock];
 			return NO;
 		}
-		outputFormat = AudioFormatAsFloat32(inputFormat);
+		outputFormat = AudioFormatAsFloat64(inputFormat);
 		outputFormat.mChannelsPerFrame = [fsurround channelCount];
-		outputFormat.mBytesPerFrame = sizeof(float) * outputFormat.mChannelsPerFrame;
+		outputFormat.mBytesPerFrame = sizeof(double) * outputFormat.mChannelsPerFrame;
 		outputFormat.mBytesPerPacket = outputFormat.mBytesPerFrame * outputFormat.mFramesPerPacket;
 		outputChannelConfig = [fsurround channelConfig];
 
@@ -219,7 +219,7 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 	size_t totalRequestedSamples = 4096;
 
 	size_t totalFrameCount = 0;
-	AudioChunk *chunk = [self readAndMergeChunksAsFloat32:totalRequestedSamples];
+	AudioChunk *chunk = [self readAndMergeChunksAsFloat64:totalRequestedSamples];
 	if(!chunk || ![chunk frameCount]) {
 		[mutex unlock];
 		return nil;
@@ -227,13 +227,13 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 
 	double streamTimestamp = [chunk streamTimestamp];
 
-	float *samplePtr = &inBuffer[0];
+	double *samplePtr = &inBuffer[0];
 
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
-	if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+	if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+		[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}
@@ -246,14 +246,14 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 		return outputChunk;
 	}
 
-	cblas_scopy((int)frameCount * 2, [sampleData bytes], 1, &samplePtr[0], 1);
+	cblas_dcopy((int)frameCount * 2, [sampleData bytes], 1, &samplePtr[0], 1);
 
 	totalFrameCount = frameCount;
 
 	size_t countToProcess = totalFrameCount;
 	size_t samplesRendered;
 	if(countToProcess < 4096) {
-		bzero(&inBuffer[countToProcess * 2], (4096 - countToProcess) * 2 * sizeof(float));
+		bzero(&inBuffer[countToProcess * 2], (4096 - countToProcess) * 2 * sizeof(double));
 		countToProcess = 4096;
 	}
 
@@ -262,7 +262,7 @@ static void * kDSPFSurroundNodeContext = &kDSPFSurroundNodeContext;
 	samplesRendered = totalFrameCount;
 
 	if(totalFrameCount < 4096) {
-		bzero(&outBuffer[4096 * 6], 4096 * 2 * sizeof(float));
+		bzero(&outBuffer[4096 * 6], 4096 * 2 * sizeof(double));
 		[fsurround process:&outBuffer[4096 * 6] output:&outBuffer[4096 * 6] count:4096];
 		samplesRendered += 2048;
 	}

@@ -107,8 +107,8 @@ static void unregisterMotionListener(void) {
 	simd_float4x4 rotationMatrix;
 	simd_float4x4 referenceMatrix;
 
-	float prefillBuffer[4096 * 32];
-	float outBuffer[4096 * 2];
+	double prefillBuffer[4096 * 32];
+	double outBuffer[4096 * 2];
 
 	void *extrapolate_buffer;
 	size_t extrapolate_buffer_size;
@@ -237,9 +237,9 @@ static void unregisterMotionListener(void) {
 			return NO;
 		}
 
-		outputFormat = AudioFormatAsFloat32(inputFormat);
+		outputFormat = AudioFormatAsFloat64(inputFormat);
 		outputFormat.mChannelsPerFrame = 2;
-		outputFormat.mBytesPerFrame = sizeof(float) * outputFormat.mChannelsPerFrame;
+		outputFormat.mBytesPerFrame = sizeof(double) * outputFormat.mChannelsPerFrame;
 		outputFormat.mBytesPerPacket = outputFormat.mBytesPerFrame * outputFormat.mFramesPerPacket;
 		outputChannelConfig = AudioChannelSideLeft | AudioChannelSideRight;
 
@@ -379,7 +379,7 @@ static void unregisterMotionListener(void) {
 		return [self readChunk:4096];
 	}
 
-	AudioChunk *chunk = [self readChunkAsFloat32:4096];
+	AudioChunk *chunk = [self readChunkAsFloat64:4096];
 	if(!chunk || ![chunk frameCount]) {
 		[mutex unlock];
 		return nil;
@@ -404,9 +404,9 @@ static void unregisterMotionListener(void) {
 
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
-	if(audioBufferIsDoP((const float *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+	if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:AudioFormatAsFloat32(inputFormat)];
+		[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
 		if(inputChannelConfig) {
 			[outputChunk setChannelConfig:inputChannelConfig];
 		}
@@ -425,13 +425,15 @@ static void unregisterMotionListener(void) {
 			maxToUse = frameCount;
 		}
 		size_t channels = inputFormat.mChannelsPerFrame;
-		memcpy(&prefillBuffer[needPrefill * channels], [sampleData bytes], maxToUse * sizeof(float) * channels);
-		lpc_extrapolate_bkwd(&prefillBuffer[needPrefill * channels], maxToUse, maxToUse, (int)channels, LPC_ORDER, needPrefill, &extrapolate_buffer, &extrapolate_buffer_size);
+		memcpy(&prefillBuffer[needPrefill * channels], [sampleData bytes], maxToUse * sizeof(double) * channels);
+		if(!lpc_extrapolate_bkwd_double(&prefillBuffer[needPrefill * channels], maxToUse, maxToUse, (int)channels, LPC_ORDER, needPrefill, &extrapolate_buffer, &extrapolate_buffer_size)) {
+			vDSP_vclrD(prefillBuffer, 1, needPrefill * channels);
+		}
 		[hrtf process:&prefillBuffer[0] sampleCount:(int)needPrefill toBuffer:&outBuffer[0]];
 		needPrefill = 0;
 	}
 
-	[hrtf process:(const float *)[sampleData bytes] sampleCount:(int)frameCount toBuffer:&outBuffer[0]];
+	[hrtf process:(const double *)[sampleData bytes] sampleCount:(int)frameCount toBuffer:&outBuffer[0]];
 
 	AudioChunk *outputChunk = [AudioChunk new];
 	[outputChunk setFormat:outputFormat];

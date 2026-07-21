@@ -27,7 +27,7 @@
 
 static NSNotificationName CogPlaybackDidPrebufferNotification = @"CogPlaybackDidPrebufferNotification";
 
-extern void scale_by_volume(float *buffer, size_t count, float volume);
+extern void scale_by_volume_double(double *buffer, size_t count, double volume);
 
 static NSNotificationName CogPlaybackDidBeginNotificiation = @"CogPlaybackDidBeginNotificiation";
 
@@ -801,59 +801,67 @@ static AudioStreamBasicDescription DoPIntegerRenderFormatForDeviceFormat(AudioSt
 	return outputFormat;
 }
 
-static int32_t convertDoPFloatToS32(float sample) {
-	const double scaled = (double)sample * 2147483648.0;
+static int32_t convertDoPFloat64ToS32(double sample) {
+	const double scaled = sample * 2147483648.0;
 	int32_t packed = (int32_t)llrint(scaled);
 	return (int32_t)(((uint32_t)packed) & 0xFFFFFF00U);
 }
 
-static int32_t convertPCMFloatToS32(float sample) {
-	if(sample >= 1.0f) return (int32_t)(((uint32_t)INT32_MAX) & 0xFFFFFF00U);
-	if(sample <= -1.0f) return INT32_MIN;
+static int32_t convertPCMFloat64ToS32(double sample) {
+	if(isnan(sample)) return 0;
+	if(sample >= 1.0) return (int32_t)(((uint32_t)INT32_MAX) & 0xFFFFFF00U);
+	if(sample <= -1.0) return INT32_MIN;
 	// Integer PCM is normalized by dividing by 2^31. Use the exact inverse
 	// here: multiplying by INT32_MAX loses one 24-bit LSB in the upper half
 	// of the positive range before the 24-bit carrier mask is applied.
-	return (int32_t)(((uint32_t)llrint((double)sample * 2147483648.0)) & 0xFFFFFF00U);
+	int64_t scaled = llrint(sample * 2147483648.0);
+	if(scaled > INT32_MAX) scaled = INT32_MAX;
+	if(scaled < INT32_MIN) scaled = INT32_MIN;
+	return (int32_t)(((uint32_t)scaled) & 0xFFFFFF00U);
 }
 
-static void convertFloatBufferToS32(int32_t *output, const float *input, size_t count, BOOL isDoP) {
+static void convertFloat64BufferToS32(int32_t *output, const double *input, size_t count, BOOL isDoP) {
 	for(size_t i = 0; i < count; ++i) {
-		output[i] = isDoP ? convertDoPFloatToS32(input[i]) : convertPCMFloatToS32(input[i]);
+		output[i] = isDoP ? convertDoPFloat64ToS32(input[i]) : convertPCMFloat64ToS32(input[i]);
 	}
 }
 
-static int32_t convertPCMFloatToFullS32(float sample) {
-	if(sample >= 1.0f) return INT32_MAX;
-	if(sample <= -1.0f) return INT32_MIN;
-	return (int32_t)llrint((double)sample * 2147483648.0);
+static int32_t convertPCMFloat64ToFullS32(double sample) {
+	if(isnan(sample)) return 0;
+	if(sample >= 1.0) return INT32_MAX;
+	if(sample <= -1.0) return INT32_MIN;
+	int64_t scaled = llrint(sample * 2147483648.0);
+	if(scaled > INT32_MAX) return INT32_MAX;
+	if(scaled < INT32_MIN) return INT32_MIN;
+	return (int32_t)scaled;
 }
 
-static void convertFloatBufferToFullS32(int32_t *output, const float *input, size_t count) {
+static void convertFloat64BufferToFullS32(int32_t *output, const double *input, size_t count) {
 	for(size_t i = 0; i < count; ++i) {
-		output[i] = convertPCMFloatToFullS32(input[i]);
+		output[i] = convertPCMFloat64ToFullS32(input[i]);
 	}
 }
 
-static void convertFloatBufferToF64(double *output, const float *input, size_t count) {
-	vDSP_vspdp(input, 1, output, 1, count);
+static void convertFloat64BufferToF32(float *output, const double *input, size_t count) {
+	vDSP_vdpsp(input, 1, output, 1, count);
 }
 
-static BOOL convertPCMBufferToFloat32(float *output, const void *input, AudioStreamBasicDescription format, size_t count) {
+static BOOL convertPCMBufferToFloat64(double *output, const void *input, AudioStreamBasicDescription format, size_t count) {
+	if(AudioFormatIsFloat64(format)) {
+		memcpy(output, input, count * sizeof(double));
+		return YES;
+	}
 	if(AudioFormatIsFloat32(format)) {
-		memcpy(output, input, count * sizeof(float));
+		vDSP_vspdp((const float *)input, 1, output, 1, count);
 		return YES;
 	}
 	if(!AudioFormatIsHighPrecisionPCM(format)) {
 		return NO;
 	}
 
-	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
-		vDSP_vdpsp((const double *)input, 1, output, 1, count);
-	} else {
-		vDSP_vflt32((const int32_t *)input, 1, output, 1, count);
-		const float scale = 2147483648.0f;
-		vDSP_vsdiv(output, 1, &scale, output, 1, count);
-	}
+	vDSP_vflt32D((const int32_t *)input, 1, output, 1, count);
+	const double scale = 2147483648.0;
+	vDSP_vsdivD(output, 1, &scale, output, 1, count);
 	return YES;
 }
 
@@ -874,7 +882,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	       !!(second.mFormatFlags & kAudioFormatFlagIsFloat);
 }
 
-- (BOOL)prepareOutputFloatScratchForRenderFormat:(AudioStreamBasicDescription)format {
+- (BOOL)prepareOutputDoubleScratchForRenderFormat:(AudioStreamBasicDescription)format {
 	const size_t maximumFrames = (size_t)_au.maximumFramesToRender;
 	const size_t channels = (size_t)format.mChannelsPerFrame;
 	if(!maximumFrames || !channels || maximumFrames > SIZE_MAX / channels) {
@@ -882,25 +890,25 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	}
 
 	const size_t requiredSamples = maximumFrames * channels;
-	if(requiredSamples > SIZE_MAX / sizeof(float)) {
+	if(requiredSamples > SIZE_MAX / sizeof(double)) {
 		return NO;
 	}
-	if(outputFloatScratch && inputFloatScratch && outputFloatScratchCapacity >= requiredSamples) {
+	if(outputDoubleScratch && inputDoubleScratch && outputDoubleScratchCapacity >= requiredSamples) {
 		return YES;
 	}
 
-	float *outputScratch = (float *)realloc(outputFloatScratch, requiredSamples * sizeof(float));
+	double *outputScratch = (double *)realloc(outputDoubleScratch, requiredSamples * sizeof(double));
 	if(!outputScratch) {
 		return NO;
 	}
-	outputFloatScratch = outputScratch;
+	outputDoubleScratch = outputScratch;
 
-	float *inputScratch = (float *)realloc(inputFloatScratch, requiredSamples * sizeof(float));
+	double *inputScratch = (double *)realloc(inputDoubleScratch, requiredSamples * sizeof(double));
 	if(!inputScratch) {
 		return NO;
 	}
-	inputFloatScratch = inputScratch;
-	outputFloatScratchCapacity = requiredSamples;
+	inputDoubleScratch = inputScratch;
+	outputDoubleScratchCapacity = requiredSamples;
 	return YES;
 }
 
@@ -1127,7 +1135,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			resetting = NO;
 			return NO;
 		}
-		if(![self prepareOutputFloatScratchForRenderFormat:renderFormat]) {
+		if(![self prepareOutputDoubleScratchForRenderFormat:renderFormat]) {
 			resetting = NO;
 			return NO;
 		}
@@ -1532,22 +1540,21 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		}
 		
 		const BOOL renderAsFloat32 = AudioFormatIsFloat32(*renderASBD);
+		const BOOL renderAsFloat64 = AudioFormatIsFloat64(*renderASBD);
 		const BOOL renderAsHighPrecision = AudioFormatIsHighPrecisionPCM(*renderASBD);
 		const size_t scratchSamples = (size_t)frameCount * channels;
-		if(!_self->inputFloatScratch || !_self->outputFloatScratch ||
-		   _self->outputFloatScratchCapacity < scratchSamples) {
+		if(!_self->inputDoubleScratch || !_self->outputDoubleScratch ||
+		   _self->outputDoubleScratchCapacity < scratchSamples) {
 			return 0;
 		}
-		float *outSamples = renderAsFloat32 ? (float *)inputData->mBuffers[0].mData : _self->outputFloatScratch;
-		if(!renderAsFloat32) {
-			bzero(outSamples, scratchSamples * sizeof(float));
-		}
+		double *outSamples = _self->outputDoubleScratch;
+		bzero(outSamples, scratchSamples * sizeof(double));
 
 		const BOOL directHighPrecision = _self->renderFormatNativeHighPrecision &&
 		                                 renderAsHighPrecision &&
 		                                 !_self->fading && !_self->faded &&
 		                                 !_self->doPActive && !_self->doPSeekPending &&
-		                                 _self->volume == 1.0f;
+		                                 _self->volume == 1.0;
 
 		@autoreleasepool {
 			if(directHighPrecision) {
@@ -1581,11 +1588,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 						} else if(highPrecisionRepresentationsMatch(chunkFormat, *renderASBD)) {
 							memcpy(destination, [sampleData bytes], inputTodo * renderASBD->mBytesPerPacket);
 							renderedChunk = YES;
-						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, sampleCount)) {
+						} else if(convertPCMBufferToFloat64(_self->inputDoubleScratch, [sampleData bytes], chunkFormat, sampleCount)) {
 							if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
-								convertFloatBufferToF64((double *)destination, _self->inputFloatScratch, sampleCount);
+								memcpy(destination, _self->inputDoubleScratch, sampleCount * sizeof(double));
 							} else {
-								convertFloatBufferToFullS32((int32_t *)destination, _self->inputFloatScratch, sampleCount);
+								convertFloat64BufferToFullS32((int32_t *)destination, _self->inputDoubleScratch, sampleCount);
 							}
 							renderedChunk = YES;
 						}
@@ -1627,23 +1634,20 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 						if(chunkFormat.mChannelsPerFrame != (UInt32)channels) {
 							break;
 						}
-						float *samplePtr = NULL;
-						if(AudioFormatIsFloat32(chunkFormat)) {
-							samplePtr = (float *)[sampleData bytes];
-						} else if(convertPCMBufferToFloat32(_self->inputFloatScratch, [sampleData bytes], chunkFormat, inputTodo * channels)) {
-							samplePtr = _self->inputFloatScratch;
+						double *samplePtr = NULL;
+						if(convertPCMBufferToFloat64(_self->inputDoubleScratch, [sampleData bytes], chunkFormat, inputTodo * channels)) {
+							samplePtr = _self->inputDoubleScratch;
 						}
 						if(!samplePtr) {
 							break;
 						}
 						uint8_t nextDoPMarker = 0x05;
-						BOOL inputIsDoP = AudioFormatIsFloat32(chunkFormat) &&
-						                  audioBufferIsDoP(samplePtr, channels, inputTodo, &nextDoPMarker);
+						BOOL inputIsDoP = audioBufferIsDoP64(samplePtr, channels, inputTodo, &nextDoPMarker);
 
 						if(_self->doPSeekPending && !inputIsDoP) {
 							// Never expose transitional or stale PCM-looking data while a
 							// DoP seek is waiting for the first verified post-seek carrier.
-							fillDoPSilence(outSamples + renderedSamples * channels, channels, inputTodo, &_self->doPMarker);
+							fillDoPSilence64(outSamples + renderedSamples * channels, channels, inputTodo, &_self->doPMarker);
 							outputContainsDoP = YES;
 						} else if(inputIsDoP) {
 							// A DoP carrier must remain bit-perfect. Complete a pending
@@ -1655,7 +1659,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 								samplePtr += channels;
 								--inputTodo;
 							}
-							cblas_scopy((int)(inputTodo * channels), samplePtr, 1, outSamples + renderedSamples * channels, 1);
+							cblas_dcopy((int)(inputTodo * channels), samplePtr, 1, outSamples + renderedSamples * channels, 1);
 							_self->doPActive = YES;
 							_self->doPSeekPending = NO;
 							_self->doPMarker = nextDoPMarker;
@@ -1663,21 +1667,21 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 							if(_self->fading) {
 								_self->faded = _self->fadeStep < 0.0;
 								_self->fading = NO;
-								_self->fadeStep = 0.0f;
-								_self->fadeLevel = _self->faded ? 0.0f : 1.0f;
+								_self->fadeStep = 0.0;
+								_self->fadeLevel = _self->faded ? 0.0 : 1.0;
 							}
 						} else if(!_self->fading) {
 							_self->doPActive = NO;
-							cblas_scopy((int)(inputTodo * channels), samplePtr, 1, outSamples + renderedSamples * channels, 1);
+							cblas_dcopy((int)(inputTodo * channels), samplePtr, 1, outSamples + renderedSamples * channels, 1);
 						} else {
 							_self->doPActive = NO;
-							BOOL faded = fadeAudio(samplePtr, outSamples + renderedSamples * channels, channels, inputTodo, &_self->fadeLevel, _self->fadeStep, _self->fadeTarget);
+							BOOL faded = fadeAudio64(samplePtr, outSamples + renderedSamples * channels, channels, inputTodo, &_self->fadeLevel, _self->fadeStep, _self->fadeTarget);
 							if(faded) {
 								if(_self->fadeStep < 0.0) {
 									_self->faded = YES;
 								}
 								_self->fading = NO;
-								_self->fadeStep = 0.0f;
+								_self->fadeStep = 0.0;
 							}
 						}
 
@@ -1693,24 +1697,27 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
 				// initial startup, track changes, and brief underruns with standard
 				// DSD silence.
-				fillDoPSilence(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
+				fillDoPSilence64(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
 				outputContainsDoP = YES;
 			}
 
 			double secondsRendered = (double)renderedSamples / format->mSampleRate;
 
 			if(!directHighPrecision && !outputContainsDoP) {
-				scale_by_volume(outSamples, frameCount * channels, _self->volume);
+				scale_by_volume_double(outSamples, frameCount * channels, _self->volume);
 			}
 
-			if(!directHighPrecision && _self->renderFormatNativeHighPrecision) {
-				if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
-					convertFloatBufferToF64((double *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+			if(!directHighPrecision) {
+				const size_t outputSampleCount = (size_t)frameCount * channels;
+				if(renderAsFloat32) {
+					convertFloat64BufferToF32((float *)inputData->mBuffers[0].mData, outSamples, outputSampleCount);
+				} else if(renderAsFloat64) {
+					memcpy(inputData->mBuffers[0].mData, outSamples, outputSampleCount * sizeof(double));
+				} else if(_self->renderFormatNativeHighPrecision) {
+					convertFloat64BufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, outputSampleCount);
 				} else {
-					convertFloatBufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels);
+					convertFloat64BufferToS32((int32_t *)inputData->mBuffers[0].mData, outSamples, outputSampleCount, outputContainsDoP);
 				}
-			} else if(!directHighPrecision && !renderAsFloat32) {
-				convertFloatBufferToS32((int32_t *)inputData->mBuffers[0].mData, outSamples, (size_t)frameCount * channels, outputContainsDoP);
 			}
 
 			[_self updateLatency:secondsRendered];
@@ -1726,6 +1733,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			[BadSampleCleaner cleanSamples:(float *)inputData->mBuffers[0].mData
 									amount:inputData->mBuffers[0].mDataByteSize / sizeof(float)
 								  location:@"final output"];
+		} else if(renderAsFloat64) {
+			[BadSampleCleaner cleanSamples64:(double *)inputData->mBuffers[0].mData
+									 amount:inputData->mBuffers[0].mDataByteSize / sizeof(double)
+								   location:@"final output"];
 		}
 #endif
 
@@ -1767,9 +1778,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		hdcdDetected = NO;
 
 		cutOffInput = NO;
-		fadeTarget = 1.0f;
-		fadeLevel = 1.0f;
-		fadeStep = 0.0f;
+		fadeTarget = 1.0;
+		fadeLevel = 1.0;
+		fadeStep = 0.0;
 		fading = NO;
 		faded = NO;
 		fadingstop = YES;
@@ -1868,11 +1879,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (double)volume {
-	return volume * 100.0f;
+	return volume * 100.0;
 }
 
 - (void)setVolume:(double)v {
-	volume = v * 0.01f;
+	volume = v * 0.01;
 	[self refreshOutputStatus];
 }
 
@@ -1977,15 +1988,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			[_au stopHardware];
 			_au = nil;
 		}
-		if(outputFloatScratch) {
-			free(outputFloatScratch);
-			outputFloatScratch = NULL;
+		if(outputDoubleScratch) {
+			free(outputDoubleScratch);
+			outputDoubleScratch = NULL;
 		}
-		if(inputFloatScratch) {
-			free(inputFloatScratch);
-			inputFloatScratch = NULL;
+		if(inputDoubleScratch) {
+			free(inputDoubleScratch);
+			inputDoubleScratch = NULL;
 		}
-		outputFloatScratchCapacity = 0;
+		outputDoubleScratchCapacity = 0;
 		if(running) {
 			while(!stopped) {
 				stopping = YES;
@@ -2104,15 +2115,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)fadeOut {
 	if(!playbackFadesEnabled()) {
-		fadeTarget = 0.0f;
-		fadeLevel = 0.0f;
-		fadeStep = 0.0f;
+		fadeTarget = 0.0;
+		fadeLevel = 0.0;
+		fadeStep = 0.0;
 		fading = NO;
 		faded = YES;
 		return;
 	}
-	fadeTarget = 0.0f;
-	fadeStep = ((fadeTarget - fadeLevel) / deviceFormat.mSampleRate) * (1000.0f / fadeTimeMS);
+	fadeTarget = 0.0;
+	fadeStep = ((fadeTarget - fadeLevel) / deviceFormat.mSampleRate) * (1000.0 / fadeTimeMS);
 	fading = YES;
 }
 
@@ -2126,7 +2137,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	DSPDownmixNode *oldDownmix = downmixNode;
 	DSPFaderNode *oldFader = faderNode;
 
-	float fadeLevel = [oldFader fadeLevel];
+	double fadeLevel = [oldFader fadeLevel];
 
 	hrtfNode = [[DSPHRTFNode alloc] initWithController:self previous:nil latency:0.03];
 	downmixNode = [[DSPDownmixNode alloc] initWithController:self previous:hrtfNode latency:0.03];
@@ -2177,17 +2188,17 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 - (void)fadeIn {
 	[self stopIdle];
 	if(!playbackFadesEnabled()) {
-		fadeLevel = 1.0f;
-		fadeTarget = 1.0f;
-		fadeStep = 0.0f;
+		fadeLevel = 1.0;
+		fadeTarget = 1.0;
+		fadeStep = 0.0;
 		fading = NO;
 		faded = NO;
 		return;
 	}
 	if(fading || faded) {
-		fadeLevel = 0.0f;
-		fadeTarget = 1.0f;
-		fadeStep = ((fadeTarget - fadeLevel) / deviceFormat.mSampleRate) * (1000.0f / fadeTimeMS);
+		fadeLevel = 0.0;
+		fadeTarget = 1.0;
+		fadeStep = ((fadeTarget - fadeLevel) / deviceFormat.mSampleRate) * (1000.0 / fadeTimeMS);
 		fading = YES;
 		faded = NO;
 	} else {
@@ -2201,9 +2212,9 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	// separate final-output fade gate is open as well: a DSD pause completes
 	// that gate as a hard fade, and reusing the output without clearing it
 	// otherwise leaves AUHAL running while it emits only carrier silence.
-	fadeLevel = 1.0f;
-	fadeTarget = 1.0f;
-	fadeStep = 0.0f;
+	fadeLevel = 1.0;
+	fadeTarget = 1.0;
+	fadeStep = 0.0;
 	fading = NO;
 	faded = NO;
 	if(playbackFadesEnabled() || doPActive) {

@@ -20,7 +20,7 @@
 	double srate;
 	uint32_t channelCount;
 	uint32_t channelConfig;
-	float tempBuffer[4096 * 2];
+	double tempBuffer[4096 * 2];
 }
 
 - (id)initWithSampleRate:(double)srate;
@@ -29,7 +29,7 @@
 - (uint32_t)channelConfig;
 - (double)srate;
 
-- (void)process:(const float *)samplesIn output:(float *)samplesOut count:(uint32_t)count;
+- (void)process:(const double *)samplesIn output:(double *)samplesOut count:(uint32_t)count;
 
 @end
 

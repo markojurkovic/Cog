@@ -25,6 +25,7 @@
 static const size_t LPC_ORDER = 32;
 
 void lpc_extrapolate2(float * const data, const size_t data_len, const int nch, const int lpc_order, const size_t extra_bkwd, const size_t extra_fwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size);
+int lpc_extrapolate2_double(double * const data, const size_t data_len, const int nch, const int lpc_order, const size_t extra_bkwd, const size_t extra_fwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size);
 
 static inline void lpc_extrapolate_bkwd(float * const data, const size_t data_len, const size_t prime_len, const int nch, const int lpc_order, const size_t extra_bkwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size)
 {
@@ -35,6 +36,17 @@ static inline void lpc_extrapolate_bkwd(float * const data, const size_t data_le
 static inline void lpc_extrapolate_fwd(float * const data, const size_t data_len, const size_t prime_len, const int nch, const int lpc_order, const size_t extra_fwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size)
 {
     lpc_extrapolate2(data + (data_len - prime_len)*nch, prime_len, nch, lpc_order, 0, extra_fwd, extrapolate_buffer, extrapolate_buffer_size);
+}
+
+static inline int lpc_extrapolate_bkwd_double(double * const data, const size_t data_len, const size_t prime_len, const int nch, const int lpc_order, const size_t extra_bkwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size)
+{
+    (void)data_len;
+    return lpc_extrapolate2_double(data, prime_len, nch, lpc_order, extra_bkwd, 0, extrapolate_buffer, extrapolate_buffer_size);
+}
+
+static inline int lpc_extrapolate_fwd_double(double * const data, const size_t data_len, const size_t prime_len, const int nch, const int lpc_order, const size_t extra_fwd, void ** extrapolate_buffer, size_t * extrapolate_buffer_size)
+{
+    return lpc_extrapolate2_double(data + (data_len - prime_len)*nch, prime_len, nch, lpc_order, 0, extra_fwd, extrapolate_buffer, extrapolate_buffer_size);
 }
 
 #endif

@@ -16,12 +16,102 @@
 #import "Logging.h"
 
 #import <Accelerate/Accelerate.h>
+#import <CogAudio/soxr.h>
 
-#import "rsstate.h"
-
+#import "AudioChunk.h"
 #import "FSurroundFilter.h"
 
-extern void scale_by_volume(float *buffer, size_t count, float volume);
+extern void scale_by_volume_double(double *buffer, size_t count, double volume);
+
+typedef struct {
+	int channelCount;
+	uint64_t inProcessed;
+	uint64_t outProcessed;
+	double sampleRatio;
+	double dstRate;
+	double *silenceBuffer;
+	soxr_t resampler;
+} AVFFloat64Resampler;
+
+static void *AVFFloat64ResamplerCreate(int channelCount, double srcRate, double dstRate) {
+	AVFFloat64Resampler *state = calloc(1, sizeof(*state));
+	if(!state) return NULL;
+
+	state->channelCount = channelCount;
+	state->sampleRatio = dstRate / srcRate;
+	state->dstRate = dstRate;
+	state->silenceBuffer = calloc((size_t)1024 * channelCount, sizeof(double));
+	if(!state->silenceBuffer) {
+		free(state);
+		return NULL;
+	}
+
+	soxr_error_t error = NULL;
+	soxr_io_spec_t ioSpec = soxr_io_spec(SOXR_FLOAT64_I, SOXR_FLOAT64_I);
+	soxr_quality_spec_t qualitySpec = soxr_quality_spec(SOXR_HQ, SOXR_DOUBLE_PRECISION);
+	soxr_runtime_spec_t runtimeSpec = soxr_runtime_spec(0);
+	state->resampler = soxr_create(srcRate, dstRate, (unsigned)channelCount, &error, &ioSpec, &qualitySpec, &runtimeSpec);
+	if(error || !state->resampler) {
+		free(state->silenceBuffer);
+		free(state);
+		return NULL;
+	}
+
+	return state;
+}
+
+static void AVFFloat64ResamplerDelete(void *opaqueState) {
+	AVFFloat64Resampler *state = opaqueState;
+	if(!state) return;
+	if(state->resampler) soxr_delete(state->resampler);
+	free(state->silenceBuffer);
+	free(state);
+}
+
+static double AVFFloat64ResamplerLatency(void *opaqueState) {
+	AVFFloat64Resampler *state = opaqueState;
+	if(!state || state->dstRate <= 0.0) return 0.0;
+	return (((double)state->inProcessed * state->sampleRatio) - (double)state->outProcessed) / state->dstRate;
+}
+
+static int AVFFloat64ResamplerProcess(void *opaqueState, const double *input, size_t inCount, size_t *inDone, double *output, size_t outMax) {
+	AVFFloat64Resampler *state = opaqueState;
+	if(!state || !inDone) return 0;
+
+	size_t outDone = 0;
+	soxr_error_t error = soxr_process(state->resampler, input, inCount, inDone, output, outMax, &outDone);
+	if(error) return 0;
+
+	state->inProcessed += *inDone;
+	state->outProcessed += outDone;
+	return (int)outDone;
+}
+
+static int AVFFloat64ResamplerFlush(void *opaqueState, double *output, size_t outMax, BOOL *drained) {
+	AVFFloat64Resampler *state = opaqueState;
+	if(drained) *drained = YES;
+	if(!state) return 0;
+
+	size_t outTotal = 0;
+	const uint64_t outputWanted = (uint64_t)ceil((double)state->inProcessed * state->sampleRatio);
+	while(state->outProcessed < outputWanted && outMax) {
+		size_t outWanted = (size_t)(outputWanted - state->outProcessed);
+		outWanted = MIN(outWanted, outMax);
+
+		size_t inDone = 0;
+		size_t outDone = 0;
+		soxr_error_t error = soxr_process(state->resampler, state->silenceBuffer, 1024, &inDone, output, outWanted, &outDone);
+		if(error || (!inDone && !outDone)) break;
+
+		state->outProcessed += outDone;
+		outTotal += outDone;
+		output += outDone * state->channelCount;
+		outMax -= outDone;
+	}
+
+	if(drained) *drained = state->outProcessed >= outputWanted;
+	return (int)outTotal;
+}
 
 static NSString *CogPlaybackDidBeginNotficiation = @"CogPlaybackDidBeginNotficiation";
 
@@ -29,20 +119,20 @@ static NSString *CogPlaybackDidBeginNotficiation = @"CogPlaybackDidBeginNotficia
 
 static void *kOutputAVFoundationContext = &kOutputAVFoundationContext;
 
-static void fillBuffers(AudioBufferList *ioData, const float *inbuffer, size_t count, size_t offset) {
+static void fillBuffers(AudioBufferList *ioData, const double *inbuffer, size_t count, size_t offset) {
 	const size_t channels = ioData->mNumberBuffers;
 	for(int i = 0; i < channels; ++i) {
 		const size_t maxCount = (ioData->mBuffers[i].mDataByteSize / sizeof(float)) - offset;
 		float *output = ((float *)ioData->mBuffers[i].mData) + offset;
-		const float *input = inbuffer + i;
-		cblas_scopy((int)((count > maxCount) ? maxCount : count), input, (int)channels, output, 1);
+		const double *input = inbuffer + i;
+		vDSP_vdpsp(input, channels, output, 1, MIN(count, maxCount));
 		ioData->mBuffers[i].mNumberChannels = 1;
 	}
 }
 
 static void clearBuffers(AudioBufferList *ioData, size_t count, size_t offset) {
 	for(int i = 0; i < ioData->mNumberBuffers; ++i) {
-		memset(ioData->mBuffers[i].mData + offset * sizeof(float), 0, count * sizeof(float));
+		memset(((uint8_t *)ioData->mBuffers[i].mData) + offset * sizeof(float), 0, count * sizeof(float));
 		ioData->mBuffers[i].mNumberChannels = 1;
 	}
 }
@@ -60,7 +150,7 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 	return 0;
 }
 
-- (int)renderInput:(int)amountToRead toBuffer:(float *)buffer {
+- (int)renderInput:(int)amountToRead toBuffer:(double *)buffer {
 	int amountRead = 0;
 
 	if(stopping == YES || [outputController shouldContinue] == NO) {
@@ -72,6 +162,8 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 	AudioStreamBasicDescription format;
 	uint32_t config;
 	if([outputController peekFormat:&format channelConfig:&config]) {
+		format = AudioFormatAsFloat64(format);
+
 		// XXX ERROR with AirPods - Can't go higher than CD*8 surround - 192k stereo
 		// Emits to console: [AUScotty] Initialize: invalid FFT size 16384
 		// DSD256 stereo emits: [AUScotty] Initialize: invalid FFT size 65536
@@ -81,36 +173,51 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 		const double maxSampleRate = isSurround ? 352800.0 : 192000.0;
 		double srcRate = format.mSampleRate;
 		double dstRate = srcRate;
-		if(format.mSampleRate > maxSampleRate) {
-			format.mSampleRate = maxSampleRate;
-			dstRate = maxSampleRate;
-			formatClipped = YES;
-			if(srcRate != lastClippedSampleRate) {
-				lastClippedSampleRate = srcRate;
-				streamFormatStarted = NO;
+			if(format.mSampleRate > maxSampleRate) {
+				format.mSampleRate = maxSampleRate;
+				dstRate = maxSampleRate;
+				formatClipped = YES;
 			}
-		}
-		if(!streamFormatStarted || config != realStreamChannelConfig || memcmp(&newFormat, &format, sizeof(format)) != 0) {
+			const BOOL resamplerConfigurationChanged = formatClipped ?
+			                                                  (!rsstate || srcRate != lastClippedSampleRate) :
+			                                                  (rsstate != NULL);
+			if(!streamFormatStarted || resamplerConfigurationChanged || config != newChannelConfig || memcmp(&newFormat, &format, sizeof(format)) != 0) {
 			[currentPtsLock lock];
+			// Finish the already queued transition and emit any staged frames before
+			// accepting another format. Otherwise a third format can overwrite the
+			// pending format while the second stream is still buffered.
+			if(rsold || rsDone || inputBufferLastTime > 0 || rsEndDrainPending || rsEndDrainComplete) {
+				[currentPtsLock unlock];
+				return -1;
+			}
 			if(formatClipped) {
 				ALog(@"Sample rate clipped to no more than %f Hz!", maxSampleRate);
+				void *newResampler = AVFFloat64ResamplerCreate((int)format.mChannelsPerFrame, srcRate, dstRate);
+				if(!newResampler) {
+					[currentPtsLock unlock];
+					ALog(@"Unable to create the Float64 output resampler");
+					stopping = YES;
+					return -1;
+				}
 				if(rsstate) {
 					rsold = rsstate;
-					rsstate = NULL;
+					rsOldIsEndDrain = NO;
 				}
-				rsstate = rsstate_new(format.mChannelsPerFrame, srcRate, dstRate);
+				rsstate = newResampler;
 			} else if(rsstate) {
 				rsold = rsstate;
+				rsOldIsEndDrain = NO;
 				rsstate = NULL;
 			}
+			lastClippedSampleRate = formatClipped ? srcRate : 0.0;
 			[currentPtsLock unlock];
 			newFormat = format;
 			newChannelConfig = config;
 			streamFormatStarted = YES;
 
-			visFormat = format;
+			visFormat = AudioFormatAsFloat64(format);
 			visFormat.mChannelsPerFrame = 1;
-			visFormat.mBytesPerFrame = visFormat.mChannelsPerFrame * (visFormat.mBitsPerChannel / 8);
+			visFormat.mBytesPerFrame = sizeof(double);
 			visFormat.mBytesPerPacket = visFormat.mBytesPerFrame * visFormat.mFramesPerPacket;
 
 			downmixerForVis = [[DownmixProcessor alloc] initWithInputFormat:format inputConfig:config andOutputFormat:visFormat outputConfig:AudioConfigMono];
@@ -126,7 +233,7 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 		return 0;
 	}
 
-	AudioChunk *chunk = [outputController readChunk:amountToRead];
+	AudioChunk *chunk = [outputController readChunkAsFloat64:amountToRead];
 
 	int frameCount = (int)[chunk frameCount];
 	format = [chunk format];
@@ -138,16 +245,16 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 
 		NSData *samples = [chunk removeSamples:frameCount];
 #ifdef _DEBUG
-		[BadSampleCleaner cleanSamples:(float *)[samples bytes]
-		                        amount:frameCount * format.mChannelsPerFrame
-		                      location:@"pre downmix"];
+		[BadSampleCleaner cleanSamples64:(double *)[samples bytes]
+		                          amount:frameCount * format.mChannelsPerFrame
+		                        location:@"pre downmix"];
 #endif
 		// It should be fine to request up to double, we'll only get downsampled
-		const float *outputPtr = (const float *)[samples bytes];
+		const double *outputPtr = (const double *)[samples bytes];
 		if(rsstate) {
 			size_t inDone = 0;
 			[currentPtsLock lock];
-			size_t framesDone = rsstate_resample(rsstate, outputPtr, frameCount, &inDone, &rsTempBuffer[0], amountToRead);
+			size_t framesDone = AVFFloat64ResamplerProcess(rsstate, outputPtr, frameCount, &inDone, &rsTempBuffer[0], amountToRead);
 			[currentPtsLock unlock];
 			if(!framesDone) return 0;
 			frameCount = (int)framesDone;
@@ -164,25 +271,27 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 		if(newFormat.mSampleRate != 44100.0) {
 			if(newFormat.mSampleRate != lastVisRate) {
 				if(rsvis) {
-					for(;;) {
+					BOOL drained = NO;
+					while(!drained) {
 						int samplesFlushed;
 						[currentPtsLock lock];
-						samplesFlushed = (int)rsstate_flush(rsvis, &visTemp[0], 8192);
+						samplesFlushed = AVFFloat64ResamplerFlush(rsvis, &visTemp[0], 8192, &drained);
 						[currentPtsLock unlock];
-						if(samplesFlushed > 1) {
-							[visController postVisPCM:visTemp amount:samplesFlushed];
-						} else {
+						if(samplesFlushed > 0) {
+							vDSP_vdpsp(visTemp, 1, visOutput, 1, samplesFlushed);
+							[visController postVisPCM:visOutput amount:samplesFlushed];
+						} else if(!drained) {
 							break;
 						}
 					}
 					[currentPtsLock lock];
-					rsstate_delete(rsvis);
+					AVFFloat64ResamplerDelete(rsvis);
 					rsvis = NULL;
 					[currentPtsLock unlock];
 				}
 				lastVisRate = newFormat.mSampleRate;
 				[currentPtsLock lock];
-				rsvis = rsstate_new(1, lastVisRate, 44100.0);
+				rsvis = AVFFloat64ResamplerCreate(1, lastVisRate, 44100.0);
 				[currentPtsLock unlock];
 			}
 			if(rsvis) {
@@ -192,37 +301,42 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 				size_t visFrameCount = frameCount;
 				{
 					[currentPtsLock lock];
-					samplesProcessed = (int)rsstate_resample(rsvis, &visAudio[totalDone], visFrameCount, &inDone, &visTemp[0], 8192);
+					samplesProcessed = AVFFloat64ResamplerProcess(rsvis, &visAudio[totalDone], visFrameCount, &inDone, &visTemp[0], 8192);
 					[currentPtsLock unlock];
 					if(samplesProcessed) {
-						[visController postVisPCM:&visTemp[0] amount:samplesProcessed];
+						vDSP_vdpsp(visTemp, 1, visOutput, 1, samplesProcessed);
+						[visController postVisPCM:visOutput amount:samplesProcessed];
 					}
 					totalDone += inDone;
 					visFrameCount -= inDone;
 				} while(samplesProcessed && visFrameCount);
 			}
 		} else if(rsvis) {
-			for(;;) {
+			BOOL drained = NO;
+			while(!drained) {
 				int samplesFlushed;
 				[currentPtsLock lock];
-				samplesFlushed = (int)rsstate_flush(rsvis, &visTemp[0], 8192);
+				samplesFlushed = AVFFloat64ResamplerFlush(rsvis, &visTemp[0], 8192, &drained);
 				[currentPtsLock unlock];
-				if(samplesFlushed > 1) {
-					[visController postVisPCM:visTemp amount:samplesFlushed];
-				} else {
+				if(samplesFlushed > 0) {
+					vDSP_vdpsp(visTemp, 1, visOutput, 1, samplesFlushed);
+					[visController postVisPCM:visOutput amount:samplesFlushed];
+				} else if(!drained) {
 					break;
 				}
 			}
 			[currentPtsLock lock];
-			rsstate_delete(rsvis);
+			AVFFloat64ResamplerDelete(rsvis);
 			rsvis = NULL;
 			[currentPtsLock unlock];
-			[visController postVisPCM:&visAudio[0] amount:frameCount];
+			vDSP_vdpsp(visAudio, 1, visOutput, 1, frameCount);
+			[visController postVisPCM:visOutput amount:frameCount];
 		} else {
-			[visController postVisPCM:&visAudio[0] amount:frameCount];
+			vDSP_vdpsp(visAudio, 1, visOutput, 1, frameCount);
+			[visController postVisPCM:visOutput amount:frameCount];
 		}
 
-		cblas_scopy((int)(frameCount * newFormat.mChannelsPerFrame), outputPtr, 1, &buffer[0], 1);
+		cblas_dcopy((int)(frameCount * newFormat.mChannelsPerFrame), outputPtr, 1, &buffer[0], 1);
 		amountRead = frameCount;
 	} else {
 		return 0;
@@ -230,7 +344,7 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 
 	if(stopping) return 0;
 
-	float volumeScale = 1.0;
+	double volumeScale = 1.0;
 	double sustained;
 	sustained = secondsHdcdSustained;
 	if(sustained > 0) {
@@ -246,7 +360,7 @@ static OSStatus eqRenderCallback(void *inRefCon, AudioUnitRenderActionFlags *ioA
 		volumeScale *= eqPreamp;
 	}
 
-	scale_by_volume(&buffer[0], amountRead * newFormat.mChannelsPerFrame, volumeScale);
+	scale_by_volume_double(&buffer[0], amountRead * newFormat.mChannelsPerFrame, volumeScale);
 
 	return amountRead;
 }
@@ -309,7 +423,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 
 		[self setEqualizerEnabled:enabled];
 	} else if([keyPath isEqualToString:@"values.eqPreamp"]) {
-		float preamp = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] floatForKey:@"eqPreamp"];
+		double preamp = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] doubleForKey:@"eqPreamp"];
 		eqPreamp = pow(10.0, preamp / 20.0);
 	} else if([keyPath isEqualToString:@"values.enableHrtf"]) {
 		enableHrtf = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"enableHrtf"];
@@ -336,7 +450,28 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 }
 
 - (BOOL)processEndOfStream {
-	if(stopping || ([outputController endOfStream] == YES && [self signalEndOfStream:secondsLatency])) {
+	if(stopping) {
+		stopping = YES;
+		return YES;
+	}
+	if([outputController endOfStream] != YES) {
+		return NO;
+	}
+
+	// Preserve a gapless resampler across a queued track with the same format.
+	// At the actual end of the playlist, however, all staged samples, SOXR
+	// delay, and the FreeSurround tail must be enqueued before playback stops.
+	if(!rsEndDrainComplete && ![outputController chainQueueHasTracks]) {
+		[currentPtsLock lock];
+		const BOOL hasResamplerWork = rsstate || rsold;
+		[currentPtsLock unlock];
+		if(hasResamplerWork || rsDone || inputBufferLastTime > 0 || fsurround) {
+			rsEndDrainPending = YES;
+			return NO;
+		}
+	}
+
+	if([self signalEndOfStream:secondsLatency]) {
 		stopping = YES;
 		return YES;
 	}
@@ -356,9 +491,44 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			[renderSynchronizer setRate:0];
 			[audioRenderer stopRequestingMediaData];
 			[audioRenderer flush];
+
+			void *activeResampler = NULL;
+			void *oldResampler = NULL;
+			void *visualizationResampler = NULL;
+			[currentPtsLock lock];
+			activeResampler = rsstate;
+			oldResampler = rsold;
+			visualizationResampler = rsvis;
+			rsstate = NULL;
+			rsold = NULL;
+			rsvis = NULL;
+			fsurround = nil;
 			currentPts = kCMTimeZero;
 			lastPts = kCMTimeZero;
 			outputPts = kCMTimeZero;
+			[currentPtsLock unlock];
+			AVFFloat64ResamplerDelete(activeResampler);
+			AVFFloat64ResamplerDelete(oldResampler);
+			AVFFloat64ResamplerDelete(visualizationResampler);
+
+			inputBufferLastTime = 0;
+			rsDone = NO;
+			rsEndDrainPending = NO;
+			rsEndDrainComplete = NO;
+			rsOldIsEndDrain = NO;
+			streamFormatStarted = NO;
+			streamFormatChanged = NO;
+			resetStreamFormat = NO;
+			lastClippedSampleRate = 0.0;
+			lastVisRate = 44100.0;
+			downmixerForVis = nil;
+			hrtf = nil;
+			FSurroundDelayRemoved = NO;
+			if(_eq) {
+				AudioUnitReset(_eq, kAudioUnitScope_Input, 0);
+				AudioUnitReset(_eq, kAudioUnitScope_Output, 0);
+				AudioUnitReset(_eq, kAudioUnitScope_Global, 0);
+			}
 			trackPts = kCMTimeZero;
 			lastCheckpointPts = kCMTimeZero;
 			secondsLatency = 1.0;
@@ -647,7 +817,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		hrtf = nil;
 	}
 
-	streamFormat = realStreamFormat;
+	streamFormat = AudioFormatAsFloat32(realStreamFormat);
 	streamFormat.mChannelsPerFrame = channels;
 	streamFormat.mBytesPerFrame = sizeof(float) * channels;
 	streamFormat.mFramesPerPacket = 1;
@@ -743,7 +913,10 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	CMBlockBufferRef blockBuffer = nil;
 
 	int samplesRendered = [self makeBlockBuffer:&blockBuffer];
-	if(!samplesRendered) return nil;
+	if(!samplesRendered) {
+		if(blockBuffer) CFRelease(blockBuffer);
+		return nil;
+	}
 
 	CMSampleBufferRef sampleBuffer = nil;
 
@@ -763,22 +936,61 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	status = CMBlockBufferCreateEmpty(kCFAllocatorDefault, 0, 0, &blockListBuffer);
 	if(status != noErr || !blockListBuffer) return 0;
 
+	if(rsEndDrainComplete) {
+		// The periodic observer may not have sampled the just-enqueued tail yet.
+		// Refresh the queued latency synchronously so final-stop scheduling keeps
+		// the complete tail alive.
+		[currentPtsLock lock];
+		double queuedLatency = CMTimeGetSeconds(CMTimeSubtract(outputPts, currentPts));
+		if(!isfinite(queuedLatency) || queuedLatency < 0.0) queuedLatency = 0.0;
+		secondsLatency = queuedLatency;
+		[currentPtsLock unlock];
+		if([self processEndOfStream]) {
+			rsEndDrainComplete = NO;
+			CFRelease(blockListBuffer);
+			return 0;
+		}
+		rsEndDrainComplete = NO;
+	}
+
+	// A drained transition owns the staged frames that follow it. Promote its
+	// format before reading again so a third format cannot relabel those frames.
+	if(rsDone && !rsold) {
+		rsDone = NO;
+		realStreamFormat = newFormat;
+		realStreamChannelConfig = newChannelConfig;
+		[self updateStreamFormat];
+	}
+
 	if(resetStreamFormat || streamFormatChanged) {
 		streamFormatChanged = NO;
 		[self updateStreamFormat];
 	}
 
+	// At final playlist EOS the already staged output precedes SOXR's delayed
+	// tail. Move the active resampler only after those staged frames were sent.
+	if(rsEndDrainPending && inputBufferLastTime == 0 && !rsold && rsstate) {
+		[currentPtsLock lock];
+		if(rsEndDrainPending && !rsold && rsstate) {
+			rsold = rsstate;
+			rsstate = NULL;
+			rsOldIsEndDrain = YES;
+		}
+		[currentPtsLock unlock];
+	}
+
 	int inputRendered = inputBufferLastTime;
 	int bytesRendered = inputRendered * newFormat.mBytesPerPacket;
 
-	while(inputRendered < 4096) {
+	while(inputRendered < 4096 && !rsEndDrainPending) {
 		int maxToRender = MIN(4096 - inputRendered, 512);
 		int rendered = [self renderInput:maxToRender toBuffer:&tempBuffer[0]];
 		if(rendered > 0) {
 			memcpy((((uint8_t *)inputBuffer) + bytesRendered), &tempBuffer[0], rendered * newFormat.mBytesPerPacket);
+			inputRendered += rendered;
+			bytesRendered += rendered * newFormat.mBytesPerPacket;
+			inputBufferLastTime = inputRendered;
 		}
-		inputRendered += rendered;
-		bytesRendered += rendered * newFormat.mBytesPerPacket;
 		if(streamFormatChanged) {
 			streamFormatChanged = NO;
 			if(inputRendered) {
@@ -788,7 +1000,14 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				[self updateStreamFormat];
 			}
 		}
-		if([self processEndOfStream]) break;
+		if(rendered < 0) {
+			break;
+		}
+		if(rendered == 0) {
+			[self processEndOfStream];
+			break;
+		}
+		if([self processEndOfStream] || rsEndDrainPending) break;
 	}
 
 	inputBufferLastTime = inputRendered;
@@ -797,23 +1016,40 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 
 	for(size_t i = 0; i < 2;) {
 		int samplesRendered;
+		BOOL finishingOldStream = NO;
 
 		if(i == 0) {
 			if(!rsold) {
 				++i;
 				continue;
 			}
+			void *finishedResampler = NULL;
+			BOOL drained = NO;
+			BOOL finishedEndDrain = NO;
 			[currentPtsLock lock];
-			samplesRendered = rsstate_flush(rsold, &rsTempBuffer[0], 4096);
-			[currentPtsLock unlock];
-			if(samplesRendered < 4096) {
-				rsstate_delete(rsold);
+			samplesRendered = AVFFloat64ResamplerFlush(rsold, &rsTempBuffer[0], 4096, &drained);
+			if(drained) {
+				finishedResampler = rsold;
 				rsold = NULL;
-				rsDone = YES;
+				finishedEndDrain = rsOldIsEndDrain;
+				rsOldIsEndDrain = NO;
+				if(finishedEndDrain) {
+					rsEndDrainPending = NO;
+					rsEndDrainComplete = YES;
+				} else {
+					rsDone = YES;
+				}
+				finishingOldStream = YES;
+			}
+			[currentPtsLock unlock];
+			if(finishedResampler) {
+				AVFFloat64ResamplerDelete(finishedResampler);
+			}
+			samplePtr = &rsTempBuffer[0];
+			if(!samplesRendered && !(finishingOldStream && fsurround)) {
 				++i;
 				continue;
 			}
-			samplePtr = &rsTempBuffer[0];
 		} else {
 			samplesRendered = inputRendered;
 			samplePtr = &inputBuffer[0];
@@ -825,17 +1061,21 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			}
 		}
 
-		if(samplesRendered || fsurround) {
+		const BOOL finishingCurrentStream = (rsEndDrainPending && !rsstate) ||
+		                                    (!rsEndDrainPending && samplesRendered > 0 && samplesRendered < 4096);
+		const BOOL drainSurround = resetStreamFormat ||
+		                           (i == 0 ? finishingOldStream : finishingCurrentStream);
+		if(samplesRendered || (fsurround && drainSurround)) {
 			if(fsurround) {
 				int countToProcess = samplesRendered;
 				if(countToProcess < 4096) {
-					bzero(samplePtr + countToProcess * 2, (4096 - countToProcess) * 2 * sizeof(float));
+					bzero(samplePtr + countToProcess * 2, (4096 - countToProcess) * 2 * sizeof(double));
 					countToProcess = 4096;
 				}
 				[fsurround process:samplePtr output:&fsurroundBuffer[0] count:countToProcess];
 				samplePtr = &fsurroundBuffer[0];
-				if(resetStreamFormat || samplesRendered < 4096) {
-					bzero(&fsurroundBuffer[4096 * 6], 4096 * 2 * sizeof(float));
+				if(drainSurround) {
+					bzero(&fsurroundBuffer[4096 * 6], 4096 * 2 * sizeof(double));
 					[fsurround process:&fsurroundBuffer[4096 * 6] output:&fsurroundBuffer[4096 * 6] count:4096];
 					samplesRendered += 2048;
 				}
@@ -860,37 +1100,46 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			if(eqEnabled && eqInitialized) {
 				const int channels = streamFormat.mChannelsPerFrame;
 				if(channels > 0) {
-					const size_t channelsminusone = channels - 1;
-					uint8_t tempBuffer[sizeof(AudioBufferList) + sizeof(AudioBuffer) * channelsminusone];
-					AudioBufferList *ioData = (AudioBufferList *)&tempBuffer[0];
+					double *const eqSamples = samplePtr;
+					int framesProcessed = 0;
+					while(framesProcessed < samplesRendered) {
+						const int framesToProcess = MIN(4096, samplesRendered - framesProcessed);
+						const size_t channelsminusone = channels - 1;
+						uint8_t audioBufferListStorage[sizeof(AudioBufferList) + sizeof(AudioBuffer) * channelsminusone];
+						AudioBufferList *ioData = (AudioBufferList *)&audioBufferListStorage[0];
 
-					ioData->mNumberBuffers = channels;
-					for(size_t i = 0; i < channels; ++i) {
-						ioData->mBuffers[i].mData = &eqBuffer[4096 * i];
-						ioData->mBuffers[i].mDataByteSize = samplesRendered * sizeof(float);
-						ioData->mBuffers[i].mNumberChannels = 1;
+						samplePtr = eqSamples + (size_t)framesProcessed * channels;
+						ioData->mNumberBuffers = channels;
+						for(size_t channel = 0; channel < channels; ++channel) {
+							ioData->mBuffers[channel].mData = &eqBuffer[4096 * channel];
+							ioData->mBuffers[channel].mDataByteSize = framesToProcess * sizeof(float);
+							ioData->mBuffers[channel].mNumberChannels = 1;
+						}
+
+						status = AudioUnitRender(_eq, NULL, &timeStamp, 0, framesToProcess, ioData);
+						if(status != noErr) {
+							samplePtr = eqSamples;
+							CFRelease(blockListBuffer);
+							return 0;
+						}
+
+						timeStamp.mSampleTime += framesToProcess;
+						for(int channel = 0; channel < channels; ++channel) {
+							vDSP_vspdp(&eqBuffer[4096 * channel], 1, samplePtr + channel, channels, framesToProcess);
+						}
+						framesProcessed += framesToProcess;
 					}
-
-					status = AudioUnitRender(_eq, NULL, &timeStamp, 0, samplesRendered, ioData);
-
-					if(status != noErr) {
-						CFRelease(blockListBuffer);
-						return 0;
-					}
-
-					timeStamp.mSampleTime += ((double)samplesRendered) / streamFormat.mSampleRate;
-
-					for(int i = 0; i < channels; ++i) {
-						cblas_scopy(samplesRendered, &eqBuffer[4096 * i], 1, samplePtr + i, channels);
-					}
+					samplePtr = eqSamples;
 				}
 			}
 
 			CMBlockBufferRef blockBuffer = nil;
-			size_t dataByteSize = samplesRendered * sizeof(float) * streamFormat.mChannelsPerFrame;
+			const size_t outputSampleCount = (size_t)samplesRendered * streamFormat.mChannelsPerFrame;
+			const size_t dataByteSize = outputSampleCount * sizeof(float);
+			vDSP_vdpsp(samplePtr, 1, deviceBuffer, 1, outputSampleCount);
 
 #ifdef OUTPUT_LOG
-			fwrite(samplePtr, 1, dataByteSize, _logFile);
+			fwrite(deviceBuffer, 1, dataByteSize, _logFile);
 #endif
 
 			status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nil, dataByteSize, kCFAllocatorDefault, nil, 0, dataByteSize, kCMBlockBufferAssureMemoryNowFlag, &blockBuffer);
@@ -900,7 +1149,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				return 0;
 			}
 
-			status = CMBlockBufferReplaceDataBytes(samplePtr, blockBuffer, 0, dataByteSize);
+			status = CMBlockBufferReplaceDataBytes(deviceBuffer, blockBuffer, 0, dataByteSize);
 
 			if(status != noErr) {
 				CFRelease(blockBuffer);
@@ -932,6 +1181,16 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		}
 	}
 
+	if(rsEndDrainPending && inputBufferLastTime == 0 && !rsDone) {
+		[currentPtsLock lock];
+		const BOOL resamplerDrainFinished = !rsstate && !rsold;
+		[currentPtsLock unlock];
+		if(resamplerDrainFinished) {
+			rsEndDrainPending = NO;
+			rsEndDrainComplete = YES;
+		}
+	}
+
 	*blockBufferOut = blockListBuffer;
 
 	return samplesRenderedTotal;
@@ -951,6 +1210,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 
 		resetStreamFormat = NO;
 		streamFormatChanged = NO;
+		streamFormatStarted = NO;
 
 		inputBufferLastTime = 0;
 
@@ -964,6 +1224,9 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		downmixerForVis = nil;
 
 		rsDone = NO;
+		rsEndDrainPending = NO;
+		rsEndDrainComplete = NO;
+		rsOldIsEndDrain = NO;
 		rsstate = NULL;
 		rsold = NULL;
 		
@@ -1107,14 +1370,14 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		                                                                 double latencySeconds = CMTimeGetSeconds(latencyTime);
 		                                                                 double latencyVis = 0.0;
 		                                                                 [lock lock];
-		                                                                 if(*rsstate) {
-			                                                                 latencySeconds += rsstate_latency(*rsstate);
-		                                                                 }
-		                                                                 if(*rsold) {
-			                                                                 latencySeconds += rsstate_latency(*rsold);
-		                                                                 }
-		                                                                 if(*rsvis) {
-			                                                                 latencyVis = rsstate_latency(*rsvis);
+			                                                                 if(*rsstate) {
+				                                                                 latencySeconds += AVFFloat64ResamplerLatency(*rsstate);
+			                                                                 }
+			                                                                 if(*rsold) {
+				                                                                 latencySeconds += AVFFloat64ResamplerLatency(*rsold);
+			                                                                 }
+			                                                                 if(*rsvis) {
+				                                                                 latencyVis = AVFFloat64ResamplerLatency(*rsvis);
 		                                                                 }
 		                                                                 if(*fsurroundtest) {
 			                                                                 latencyVis += 2048.0 / [(*fsurroundtest) srate];
@@ -1143,7 +1406,7 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 }
 
 - (void)setVolume:(double)v {
-	volume = v * 0.01f;
+	volume = v * 0.01;
 	if(audioRenderer) {
 		[audioRenderer setVolume:volume];
 	}
@@ -1272,20 +1535,27 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			_logFile = NULL;
 		}
 #endif
+		void *activeResampler = NULL;
+		void *oldResampler = NULL;
+		void *visualizationResampler = NULL;
+		[currentPtsLock lock];
+		activeResampler = rsstate;
+		oldResampler = rsold;
+		visualizationResampler = rsvis;
+		rsstate = NULL;
+		rsold = NULL;
+		rsvis = NULL;
+		[currentPtsLock unlock];
+		AVFFloat64ResamplerDelete(activeResampler);
+		AVFFloat64ResamplerDelete(oldResampler);
+		AVFFloat64ResamplerDelete(visualizationResampler);
+		rsDone = NO;
+		rsEndDrainPending = NO;
+		rsEndDrainComplete = NO;
+		rsOldIsEndDrain = NO;
+		inputBufferLastTime = 0;
 		outputController = nil;
 		visController = nil;
-		if(rsstate) {
-			rsstate_delete(rsstate);
-			rsstate = NULL;
-		}
-		if(rsold) {
-			rsstate_delete(rsold);
-			rsold = NULL;
-		}
-		if(rsvis) {
-			rsstate_delete(rsvis);
-			rsvis = NULL;
-		}
 		stopCompleted = YES;
 	}
 }

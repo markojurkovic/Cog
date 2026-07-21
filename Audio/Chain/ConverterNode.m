@@ -71,6 +71,7 @@ static void *kConverterNodeContext = &kConverterNodeContext;
 		extrapolateBufferSize = 0;
 
 		mutex = [NSRecursiveLock new];
+		volumeScalingPreference = [[NSUserDefaults standardUserDefaults] stringForKey:@"volumeScaling"];
 
 #ifdef LOG_CHAINS
 		[self initLogFiles];
@@ -94,11 +95,11 @@ static void *kConverterNodeContext = &kConverterNodeContext;
 	}
 }
 
-void scale_by_volume(float *buffer, size_t count, float volume) {
+void scale_by_volume_double(double *buffer, size_t count, double volume) {
 	if(volume != 1.0) {
 		size_t unaligned = (uintptr_t)buffer & 15;
 		if(unaligned) {
-			size_t count_unaligned = (16 - unaligned) / sizeof(float);
+			size_t count_unaligned = (16 - unaligned) / sizeof(double);
 			while(count > 0 && count_unaligned > 0) {
 				*buffer++ *= volume;
 				count_unaligned--;
@@ -107,9 +108,24 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		}
 
 		if(count) {
-			vDSP_vsmul(buffer, 1, &volume, buffer, 1, count);
+			vDSP_vsmulD(buffer, 1, &volume, buffer, 1, count);
 		}
 	}
+}
+
+static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t requiredCapacity) {
+	if(*buffer && *capacity >= requiredCapacity) {
+		return YES;
+	}
+
+	void *resizedBuffer = realloc(*buffer, requiredCapacity);
+	if(!resizedBuffer) {
+		return NO;
+	}
+
+	*buffer = resizedBuffer;
+	*capacity = requiredCapacity;
+	return YES;
 }
 
 - (BOOL)paused {
@@ -164,7 +180,7 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		return nil;
 	}
 
-	if(nativePrecisionCandidate && volumeScale == 1.0f && inpOffset == inpSize) {
+	if(nativePrecisionCandidate && volumeScale == 1.0 && inpOffset == inpSize) {
 		AudioStreamBasicDescription inf;
 		uint32_t config;
 		if([self peekFormat:&inf channelConfig:&config]) {
@@ -260,9 +276,11 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		// Approximately the most we want on input
 		ioNumberPackets = 4096;
 
-		size_t newSize = ioNumberPackets * floatFormat.mBytesPerPacket;
-		if(!inputBuffer || inputBufferSize < newSize)
-			inputBuffer = realloc(inputBuffer, inputBufferSize = newSize);
+		size_t newSize = (size_t)ioNumberPackets * floatFormat.mBytesPerPacket;
+		if(!ensureBufferCapacity(&inputBuffer, &inputBufferSize, newSize)) {
+			[mutex unlock];
+			return nil;
+		}
 
 		ssize_t amountToWrite = ioNumberPackets * floatFormat.mBytesPerPacket;
 
@@ -285,7 +303,7 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 				}
 			}
 
-			AudioChunk *chunk = [self readChunkAsFloat32:((amountToWrite - bytesReadFromInput) / floatFormat.mBytesPerPacket)];
+			AudioChunk *chunk = [self readChunkAsFloat64:((amountToWrite - bytesReadFromInput) / floatFormat.mBytesPerPacket)];
 			inf = [chunk format];
 			size_t frameCount = [chunk frameCount];
 			config = [chunk channelConfig];
@@ -330,16 +348,20 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 			size_t newSize = _N_samples_to_add_ * floatFormat.mBytesPerPacket;
 			newSize += bytesReadFromInput;
 
-			if(newSize > inputBufferSize) {
-				inputBuffer = realloc(inputBuffer, inputBufferSize = newSize * 3);
+			if(newSize <= SIZE_MAX / 3 && ensureBufferCapacity(&inputBuffer, &inputBufferSize, newSize * 3)) {
+				memmove((uint8_t *)inputBuffer + _N_samples_to_add_ * floatFormat.mBytesPerPacket, inputBuffer, bytesReadFromInput);
+
+				if(lpc_extrapolate_bkwd_double((double *)((uint8_t *)inputBuffer + _N_samples_to_add_ * floatFormat.mBytesPerPacket), inputSamples, prime, floatFormat.mChannelsPerFrame, LPC_ORDER, _N_samples_to_add_, &extrapolateBuffer, &extrapolateBufferSize)) {
+					bytesReadFromInput += _N_samples_to_add_ * floatFormat.mBytesPerPacket;
+					latencyEaten = N_samples_to_drop_;
+				} else {
+					memmove(inputBuffer, (uint8_t *)inputBuffer + _N_samples_to_add_ * floatFormat.mBytesPerPacket, bytesReadFromInput);
+					latencyEaten = 0;
+				}
+			} else {
+				// Preserve the audio already read if optional LPC priming cannot grow.
+				latencyEaten = 0;
 			}
-
-			memmove(inputBuffer + _N_samples_to_add_ * floatFormat.mBytesPerPacket, inputBuffer, bytesReadFromInput);
-
-			lpc_extrapolate_bkwd(inputBuffer + _N_samples_to_add_ * floatFormat.mBytesPerPacket, inputSamples, prime, floatFormat.mChannelsPerFrame, LPC_ORDER, _N_samples_to_add_, &extrapolateBuffer, &extrapolateBufferSize);
-
-			bytesReadFromInput += _N_samples_to_add_ * floatFormat.mBytesPerPacket;
-			latencyEaten = N_samples_to_drop_;
 			is_preextrapolated_ = YES;
 		}
 
@@ -350,20 +372,25 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 
 			size_t newSize = bytesReadFromInput;
 			newSize += _N_samples_to_add_ * floatFormat.mBytesPerPacket;
-			if(newSize > inputBufferSize) {
-				inputBuffer = realloc(inputBuffer, inputBufferSize = newSize * 3);
+			if(newSize <= SIZE_MAX / 3 && ensureBufferCapacity(&inputBuffer, &inputBufferSize, newSize * 3)) {
+				if(lpc_extrapolate_fwd_double((double *)inputBuffer, inputSamples, prime, floatFormat.mChannelsPerFrame, LPC_ORDER, _N_samples_to_add_, &extrapolateBuffer, &extrapolateBufferSize)) {
+					bytesReadFromInput += _N_samples_to_add_ * floatFormat.mBytesPerPacket;
+					latencyEatenPost = N_samples_to_drop_;
+					is_postextrapolated_ = 2;
+				} else {
+					latencyEatenPost = 0;
+					is_postextrapolated_ = 3;
+				}
+			} else {
+				// Flushing without extrapolation is preferable to dropping buffered audio.
+				latencyEatenPost = 0;
+				is_postextrapolated_ = 3;
 			}
-
-			lpc_extrapolate_fwd(inputBuffer, inputSamples, prime, floatFormat.mChannelsPerFrame, LPC_ORDER, _N_samples_to_add_, &extrapolateBuffer, &extrapolateBufferSize);
-
-			bytesReadFromInput += _N_samples_to_add_ * floatFormat.mBytesPerPacket;
-			latencyEatenPost = N_samples_to_drop_;
-			is_postextrapolated_ = 2;
 		} else if(is_postextrapolated_ == 3) {
 			latencyEatenPost = 0;
 		}
 
-		// Input now contains bytesReadFromInput worth of floats, in the input sample rate
+			// Input now contains bytesReadFromInput worth of Float64 samples at the input rate.
 		inpSize = bytesReadFromInput;
 		inpOffset = 0;
 	}
@@ -375,13 +402,14 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 	if(ioNumberPackets) {
 		size_t inputSamples = ioNumberPackets / floatFormat.mBytesPerPacket;
 		ioNumberPackets = (UInt32)inputSamples;
-		ioNumberPackets = (UInt32)ceil((float)ioNumberPackets * sampleRatio);
+		ioNumberPackets = (UInt32)ceil((double)ioNumberPackets * sampleRatio);
 		ioNumberPackets += soxr_delay(soxr);
 		ioNumberPackets = (ioNumberPackets + 255) & ~255;
 
-		size_t newSize = ioNumberPackets * floatFormat.mBytesPerPacket;
-		if(!floatBuffer || floatBufferSize < newSize) {
-			floatBuffer = realloc(floatBuffer, floatBufferSize = newSize * 3);
+		size_t newSize = (size_t)ioNumberPackets * floatFormat.mBytesPerPacket;
+		if(newSize > SIZE_MAX / 3 || !ensureBufferCapacity(&floatBuffer, &floatBufferSize, newSize * 3)) {
+			[mutex unlock];
+			return nil;
 		}
 
 		if(stopping) {
@@ -393,14 +421,14 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		size_t outputDone = 0;
 
 		if(!skipResampler) {
-			soxr_process(soxr, (float *)(((uint8_t *)inputBuffer) + inpOffset), inputSamples, &inputDone, floatBuffer, ioNumberPackets, &outputDone);
+			soxr_process(soxr, (double *)(((uint8_t *)inputBuffer) + inpOffset), inputSamples, &inputDone, floatBuffer, ioNumberPackets, &outputDone);
 
-			if(latencyEatenPost) {
+			if(is_postextrapolated_ >= 2) {
 				// Post file or format change flush
 				size_t idone = 0, odone = 0;
 
 				do {
-					soxr_process(soxr, NULL, 0, &idone, floatBuffer + outputDone * floatFormat.mBytesPerPacket, ioNumberPackets - outputDone, &odone);
+					soxr_process(soxr, NULL, 0, &idone, (uint8_t *)floatBuffer + outputDone * floatFormat.mBytesPerPacket, ioNumberPackets - outputDone, &odone);
 					outputDone += odone;
 				} while(odone > 0);
 			}
@@ -415,7 +443,7 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		if(latencyEaten) {
 			if(outputDone > latencyEaten) {
 				outputDone -= latencyEaten;
-				memmove(floatBuffer, floatBuffer + latencyEaten * floatFormat.mBytesPerPacket, outputDone * floatFormat.mBytesPerPacket);
+					memmove(floatBuffer, (uint8_t *)floatBuffer + latencyEaten * floatFormat.mBytesPerPacket, outputDone * floatFormat.mBytesPerPacket);
 				latencyEaten = 0;
 			} else {
 				latencyEaten -= outputDone;
@@ -444,9 +472,9 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 		}
 		[self addObservers];
 		const size_t frameCount = ioNumberPackets / floatFormat.mBytesPerPacket;
-		doPStream = doPStream || audioBufferIsDoP(floatBuffer, floatFormat.mChannelsPerFrame, frameCount, NULL);
+		doPStream = doPStream || audioBufferIsDoP64((const double *)floatBuffer, floatFormat.mChannelsPerFrame, frameCount, NULL);
 		if(!doPStream) {
-			scale_by_volume(floatBuffer, ioNumberPackets / sizeof(float), volumeScale);
+			scale_by_volume_double((double *)floatBuffer, ioNumberPackets / sizeof(double), volumeScale);
 		}
 		[chunk setStreamTimestamp:streamTimestamp];
 		[chunk setStreamTimeRatio:streamTimeRatio];
@@ -479,50 +507,49 @@ void scale_by_volume(float *buffer, size_t count, float volume) {
 	}
 }
 
-static float db_to_scale(float db) {
+static double db_to_scale(double db) {
 	return pow(10.0, db / 20);
 }
 
-- (void)refreshVolumeScaling {
+- (void)refreshVolumeScalingLocked:(NSString *)scaling {
 	if(rgInfo == nil) {
 		volumeScale = 1.0;
 		if(nativePrecisionCandidate) nodeFormat = nativePrecisionFormat;
 		return;
 	}
 
-	NSString *scaling = [[NSUserDefaults standardUserDefaults] stringForKey:@"volumeScaling"];
 	BOOL useAlbum = [scaling hasPrefix:@"albumGain"];
 	BOOL useTrack = useAlbum || [scaling hasPrefix:@"trackGain"];
 	BOOL useSoundcheck = useAlbum || useTrack || [scaling isEqualToString:@"soundcheck"];
 	BOOL useVolume = useAlbum || useTrack || useSoundcheck || [scaling isEqualToString:@"volumeScale"];
 	BOOL usePeak = [scaling hasSuffix:@"WithPeak"];
-	float scale = 1.0;
-	float peak = 0.0;
+	double scale = 1.0;
+	double peak = 0.0;
 	if(useVolume) {
 		id pVolumeScale = [rgInfo objectForKey:@"volume"];
 		if(pVolumeScale != nil)
-			scale = [pVolumeScale floatValue];
+			scale = [pVolumeScale doubleValue];
 	}
 	if(useSoundcheck) {
 		id pSoundcheck = [rgInfo objectForKey:@"soundcheck"];
 		if(pSoundcheck != nil)
-			scale = [pSoundcheck floatValue];
+			scale = [pSoundcheck doubleValue];
 	}
 	if(useTrack) {
 		id trackGain = [rgInfo objectForKey:@"replayGainTrackGain"];
 		id trackPeak = [rgInfo objectForKey:@"replayGainTrackPeak"];
 		if(trackGain != nil)
-			scale = db_to_scale([trackGain floatValue]);
+			scale = db_to_scale([trackGain doubleValue]);
 		if(trackPeak != nil)
-			peak = [trackPeak floatValue];
+			peak = [trackPeak doubleValue];
 	}
 	if(useAlbum) {
 		id albumGain = [rgInfo objectForKey:@"replayGainAlbumGain"];
 		id albumPeak = [rgInfo objectForKey:@"replayGainAlbumPeak"];
 		if(albumGain != nil)
-			scale = db_to_scale([albumGain floatValue]);
+			scale = db_to_scale([albumGain doubleValue]);
 		if(albumPeak != nil)
-			peak = [albumPeak floatValue];
+			peak = [albumPeak doubleValue];
 	}
 	if(usePeak) {
 		if(scale * peak > 1.0)
@@ -530,15 +557,26 @@ static float db_to_scale(float db) {
 	}
 	volumeScale = scale;
 	if(nativePrecisionCandidate) {
-		nodeFormat = (volumeScale == 1.0f) ? nativePrecisionFormat : processedFormat;
+		nodeFormat = (volumeScale == 1.0) ? nativePrecisionFormat : processedFormat;
 	}
+}
+
+- (void)refreshVolumeScaling {
+	NSString *scaling = [[NSUserDefaults standardUserDefaults] stringForKey:@"volumeScaling"];
+	[mutex lock];
+	volumeScalingPreference = scaling;
+	[self refreshVolumeScalingLocked:volumeScalingPreference];
+	[mutex unlock];
 }
 
 - (BOOL)appliesVolumeScaling {
 	// Before setup, inputFormat is empty and volumeScale has not been
 	// initialized yet. Treat that as unknown/no scaling; BufferChain refreshes
 	// the output status after the converter and ReplayGain information are set.
-	return inputFormat.mFormatID != 0 && volumeScale != 1.0f;
+	[mutex lock];
+	const BOOL appliesVolumeScaling = inputFormat.mFormatID != 0 && volumeScale != 1.0;
+	[mutex unlock];
+	return appliesVolumeScaling;
 }
 
 - (BOOL)setupWithInputFormat:(AudioStreamBasicDescription)inf withInputConfig:(uint32_t)inputConfig outputFormat:(AudioStreamBasicDescription)outf isLossless:(BOOL)lossless {
@@ -564,11 +602,7 @@ static float db_to_scale(float db) {
 		return NO;
 	}
 
-	floatFormat = inputFormat;
-	floatFormat.mFormatFlags = kAudioFormatFlagsNativeFloatPacked;
-	floatFormat.mBitsPerChannel = 32;
-	floatFormat.mBytesPerFrame = (32 / 8) * floatFormat.mChannelsPerFrame;
-	floatFormat.mBytesPerPacket = floatFormat.mBytesPerFrame * floatFormat.mFramesPerPacket;
+	floatFormat = AudioFormatAsFloat64(inputFormat);
 
 #if DSD_DECIMATE
 	if(inputFormat.mBitsPerChannel == 1) {
@@ -579,9 +613,8 @@ static float db_to_scale(float db) {
 	inpOffset = 0;
 	inpSize = 0;
 
-	// These are the post-resampler formats. High-precision sources keep their
-	// native integer or Float64 representation while the path is transparent;
-	// any active gain or resampling uses the established Float32 processor.
+	// High-precision sources keep their native integer or Float64 representation
+	// while the path is transparent; active gain or resampling uses Float64.
 	processedFormat = floatFormat;
 	processedFormat.mSampleRate = outputFormat.mSampleRate;
 	nativePrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
@@ -592,8 +625,8 @@ static float db_to_scale(float db) {
 	skipResampler = fabs(sampleRatio - 1.0) < 1e-7;
 	nativePrecisionCandidate = skipResampler && AudioFormatIsHighPrecisionPCM(inputFormat);
 	if(!skipResampler) {
-		soxr_quality_spec_t q_spec = soxr_quality_spec(SOXR_HQ, 0);
-		soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
+		soxr_quality_spec_t q_spec = soxr_quality_spec(SOXR_HQ, SOXR_DOUBLE_PRECISION);
+		soxr_io_spec_t io_spec = soxr_io_spec(SOXR_FLOAT64_I, SOXR_FLOAT64_I);
 		soxr_runtime_spec_t runtime_spec = soxr_runtime_spec(0);
 		soxr_error_t error;
 
@@ -620,8 +653,8 @@ static float db_to_scale(float db) {
 	latencyEatenPost = 0;
 	doPStream = NO;
 
-	[self refreshVolumeScaling];
-	nodeFormat = (nativePrecisionCandidate && volumeScale == 1.0f) ? nativePrecisionFormat : processedFormat;
+	[self refreshVolumeScalingLocked:volumeScalingPreference];
+	nodeFormat = (nativePrecisionCandidate && volumeScale == 1.0) ? nativePrecisionFormat : processedFormat;
 
 	PrintStreamDesc(&inf);
 	PrintStreamDesc(&nodeFormat);
@@ -662,8 +695,12 @@ static float db_to_scale(float db) {
 
 - (void)setRGInfo:(NSDictionary *)rgi {
 	DLog(@"Setting ReplayGain info");
+	NSString *volumeScaling = [[NSUserDefaults standardUserDefaults] stringForKey:@"volumeScaling"];
+	[mutex lock];
 	rgInfo = rgi;
-	[self refreshVolumeScaling];
+	volumeScalingPreference = volumeScaling;
+	[self refreshVolumeScalingLocked:volumeScalingPreference];
+	[mutex unlock];
 }
 
 - (void)cleanUp {
