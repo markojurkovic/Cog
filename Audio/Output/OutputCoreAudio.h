@@ -127,12 +127,17 @@ using std::atomic_long;
 	NSDictionary<NSNumber *, NSValue *> *savedVirtualFormats;
 	BOOL hogModeOwned;
 	AudioDeviceID hogModeDeviceID;
+	AudioDeviceIOProcID exclusiveIOProcID;
+	AudioDeviceID exclusiveIOProcDeviceID;
+	BOOL exclusiveIOProcRunning;
+	UInt32 exclusiveMaximumFramesToRender;
 
 	double *outputDoubleScratch;
 	double *inputDoubleScratch;
 	size_t outputDoubleScratchCapacity;
 
 	AUAudioUnit *_au;
+	AURenderPullInputBlock _outputRenderBlock;
 
 	size_t _bufferSize;
 

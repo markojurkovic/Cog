@@ -4,6 +4,12 @@
     "" : {
       "shouldTranslate" : false
     },
+    " · End-to-end integer" : {
+      "comment" : "Shared end-to-end integer transport status"
+    },
+    " · End-to-end integer · Exclusive" : {
+      "comment" : "Exclusive end-to-end integer transport status"
+    },
     "%1d day(s)" : {
       "comment" : "day for total",
       "localizations" : {
@@ -555,27 +561,27 @@
     "Cog signal integrity and Core Audio output formats" : {
       "comment" : "Cog signal-integrity and output formats accessibility label"
     },
-    "Cog signal path: %@\n%@\nCore Audio, driver, and hardware processing are not included.\n\nCog → Core Audio: %@\nDevice physical stream: %@" : {
+    "Cog signal path: %@\n%@\n%@\nDriver and hardware processing beyond the reported physical stream are not included.\n\nApp client format: %@\nCore Audio virtual stream: %@\nDevice physical stream: %@" : {
       "comment" : "Detailed Cog signal-integrity and output format tooltip",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Cog signal path: %1$@\n%2$@\nCore Audio, driver, and hardware processing are not included.\n\nCog → Core Audio: %3$@\nDevice physical stream: %4$@"
+            "value" : "Cog signal path: %1$@\n%2$@\n%3$@\nDriver and hardware processing beyond the reported physical stream are not included.\n\nApp client format: %4$@\nCore Audio virtual stream: %5$@\nDevice physical stream: %6$@"
           }
         }
       }
     },
-    "Cog: — · App: — → Device: —" : {
+    "Cog: — · App: — → Core Audio: — → Device: —" : {
       "comment" : "No active Cog signal-integrity or output format information"
     },
-    "Cog: %@ · App: %@ → Device: %@" : {
-      "comment" : "Cog signal-integrity state, Core Audio client format, and physical device format",
+    "Cog: %@ · App: %@ → Core Audio: %@ → Device: %@%@" : {
+      "comment" : "Cog signal-integrity state, app client format, Core Audio virtual format, physical device format, and transport state",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Cog: %1$@ · App: %2$@ → Device: %3$@"
+            "value" : "Cog: %1$@ · App: %2$@ → Core Audio: %3$@ → Device: %4$@%5$@"
           }
         }
       }
@@ -1052,6 +1058,9 @@
           }
         }
       }
+    },
+    "End-to-end integer transport is not active." : {
+      "comment" : "Inactive integer transport tooltip"
     },
     "Engine:" : {
       "comment" : "A label for the engine setting in the RubberbandPaneView.",
@@ -2184,6 +2193,9 @@
         }
       }
     },
+    "Output ownership" : {
+
+    },
     "Password" : {
       "comment" : "Last.FM password field",
       "localizations" : {
@@ -3168,7 +3180,7 @@
         }
       }
     },
-    "Shows whether Cog preserves decoded source samples, followed by Cog's Core Audio handoff and the selected device's physical output stream." : {
+    "Shows whether Cog preserves decoded source samples, followed by Cog's app, Core Audio virtual, and device physical formats." : {
       "comment" : "Cog signal-integrity and output format tooltip"
     },
     "ShuffleButtonTooltip" : {
@@ -3693,7 +3705,7 @@
       }
     },
     "Unavailable" : {
-      "comment" : "Physical device format unavailable"
+      "comment" : "Core Audio virtual format unavailable\nPhysical device format unavailable"
     },
     "Unknown" : {
       "comment" : "Unknown Cog signal-integrity state"
@@ -3719,6 +3731,9 @@
           }
         }
       }
+    },
+    "Use exclusive mode for end-to-end integer output" : {
+
     },
     "Use flat perspective in toolbar" : {
       "localizations" : {
@@ -3774,6 +3789,12 @@
           }
         }
       }
+    },
+    "Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams without exclusive ownership." : {
+      "comment" : "Shared integer transport tooltip"
+    },
+    "Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams; Cog owns the device exclusively." : {
+      "comment" : "Exclusive integer transport tooltip"
     },
     "Version %@" : {
       "comment" : "A label displaying the current version of the app. The argument is the full version string of the app. The argument is the string “CO_LOSNO_COG_APPFULLVERSION”.",
@@ -3851,6 +3872,9 @@
           }
         }
       }
+    },
+    "When an integer source and the selected device support it, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported devices continue using shared output." : {
+
     },
     "When opening files" : {
       "localizations" : {
