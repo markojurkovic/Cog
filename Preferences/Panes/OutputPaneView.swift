@@ -28,6 +28,9 @@ private final class OutputPrefs: ObservableObject {
     @Published var exclusiveOutput: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(exclusiveOutput, forKey: "exclusiveIntegerOutput") }
     }
+    @Published var setDeviceVolumeTo100ForExclusiveOutput: Bool {
+        didSet { guard isActive else { return }; UserDefaults.standard.set(setDeviceVolumeTo100ForExclusiveOutput, forKey: "setDeviceVolumeTo100ForExclusiveOutput") }
+    }
     @Published var enableFading: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(enableFading, forKey: "enableFading") }
     }
@@ -50,6 +53,7 @@ private final class OutputPrefs: ObservableObject {
         volumeLimit = d.object(forKey: "volumeLimit") as? Bool ?? true
         suspendOutputOnPause = d.object(forKey: "suspendOutputOnPause") as? Bool ?? true
         exclusiveOutput = d.object(forKey: "exclusiveIntegerOutput") as? Bool ?? false
+        setDeviceVolumeTo100ForExclusiveOutput = d.object(forKey: "setDeviceVolumeTo100ForExclusiveOutput") as? Bool ?? false
         enableFading = d.object(forKey: "enableFading") as? Bool ?? true
         enableHdcd = d.object(forKey: "enableHDCD") as? Bool ?? true
         halveDSDVolume = d.object(forKey: "halveDSDVolume") as? Bool ?? false
@@ -131,6 +135,11 @@ struct OutputPaneView: View {
                     "Use exclusive mode when supported",
                     isOn: $prefs.exclusiveOutput
                 )
+                Toggle(
+                    "Set device volume to 100% for exclusive output",
+                    isOn: $prefs.setDeviceVolumeTo100ForExclusiveOutput
+                )
+                .disabled(!prefs.exclusiveOutput)
                 Text("When the source format and selected device support direct output, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported formats and devices continue using shared output.")
                     .font(.caption)
                     .foregroundColor(.secondary)

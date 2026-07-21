@@ -225,6 +225,7 @@ static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
 - (BOOL)ensureAUHALBoundToOutputDevice;
 - (BOOL)createExclusiveIOProc;
 - (void)destroyExclusiveIOProc;
+- (void)setDeviceVolumeTo100ForExclusiveOutputIfSupported;
 - (BOOL)startCurrentHardware:(NSError **)error;
 - (void)stopCurrentHardware;
 - (BOOL)currentOutputUsesExclusiveTransport;
@@ -463,6 +464,12 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	} else if([keyPath isEqualToString:@"values.exclusiveIntegerOutput"]) {
 		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
 		if(!stopping) outputdevicechanged = YES;
+	} else if([keyPath isEqualToString:@"values.setDeviceVolumeTo100ForExclusiveOutput"]) {
+		setDeviceVolumeTo100ForExclusiveOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"setDeviceVolumeTo100ForExclusiveOutput"];
+		if(setDeviceVolumeTo100ForExclusiveOutput && exclusiveIOProcRunning &&
+		   [self currentOutputUsesExclusiveTransport]) {
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
+		}
 	} else if([signalIntegrityPreferenceKeyPaths() containsObject:keyPath]) {
 		// ConverterNode and the DSP nodes observe the same preferences. Defer the
 		// refresh by one main-queue turn so their active state is updated first.
@@ -1936,6 +1943,51 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	return maximumFrames;
 }
 
+- (void)setDeviceVolumeTo100ForExclusiveOutputIfSupported {
+	if(!setDeviceVolumeTo100ForExclusiveOutput ||
+	   outputDeviceID == kAudioObjectUnknown || outputDeviceID == (AudioDeviceID)-1) return;
+
+	// The virtual main control maps to a device's main volume when present, or
+	// to its relevant per-channel controls while preserving their balance.
+	const AudioObjectPropertySelector selectors[] = {
+		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+		kAudioDevicePropertyVolumeScalar,
+	};
+	BOOL foundSettableControl = NO;
+	OSStatus lastStatus = noErr;
+	for(size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); ++i) {
+		AudioObjectPropertyAddress address = {
+			.mSelector = selectors[i],
+			.mScope = kAudioDevicePropertyScopeOutput,
+			.mElement = kAudioObjectPropertyElementMaster
+		};
+		if(!AudioObjectHasProperty(outputDeviceID, &address)) continue;
+
+		Boolean settable = false;
+		lastStatus = AudioObjectIsPropertySettable(outputDeviceID, &address, &settable);
+		if(lastStatus != noErr || !settable) continue;
+		foundSettableControl = YES;
+
+		Float32 maximumVolume = 1.0f;
+		lastStatus = AudioObjectSetPropertyData(outputDeviceID,
+		                                            &address,
+		                                            0,
+		                                            NULL,
+		                                            sizeof(maximumVolume),
+		                                            &maximumVolume);
+		if(lastStatus == noErr) {
+			DLog(@"Set output device %u volume to 100%% for exclusive output",
+			     (unsigned int)outputDeviceID);
+			return;
+		}
+	}
+
+	if(foundSettableControl) {
+		ALog(@"Unable to set output device %u volume to 100%% for exclusive output: %d",
+		     (unsigned int)outputDeviceID, (int)lastStatus);
+	}
+}
+
 - (BOOL)createExclusiveIOProc {
 	if(exclusiveIOProcID) {
 		return exclusiveIOProcDeviceID == outputDeviceID;
@@ -2000,10 +2052,14 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 
 - (BOOL)startCurrentHardware:(NSError **)error {
 	if(exclusiveIOProcID) {
-		if(exclusiveIOProcRunning) return YES;
+		if(exclusiveIOProcRunning) {
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
+			return YES;
+		}
 		OSStatus status = AudioDeviceStart(exclusiveIOProcDeviceID, exclusiveIOProcID);
 		if(status == noErr) {
 			exclusiveIOProcRunning = YES;
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
 			return YES;
 		}
 		if(error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil];
@@ -3790,6 +3846,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 
 		suspendOutputOnPause = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"suspendOutputOnPause"];
 		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
+		setDeviceVolumeTo100ForExclusiveOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"setDeviceVolumeTo100ForExclusiveOutput"];
 
 		[self audioOutputBlock];
 
@@ -3823,6 +3880,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.outputDevice" options:0 context:kOutputCoreAudioContext];
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.suspendOutputOnPause" options:0 context:kOutputCoreAudioContext];
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.exclusiveIntegerOutput" options:0 context:kOutputCoreAudioContext];
+		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.setDeviceVolumeTo100ForExclusiveOutput" options:0 context:kOutputCoreAudioContext];
 		for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
 			[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:keyPath options:0 context:kOutputCoreAudioContext];
 		}
@@ -3898,6 +3956,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.outputDevice" context:kOutputCoreAudioContext];
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.suspendOutputOnPause" context:kOutputCoreAudioContext];
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.exclusiveIntegerOutput" context:kOutputCoreAudioContext];
+			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.setDeviceVolumeTo100ForExclusiveOutput" context:kOutputCoreAudioContext];
 			for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
 				[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:keyPath context:kOutputCoreAudioContext];
 			}

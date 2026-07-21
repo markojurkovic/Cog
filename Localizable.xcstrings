@@ -3143,6 +3143,9 @@
         }
       }
     },
+    "Set device volume to 100% for exclusive output" : {
+
+    },
     "Shared" : {
       "comment" : "Shared audio transport tooltip value"
     },

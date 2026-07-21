@@ -86,6 +86,7 @@ using std::atomic_long;
 
 	BOOL suspendOutputOnPause;
 	BOOL exclusiveOutputEnabled;
+	BOOL setDeviceVolumeTo100ForExclusiveOutput;
 
 	double volume;
 
