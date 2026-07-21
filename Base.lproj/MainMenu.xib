@@ -895,7 +895,7 @@
                     <view translatesAutoresizingMaskIntoConstraints="NO" id="Dac-Fm-Bar" userLabel="Bottom Status Bar">
                         <rect key="frame" x="0.0" y="0.0" width="1281" height="22"/>
                         <subviews>
-                            <textField verticalHuggingPriority="750" horizontalCompressionResistancePriority="250" translatesAutoresizingMaskIntoConstraints="NO" id="778">
+                            <textField horizontalHuggingPriority="251" verticalHuggingPriority="750" horizontalCompressionResistancePriority="750" translatesAutoresizingMaskIntoConstraints="NO" id="778">
                                 <rect key="frame" x="8" y="4" width="261" height="14"/>
                                 <textFieldCell key="cell" controlSize="small" lineBreakMode="truncatingTail" sendsActionOnEndEditing="YES" alignment="left" title="Total Duration: 00 hours 00 minutes 00 seconds" bezelStyle="round" id="1473">
                                     <font key="font" metaFont="controlContent" size="11"/>
