@@ -158,7 +158,7 @@ static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOO
 	                                                        outputSampleRateDescription(format.mSampleRate),
 	                                                        bitDepthDescription];
 	if(format.mFormatFlags & kAudioFormatFlagIsNonMixable) {
-		description = [description stringByAppendingString:NSLocalizedString(@" · Exclusive", @"Non-mixable Core Audio hardware format")];
+		description = [description stringByAppendingString:NSLocalizedString(@" · Non-mixable", @"Non-mixable Core Audio stream format")];
 	}
 	return description;
 }
@@ -228,6 +228,7 @@ static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
 - (void)stopCurrentHardware;
 - (BOOL)currentOutputIsEndToEndInteger;
 - (BOOL)currentProcessOwnsHogMode;
+- (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat;
 @end
 
 @implementation OutputCoreAudio {
@@ -537,15 +538,23 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			if(outputdevicechanged) {
 				// Re-run source-aware negotiation after a device or stream-format
 				// change so a newly selected DAC can enter its integer physical mode.
-				BOOL devicePrepared = sourceFormatValid ? [self prepareForInputFormat:sourceFormat] :
-				                                               [self updateDeviceFormat];
-				if(devicePrepared && !exclusiveIOProcID && !_au.renderResourcesAllocated) {
-					NSError *resourceError = nil;
-					devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+				// Take the source-format snapshot under the same lock used by manual
+				// stream replacement. Otherwise a callback raised by that replacement
+				// can capture the outgoing DoP format, wait for the PCM transaction, and
+				// then restore the stale DoP clock as soon as the lock becomes available.
+				BOOL devicePrepared = NO;
+				@synchronized(self) {
+					devicePrepared = sourceFormatValid ? [self prepareForInputFormatLocked:sourceFormat] :
+					                                               [self updateDeviceFormat];
+					if(devicePrepared && !exclusiveIOProcID && !_au.renderResourcesAllocated) {
+						NSError *resourceError = nil;
+						devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+					}
+					if(devicePrepared) {
+						outputdevicechanged = NO;
+					}
 				}
-				if(devicePrepared) {
-					outputdevicechanged = NO;
-				} else {
+				if(!devicePrepared) {
 					usleep(2000);
 					continue;
 				}
@@ -2824,6 +2833,17 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
+	// Treat the source description and the corresponding hardware transaction as
+	// one handoff. Changing a device clock/stream format invokes Core Audio
+	// listeners asynchronously; without this outer lock, the output thread can
+	// observe that notification before sourceFormat is committed and immediately
+	// renegotiate the outgoing track's format over the replacement track.
+	@synchronized(self) {
+		return [self prepareForInputFormatLocked:inputFormat];
+	}
+}
+
+- (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat {
 	const uint32_t inputChannelConfig = [outputController currentInputChannelConfig];
 	const BOOL inputFormatValid = inputFormat.mFormatID != 0 &&
 	                              inputFormat.mSampleRate > 0.0 &&

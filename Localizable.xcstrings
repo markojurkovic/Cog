@@ -4,11 +4,33 @@
     "" : {
       "shouldTranslate" : false
     },
-    " · End-to-end integer" : {
-      "comment" : "Shared end-to-end integer transport status"
+    " · Exclusive" : {
+      "comment" : "Exclusive audio transport status"
     },
-    " · End-to-end integer · Exclusive" : {
-      "comment" : "Exclusive end-to-end integer transport status"
+    " · Integer" : {
+      "comment" : "End-to-end integer transport status"
+    },
+    "%@\n%@\n\nTransport: %@\nApp: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown." : {
+      "comment" : "Detailed but concise audio output tooltip",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@\n%2$@\n\nTransport: %3$@\nApp: %4$@\nCore Audio: %5$@\nDevice: %6$@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown."
+          }
+        }
+      }
+    },
+    "%@ · %@%@" : {
+      "comment" : "Signal integrity, active app format, and concise transport status",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ · %2$@%3$@"
+          }
+        }
+      }
     },
     "%1d day(s)" : {
       "comment" : "day for total",
@@ -359,6 +381,9 @@
         }
       }
     },
+    "Audio output status" : {
+      "comment" : "Audio output status accessibility label"
+    },
     "Audio Units" : {
       "localizations" : {
         "es" : {
@@ -368,6 +393,9 @@
           }
         }
       }
+    },
+    "Audio: —" : {
+      "comment" : "No active audio output information"
     },
     "Bar color:" : {
       "comment" : "A label displayed next to a color well in the Spectrum pane.",
@@ -554,34 +582,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Códec"
-          }
-        }
-      }
-    },
-    "Cog signal integrity and Core Audio output formats" : {
-      "comment" : "Cog signal-integrity and output formats accessibility label"
-    },
-    "Cog signal path: %@\n%@\n%@\nDriver and hardware processing beyond the reported physical stream are not included.\n\nApp client format: %@\nCore Audio virtual stream: %@\nDevice physical stream: %@" : {
-      "comment" : "Detailed Cog signal-integrity and output format tooltip",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Cog signal path: %1$@\n%2$@\n%3$@\nDriver and hardware processing beyond the reported physical stream are not included.\n\nApp client format: %4$@\nCore Audio virtual stream: %5$@\nDevice physical stream: %6$@"
-          }
-        }
-      }
-    },
-    "Cog: — · App: — → Core Audio: — → Device: —" : {
-      "comment" : "No active Cog signal-integrity or output format information"
-    },
-    "Cog: %@ · App: %@ → Core Audio: %@ → Device: %@%@" : {
-      "comment" : "Cog signal-integrity state, app client format, Core Audio virtual format, physical device format, and transport state",
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Cog: %1$@ · App: %2$@ → Core Audio: %3$@ → Device: %4$@%5$@"
           }
         }
       }
@@ -1059,8 +1059,8 @@
         }
       }
     },
-    "End-to-end integer transport is not active." : {
-      "comment" : "Inactive integer transport tooltip"
+    "End-to-end integer" : {
+      "comment" : "End-to-end integer transport tooltip value"
     },
     "Engine:" : {
       "comment" : "A label for the engine setting in the RubberbandPaneView.",
@@ -1193,6 +1193,9 @@
           }
         }
       }
+    },
+    "Exclusive integer" : {
+      "comment" : "Exclusive integer transport tooltip value"
     },
     "Fade" : {
       "localizations" : {
@@ -1957,6 +1960,9 @@
           }
         }
       }
+    },
+    "No active audio output." : {
+      "comment" : "No active audio output tooltip"
     },
     "No volume scaling" : {
       "comment" : "Label for the option that disables volume scaling.",
@@ -3134,6 +3140,9 @@
         }
       }
     },
+    "Shared" : {
+      "comment" : "Shared audio transport tooltip value"
+    },
     "Shifted" : {
       "localizations" : {
         "es" : {
@@ -3179,9 +3188,6 @@
           }
         }
       }
-    },
-    "Shows whether Cog preserves decoded source samples, followed by Cog's app, Core Audio virtual, and device physical formats." : {
-      "comment" : "Cog signal-integrity and output format tooltip"
     },
     "ShuffleButtonTooltip" : {
       "localizations" : {
@@ -3789,12 +3795,6 @@
           }
         }
       }
-    },
-    "Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams without exclusive ownership." : {
-      "comment" : "Shared integer transport tooltip"
-    },
-    "Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams; Cog owns the device exclusively." : {
-      "comment" : "Exclusive integer transport tooltip"
     },
     "Version %@" : {
       "comment" : "A label displaying the current version of the app. The argument is the full version string of the app. The argument is the string “CO_LOSNO_COG_APPFULLVERSION”.",
