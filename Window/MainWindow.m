@@ -53,9 +53,9 @@ void showSentryConsent(NSWindow *window) {
 - (void)awakeFromNib {
 	[super awakeFromNib];
 
-	outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Device: —", @"No active Cog signal-integrity or output format information");
-	outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's Core Audio handoff and the selected device's physical output stream.", @"Cog signal-integrity and output format tooltip");
-	outputFormatField.accessibilityLabel = NSLocalizedString(@"Cog signal integrity and Core Audio output formats", @"Cog signal-integrity and output formats accessibility label");
+	outputFormatField.stringValue = NSLocalizedString(@"Audio: —", @"No active audio output information");
+	outputFormatField.toolTip = NSLocalizedString(@"No active audio output.", @"No active audio output tooltip");
+	outputFormatField.accessibilityLabel = NSLocalizedString(@"Audio output status", @"Audio output status accessibility label");
 	[[NSNotificationCenter defaultCenter] addObserver:self
 	                                         selector:@selector(coreAudioOutputFormatDidChange:)
 	                                             name:CogCoreAudioOutputFormatDidChangeNotification
@@ -76,6 +76,7 @@ void showSentryConsent(NSWindow *window) {
 
 - (void)coreAudioOutputFormatDidChange:(NSNotification *)notification {
 	NSString *formatDescription = notification.userInfo[CogCoreAudioOutputFormatDescriptionKey];
+	NSString *virtualFormatDescription = notification.userInfo[CogCoreAudioVirtualFormatDescriptionKey];
 	NSString *deviceFormatDescription = notification.userInfo[CogCoreAudioDeviceFormatDescriptionKey];
 	if(formatDescription.length) {
 		outputFormatSource = notification.object;
@@ -91,22 +92,36 @@ void showSentryConsent(NSWindow *window) {
 		}
 		NSString *deviceDescription = deviceFormatDescription.length ? deviceFormatDescription :
 		                                                                 NSLocalizedString(@"Unavailable", @"Physical device format unavailable");
-		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"Cog: %@ · App: %@ → Device: %@", @"Cog signal-integrity state, Core Audio client format, and physical device format"),
+		NSString *virtualDescription = virtualFormatDescription.length ? virtualFormatDescription :
+		                                                                   NSLocalizedString(@"Unavailable", @"Core Audio virtual format unavailable");
+		const BOOL endToEndInteger = [notification.userInfo[CogCoreAudioEndToEndIntegerTransportKey] boolValue];
+		const BOOL exclusiveTransport = [notification.userInfo[CogCoreAudioExclusiveTransportKey] boolValue];
+		NSString *transportStatus = exclusiveTransport ?
+		                                NSLocalizedString(@" · Exclusive", @"Exclusive audio transport status") :
+		                                (endToEndInteger ? NSLocalizedString(@" · Integer", @"End-to-end integer transport status") : @"");
+		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@%@", @"Signal integrity, active app format, and concise transport status"),
 		                                                               integrityDescription,
 		                                                               formatDescription,
-		                                                               deviceDescription];
-		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"Cog signal path: %@\n%@\nCore Audio, driver, and hardware processing are not included.\n\nCog → Core Audio: %@\nDevice physical stream: %@", @"Detailed Cog signal-integrity and output format tooltip"),
+		                                                               transportStatus];
+		NSString *transportDetails = exclusiveTransport ?
+		                                         (endToEndInteger ? NSLocalizedString(@"Exclusive integer", @"Exclusive integer transport tooltip value") :
+		                                                             NSLocalizedString(@"Exclusive", @"Exclusive transport tooltip value")) :
+		                                         (endToEndInteger ? NSLocalizedString(@"End-to-end integer", @"End-to-end integer transport tooltip value") :
+		                                                             NSLocalizedString(@"Shared", @"Shared audio transport tooltip value"));
+		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"%@\n%@\n\nTransport: %@\nApp: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown.", @"Detailed but concise audio output tooltip"),
 		                                                            integrityDescription,
 		                                                            integrityDetails,
+		                                                            transportDetails,
 		                                                            formatDescription,
+		                                                            virtualDescription,
 		                                                            deviceDescription];
 	} else if(!notification.object || notification.object == outputFormatSource) {
 		// An old output can finish stopping after its replacement has already
 		// published the same format. Ignore that stale clear instead of replacing
 		// the active format with a dash during track transitions.
 		outputFormatSource = nil;
-		outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Device: —", @"No active Cog signal-integrity or output format information");
-		outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's Core Audio handoff and the selected device's physical output stream.", @"Cog signal-integrity and output format tooltip");
+		outputFormatField.stringValue = NSLocalizedString(@"Audio: —", @"No active audio output information");
+		outputFormatField.toolTip = NSLocalizedString(@"No active audio output.", @"No active audio output tooltip");
 	}
 }
 

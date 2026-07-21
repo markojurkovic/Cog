@@ -18,6 +18,7 @@
 
 #import <Accelerate/Accelerate.h>
 #import <limits.h>
+#import <unistd.h>
 
 #import <CogAudio/VisualizationController.h>
 
@@ -33,7 +34,11 @@ static NSNotificationName CogPlaybackDidBeginNotificiation = @"CogPlaybackDidBeg
 
 NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification = @"CogCoreAudioOutputFormatDidChangeNotification";
 NSString *const CogCoreAudioOutputFormatDescriptionKey = @"CogCoreAudioOutputFormatDescription";
+NSString *const CogCoreAudioVirtualFormatDescriptionKey = @"CogCoreAudioVirtualFormatDescription";
 NSString *const CogCoreAudioDeviceFormatDescriptionKey = @"CogCoreAudioDeviceFormatDescription";
+NSString *const CogCoreAudioEndToEndIntegerTransportKey = @"CogCoreAudioEndToEndIntegerTransport";
+NSString *const CogCoreAudioExclusiveTransportKey = @"CogCoreAudioExclusiveTransport";
+NSString *const CogCoreAudioHogModeOwnedKey = @"CogCoreAudioHogModeOwned";
 NSString *const CogCoreAudioSignalIntegrityLosslessKey = @"CogCoreAudioSignalIntegrityLossless";
 NSString *const CogCoreAudioSignalIntegrityDetailsKey = @"CogCoreAudioSignalIntegrityDetails";
 
@@ -149,13 +154,18 @@ static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOO
 		bitDepthDescription = [NSString stringWithFormat:@"%u-bit", (unsigned int)format.mBitsPerChannel];
 	}
 
-	return [NSString stringWithFormat:@"%@ · %@ · %@",
-	                                  formatName,
-	                                  outputSampleRateDescription(format.mSampleRate),
-	                                  bitDepthDescription];
+	NSString *description = [NSString stringWithFormat:@"%@ · %@ · %@",
+	                                                        formatName,
+	                                                        outputSampleRateDescription(format.mSampleRate),
+	                                                        bitDepthDescription];
+	if(format.mFormatFlags & kAudioFormatFlagIsNonMixable) {
+		description = [description stringByAppendingString:NSLocalizedString(@" · Non-mixable", @"Non-mixable Core Audio stream format")];
+	}
+	return description;
 }
 
-static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
+static NSString *streamOutputFormatDescription(AudioDeviceID deviceID,
+                                                AudioObjectPropertySelector formatSelector) {
 	if(deviceID == kAudioObjectUnknown || deviceID == (AudioDeviceID)-1) {
 		return nil;
 	}
@@ -184,7 +194,7 @@ static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
 	NSMutableOrderedSet<NSString *> *descriptions = [NSMutableOrderedSet orderedSet];
 	const UInt32 streamCount = streamsSize / (UInt32)sizeof(AudioStreamID);
 	AudioObjectPropertyAddress formatAddress = {
-		.mSelector = kAudioStreamPropertyPhysicalFormat,
+		.mSelector = formatSelector,
 		.mScope = kAudioObjectPropertyScopeGlobal,
 		.mElement = kAudioObjectPropertyElementMaster
 	};
@@ -201,8 +211,27 @@ static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
 	return descriptions.count ? [[descriptions array] componentsJoinedByString:@" / "] : nil;
 }
 
+static NSString *physicalOutputFormatDescription(AudioDeviceID deviceID) {
+	return streamOutputFormatDescription(deviceID, kAudioStreamPropertyPhysicalFormat);
+}
+
+static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
+	return streamOutputFormatDescription(deviceID, kAudioStreamPropertyVirtualFormat);
+}
+
 @interface OutputCoreAudio ()
 - (double)currentDeviceSampleRate;
+- (BOOL)ensureMixableStreamFormatsForAUHAL;
+- (BOOL)ensureAUHALBoundToOutputDevice;
+- (BOOL)createExclusiveIOProc;
+- (void)destroyExclusiveIOProc;
+- (void)setDeviceVolumeTo100ForExclusiveOutputIfSupported;
+- (BOOL)startCurrentHardware:(NSError **)error;
+- (void)stopCurrentHardware;
+- (BOOL)currentOutputUsesExclusiveTransport;
+- (BOOL)currentOutputIsEndToEndInteger;
+- (BOOL)currentProcessOwnsHogMode;
+- (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat;
 @end
 
 @implementation OutputCoreAudio {
@@ -325,7 +354,7 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 		   (fabs(pitch - 1.0) >= 1e-7 || fabs(tempo - 1.0) >= 1e-7)) {
 			[reasons addObject:NSLocalizedString(@"time or pitch processing", @"Cog signal-integrity modification reason")];
 		}
-		if(hdcdDetected && [defaults boolForKey:@"enableHDCD"]) {
+		if([outputController currentInputHDCDDetected] && [defaults boolForKey:@"enableHDCD"]) {
 			[reasons addObject:NSLocalizedString(@"HDCD decoding", @"Cog signal-integrity modification reason")];
 		}
 	}
@@ -347,12 +376,20 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 - (void)postOutputFormatDescription:(NSString *)description {
 	NSDictionary *userInfo = nil;
 	if(description) {
-		NSString *deviceDescription = physicalOutputFormatDescription(outputDeviceID);
+		const AudioDeviceID activeDeviceID = exclusiveIOProcID ? exclusiveIOProcDeviceID : _au.deviceID;
+		NSString *virtualDescription = virtualOutputFormatDescription(activeDeviceID);
+		NSString *deviceDescription = physicalOutputFormatDescription(activeDeviceID);
 		NSMutableDictionary *formatInfo = [@{ CogCoreAudioOutputFormatDescriptionKey: description } mutableCopy];
 		[formatInfo addEntriesFromDictionary:[self signalIntegrityInfo]];
+		if(virtualDescription) {
+			formatInfo[CogCoreAudioVirtualFormatDescriptionKey] = virtualDescription;
+		}
 		if(deviceDescription) {
 			formatInfo[CogCoreAudioDeviceFormatDescriptionKey] = deviceDescription;
 		}
+		formatInfo[CogCoreAudioEndToEndIntegerTransportKey] = @([self currentOutputIsEndToEndInteger]);
+		formatInfo[CogCoreAudioExclusiveTransportKey] = @([self currentOutputUsesExclusiveTransport]);
+		formatInfo[CogCoreAudioHogModeOwnedKey] = @([self currentProcessOwnsHogMode]);
 		userInfo = formatInfo;
 	}
 	dispatch_block_t postNotification = ^{
@@ -378,8 +415,23 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	OutputCoreAudio *_self = (__bridge OutputCoreAudio *)inUserData;
 	for(UInt32 i = 0; i < inNumberAddresses; ++i) {
 		switch(inAddresses[i].mSelector) {
-			case kAudioDevicePropertyDeviceIsAlive:
+			case kAudioDevicePropertyDeviceIsAlive: {
+				// Core Audio can send this notification while a live device changes
+				// ownership or stream format. Only abandon the selected device after
+				// reading an actual dead state; treating every notification as removal
+				// tears down Cog's own hog-mode transition.
+				AudioObjectPropertyAddress aliveAddress = {
+					.mSelector = kAudioDevicePropertyDeviceIsAlive,
+					.mScope = kAudioObjectPropertyScopeGlobal,
+					.mElement = kAudioObjectPropertyElementMaster
+				};
+				UInt32 alive = 0;
+				UInt32 size = sizeof(alive);
+				if(AudioObjectGetPropertyData(inObjectID, &aliveAddress, 0, NULL, &size, &alive) == noErr && alive) {
+					return noErr;
+				}
 				return [_self setOutputDeviceByID:-1];
+			}
 
 			case kAudioDevicePropertyNominalSampleRate:
 			case kAudioDevicePropertyStreamFormat:
@@ -408,6 +460,15 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 				[self timeOut];
 			else
 				[self resume];
+		}
+	} else if([keyPath isEqualToString:@"values.exclusiveIntegerOutput"]) {
+		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
+		if(!stopping) outputdevicechanged = YES;
+	} else if([keyPath isEqualToString:@"values.setDeviceVolumeTo100ForExclusiveOutput"]) {
+		setDeviceVolumeTo100ForExclusiveOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"setDeviceVolumeTo100ForExclusiveOutput"];
+		if(setDeviceVolumeTo100ForExclusiveOutput && exclusiveIOProcRunning &&
+		   [self currentOutputUsesExclusiveTransport]) {
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
 		}
 	} else if([signalIntegrityPreferenceKeyPaths() containsObject:keyPath]) {
 		// ConverterNode and the DSP nodes observe the same preferences. Defer the
@@ -500,14 +561,25 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	while(!stopping) {
 		@autoreleasepool {
 			if(outputdevicechanged) {
-				BOOL devicePrepared = [self updateDeviceFormat];
-				if(devicePrepared && !_au.renderResourcesAllocated) {
-					NSError *resourceError = nil;
-					devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+				// Re-run source-aware negotiation after a device or stream-format
+				// change so a newly selected DAC can enter its integer physical mode.
+				// Take the source-format snapshot under the same lock used by manual
+				// stream replacement. Otherwise a callback raised by that replacement
+				// can capture the outgoing DoP format, wait for the PCM transaction, and
+				// then restore the stale DoP clock as soon as the lock becomes available.
+				BOOL devicePrepared = NO;
+				@synchronized(self) {
+					devicePrepared = sourceFormatValid ? [self prepareForInputFormatLocked:sourceFormat] :
+					                                               [self updateDeviceFormat];
+					if(devicePrepared && !exclusiveIOProcID && !_au.renderResourcesAllocated) {
+						NSError *resourceError = nil;
+						devicePrepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+					}
+					if(devicePrepared) {
+						outputdevicechanged = NO;
+					}
 				}
-				if(devicePrepared) {
-					outputdevicechanged = NO;
-				} else {
+				if(!devicePrepared) {
 					usleep(2000);
 					continue;
 				}
@@ -583,6 +655,20 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 
 			return err;
 		}
+		if(deviceID == kAudioObjectUnknown) {
+			// Some HAL drivers temporarily remove a hogged device from the shared
+			// system-default slot. That is not a real output-device change. Keep the
+			// device Cog already owns; a later valid default notification will still
+			// be handled normally.
+			if(outputDeviceID != kAudioObjectUnknown && outputDeviceID != (AudioDeviceID)-1 &&
+			   [self currentProcessOwnsHogMode]) {
+				DLog(@"Ignoring transient unknown default output while Cog owns device %u",
+				     (unsigned int)outputDeviceID);
+				return noErr;
+			}
+			DLog(@"THERE'S NO DEFAULT OUTPUT DEVICE");
+			return kAudioHardwareBadDeviceError;
+		}
 	}
 
 	if(_au) {
@@ -599,6 +685,51 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 		}
 
 		if(outputDeviceID != deviceID) {
+			const BOOL hardwareWasRunning = [self hardwareIsRunning];
+			if((savedPhysicalFormatValid && savedPhysicalFormatDeviceID == outputDeviceID) ||
+			   (savedVirtualFormatValid && savedVirtualFormatDeviceID == outputDeviceID) ||
+			   (hogModeOwned && hogModeDeviceID == outputDeviceID)) {
+				resetting = YES;
+				[self stopCurrentHardware];
+				if(_au.renderResourcesAllocated) {
+					[_au deallocateRenderResources];
+				}
+				[self destroyExclusiveIOProc];
+				BOOL restored = [self restoreSavedPhysicalFormatSetAtCurrentSampleRate];
+				if(!restored) {
+					ALog(@"Unable to restore the previous physical format before changing output devices");
+				}
+				restored = [self restoreSavedVirtualFormatSetAtCurrentSampleRate] && restored;
+				if(!restored) {
+					ALog(@"Unable to restore the previous virtual format before changing output devices");
+					[self ensureMixableStreamFormatsForAUHAL];
+				}
+				if(![self releaseHogModeForCurrentDevice]) {
+					ALog(@"Unable to release exclusive ownership before changing output devices");
+				}
+				savedPhysicalFormatValid = NO;
+				savedPhysicalFormats = nil;
+				savedVirtualFormatValid = NO;
+				savedVirtualFormats = nil;
+				hogModeOwned = NO;
+				hogModeDeviceID = kAudioObjectUnknown;
+				if(hardwareWasRunning) {
+					started = NO;
+					restarted = NO;
+				}
+				resetting = NO;
+			}
+			preferIntegerPhysicalOutput = NO;
+			preferredIntegerPhysicalFormats = nil;
+			preferExclusiveIntegerTransport = NO;
+			preferredIntegerTransportRequiresHog = NO;
+			preferredIntegerVirtualFormats = nil;
+			preferExclusiveFloatTransport = NO;
+			preferredFloatVirtualFormats = nil;
+			bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+			renderFormatEndToEndInteger = NO;
+			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+
 			if(currentdevicelistenerapplied) {
 				if(devicealivelistenerapplied) {
 					theAddress.mSelector = kAudioDevicePropertyDeviceIsAlive;
@@ -615,15 +746,24 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			DLog(@"Device: %i\n", deviceID);
 			outputDeviceID = deviceID;
 
+			// AUHAL is a shared-mode output unit unless Cog has explicitly acquired
+			// exclusive ownership of the device. A stale non-mixable stream format
+			// makes AUHAL declare the selected device unusable and silently fall back
+			// to another output. Restore an equivalent mixable representation before
+			// attaching AUHAL. Non-mixable formats must be reserved for a real
+			// exclusive/hog-mode implementation.
+			if(![self ensureMixableStreamFormatsForAUHAL]) {
+				ALog(@"Unable to restore mixable stream formats before selecting output device %u",
+				     (unsigned int)outputDeviceID);
+			}
+
 			// AUHAL may immediately restart the new device with the old input-bus
 			// format. Keep that short transition silent until the output thread has
 			// renegotiated the active source for the new device capabilities.
 			resetting = YES;
-			NSError *nserr;
-			[_au setDeviceID:outputDeviceID error:&nserr];
-			if(nserr != nil) {
+			if(![self ensureAUHALBoundToOutputDevice]) {
 				resetting = NO;
-				return (OSErr)[nserr code];
+				return kAudioHardwareUnspecifiedError;
 			}
 
 			outputDeviceIDChanged = YES;
@@ -812,29 +952,182 @@ static AudioStreamBasicDescription DoPIntegerRenderFormatForDeviceFormat(AudioSt
 	return outputFormat;
 }
 
-static int32_t convertDoPFloat64ToS32(double sample) {
-	const double scaled = sample * 2147483648.0;
-	int32_t packed = (int32_t)llrint(scaled);
-	return (int32_t)(((uint32_t)packed) & 0xFFFFFF00U);
+static BOOL AudioFormatIsSignedIntegerPCM(AudioStreamBasicDescription format) {
+	return format.mFormatID == kAudioFormatLinearPCM &&
+	       !(format.mFormatFlags & kAudioFormatFlagIsFloat) &&
+	       !!(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+	       format.mBitsPerChannel > 0 && format.mBitsPerChannel <= 32 &&
+	       format.mFramesPerPacket == 1;
 }
 
-static int32_t convertPCMFloat64ToS32(double sample) {
-	if(isnan(sample)) return 0;
-	if(sample >= 1.0) return (int32_t)(((uint32_t)INT32_MAX) & 0xFFFFFF00U);
-	if(sample <= -1.0) return INT32_MIN;
-	// Integer PCM is normalized by dividing by 2^31. Use the exact inverse
-	// here: multiplying by INT32_MAX loses one 24-bit LSB in the upper half
-	// of the positive range before the 24-bit carrier mask is applied.
-	int64_t scaled = llrint(sample * 2147483648.0);
-	if(scaled > INT32_MAX) scaled = INT32_MAX;
-	if(scaled < INT32_MIN) scaled = INT32_MIN;
-	return (int32_t)(((uint32_t)scaled) & 0xFFFFFF00U);
+static BOOL AudioFormatIsIntegerPCM(AudioStreamBasicDescription format) {
+	return format.mFormatID == kAudioFormatLinearPCM &&
+	       !(format.mFormatFlags & kAudioFormatFlagIsFloat) &&
+	       !(format.mFormatFlags & kLinearPCMFormatFlagsSampleFractionMask) &&
+	       format.mBitsPerChannel > 0 && format.mBitsPerChannel <= 64 &&
+	       format.mFramesPerPacket == 1;
 }
 
-static void convertFloat64BufferToS32(int32_t *output, const double *input, size_t count, BOOL isDoP) {
-	for(size_t i = 0; i < count; ++i) {
-		output[i] = isDoP ? convertDoPFloat64ToS32(input[i]) : convertPCMFloat64ToS32(input[i]);
+static UInt32 AudioFormatBytesPerSample(AudioStreamBasicDescription format) {
+	if(!format.mChannelsPerFrame || !format.mBytesPerFrame) {
+		return 0;
 	}
+	if(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) {
+		return format.mBytesPerFrame;
+	}
+	if(format.mBytesPerFrame % format.mChannelsPerFrame) {
+		return 0;
+	}
+	return format.mBytesPerFrame / format.mChannelsPerFrame;
+}
+
+static AudioStreamBasicDescription IntegerClientFormatForSourceBits(UInt32 sourceBits,
+	                                                                 double sampleRate,
+	                                                                 UInt32 channels) {
+	AudioStreamBasicDescription clientFormat = { 0 };
+	clientFormat.mSampleRate = sampleRate;
+	clientFormat.mFormatID = kAudioFormatLinearPCM;
+	clientFormat.mChannelsPerFrame = channels;
+	clientFormat.mFramesPerPacket = 1;
+	if(sourceBits <= 16) {
+		clientFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
+		clientFormat.mBitsPerChannel = 16;
+		clientFormat.mBytesPerFrame = (UInt32)(sizeof(int16_t) * channels);
+	} else if(sourceBits <= 24) {
+		// 24 valid bits in a 32-bit high-aligned client slot is accepted by
+		// AUHAL across macOS versions. It does not imply that the DAC uses the
+		// same container; HAL performs an exact integer representation change.
+		clientFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsAlignedHigh | kAudioFormatFlagsNativeEndian;
+		clientFormat.mBitsPerChannel = 24;
+		clientFormat.mBytesPerFrame = (UInt32)(sizeof(int32_t) * channels);
+	} else {
+		clientFormat.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian;
+		clientFormat.mBitsPerChannel = 32;
+		clientFormat.mBytesPerFrame = (UInt32)(sizeof(int32_t) * channels);
+	}
+	clientFormat.mBytesPerPacket = clientFormat.mBytesPerFrame;
+	return clientFormat;
+}
+
+static NSValue *PhysicalFormatValue(AudioStreamBasicDescription format) {
+	return [NSValue valueWithBytes:&format objCType:@encode(AudioStreamBasicDescription)];
+}
+
+static BOOL GetPhysicalFormatValue(NSValue *value, AudioStreamBasicDescription *format) {
+	if(!value || !format || strcmp(value.objCType, @encode(AudioStreamBasicDescription)) != 0) {
+		return NO;
+	}
+	[value getValue:format size:sizeof(*format)];
+	return YES;
+}
+
+static NSValue *RangedFormatValue(AudioStreamRangedDescription format) {
+	return [NSValue valueWithBytes:&format objCType:@encode(AudioStreamRangedDescription)];
+}
+
+static BOOL GetRangedFormatValue(NSValue *value, AudioStreamRangedDescription *format) {
+	if(!value || !format || strcmp(value.objCType, @encode(AudioStreamRangedDescription)) != 0) {
+		return NO;
+	}
+	[value getValue:format size:sizeof(*format)];
+	return YES;
+}
+
+static BOOL PhysicalFormatsHaveSameRepresentation(AudioStreamBasicDescription first,
+	                                                 AudioStreamBasicDescription second) {
+	const AudioFormatFlags relevantFlags = kAudioFormatFlagIsFloat |
+	                                       kAudioFormatFlagIsBigEndian |
+	                                       kAudioFormatFlagIsSignedInteger |
+	                                       kAudioFormatFlagIsPacked |
+	                                       kAudioFormatFlagIsAlignedHigh |
+	                                       kAudioFormatFlagIsNonInterleaved |
+	                                       kAudioFormatFlagIsNonMixable |
+	                                       kLinearPCMFormatFlagsSampleFractionMask;
+	return first.mFormatID == second.mFormatID &&
+	       (first.mFormatFlags & relevantFlags) == (second.mFormatFlags & relevantFlags) &&
+	       first.mBytesPerPacket == second.mBytesPerPacket &&
+	       first.mFramesPerPacket == second.mFramesPerPacket &&
+	       first.mBytesPerFrame == second.mBytesPerFrame &&
+	       first.mChannelsPerFrame == second.mChannelsPerFrame &&
+	       first.mBitsPerChannel == second.mBitsPerChannel;
+}
+
+static BOOL PhysicalFormatsMatch(AudioStreamBasicDescription first,
+	                              AudioStreamBasicDescription second) {
+	return PhysicalFormatsHaveSameRepresentation(first, second) &&
+	       fabs(first.mSampleRate - second.mSampleRate) < 1.0;
+}
+
+static BOOL StreamFormatsHaveSameSampleRepresentation(AudioStreamBasicDescription first,
+	                                                    AudioStreamBasicDescription second,
+	                                                    BOOL compareNonMixable) {
+	AudioFormatFlags relevantFlags = kAudioFormatFlagIsFloat |
+	                                 kAudioFormatFlagIsBigEndian |
+	                                 kAudioFormatFlagIsSignedInteger |
+	                                 kAudioFormatFlagIsPacked |
+	                                 kAudioFormatFlagIsAlignedHigh |
+	                                 kAudioFormatFlagIsNonInterleaved |
+	                                 kLinearPCMFormatFlagsSampleFractionMask;
+	if(compareNonMixable) relevantFlags |= kAudioFormatFlagIsNonMixable;
+	return first.mFormatID == second.mFormatID &&
+	       (first.mFormatFlags & relevantFlags) == (second.mFormatFlags & relevantFlags) &&
+	       first.mFramesPerPacket == second.mFramesPerPacket &&
+	       first.mBitsPerChannel == second.mBitsPerChannel &&
+	       AudioFormatBytesPerSample(first) == AudioFormatBytesPerSample(second);
+}
+
+static BOOL RangedPhysicalFormatSupportsSampleRate(AudioStreamRangedDescription description,
+	                                                double sampleRate) {
+	return sampleRate >= description.mSampleRateRange.mMinimum - 1.0 &&
+	       sampleRate <= description.mSampleRateRange.mMaximum + 1.0;
+}
+
+static BOOL convertFloat64BufferToIntegerPCM(void *output,
+	                                         const double *input,
+	                                         size_t count,
+	                                         AudioStreamBasicDescription format) {
+	if(!AudioFormatIsSignedIntegerPCM(format)) {
+		return NO;
+	}
+	const UInt32 bytesPerSample = AudioFormatBytesPerSample(format);
+	const UInt32 containerBits = bytesPerSample * 8;
+	const UInt32 validBits = format.mBitsPerChannel;
+	if(bytesPerSample < 2 || bytesPerSample > 4 || validBits > containerBits) {
+		return NO;
+	}
+
+	const BOOL alignedHigh = !(format.mFormatFlags & kAudioFormatFlagIsPacked) &&
+	                         !!(format.mFormatFlags & kAudioFormatFlagIsAlignedHigh);
+	const BOOL bigEndian = !!(format.mFormatFlags & kAudioFormatFlagIsBigEndian);
+	const UInt32 alignmentShift = alignedHigh ? containerBits - validBits : 0;
+	const int64_t minimum = -(INT64_C(1) << (validBits - 1));
+	const int64_t maximum = (INT64_C(1) << (validBits - 1)) - 1;
+	const double scale = ldexp(1.0, (int)validBits - 1);
+	const uint64_t containerMask = (UINT64_C(1) << containerBits) - 1;
+	uint8_t *bytes = (uint8_t *)output;
+
+	for(size_t i = 0; i < count; ++i) {
+		const double sample = input[i];
+		int64_t quantized;
+		if(!isfinite(sample)) {
+			quantized = 0;
+		} else if(sample >= 1.0) {
+			quantized = maximum;
+		} else if(sample <= -1.0) {
+			quantized = minimum;
+		} else {
+			// Cog's integer-to-Float64 normalization divides by 2^(bits-1).
+			// This exact inverse restores every Int16 and Int24 source value.
+			quantized = llrint(sample * scale);
+		}
+
+		uint64_t encoded = (((uint64_t)quantized) << alignmentShift) & containerMask;
+		for(UInt32 byte = 0; byte < bytesPerSample; ++byte) {
+			const UInt32 destinationByte = bigEndian ? bytesPerSample - byte - 1 : byte;
+			bytes[i * bytesPerSample + destinationByte] = (uint8_t)(encoded >> (byte * 8));
+		}
+	}
+	return YES;
 }
 
 static int32_t convertPCMFloat64ToFullS32(double sample) {
@@ -894,7 +1187,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)prepareOutputDoubleScratchForRenderFormat:(AudioStreamBasicDescription)format {
-	const size_t maximumFrames = (size_t)_au.maximumFramesToRender;
+	const size_t maximumFrames = MAX((size_t)_au.maximumFramesToRender,
+	                                 (size_t)exclusiveMaximumFramesToRender);
 	const size_t channels = (size_t)format.mChannelsPerFrame;
 	if(!maximumFrames || !channels || maximumFrames > SIZE_MAX / channels) {
 		return NO;
@@ -921,6 +1215,1162 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	inputDoubleScratch = inputScratch;
 	outputDoubleScratchCapacity = requiredSamples;
 	return YES;
+}
+
+- (BOOL)readStreamFormat:(AudioStreamBasicDescription *)format
+	          fromStream:(AudioStreamID)streamID
+	            selector:(AudioObjectPropertySelector)selector {
+	if(streamID == kAudioObjectUnknown || !format) {
+		return NO;
+	}
+	AudioObjectPropertyAddress address = {
+		.mSelector = selector,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = sizeof(*format);
+	bzero(format, sizeof(*format));
+	OSStatus status = AudioObjectGetPropertyData(streamID, &address, 0, NULL, &size, format);
+	return status == noErr && size == sizeof(*format) && format->mFormatID != 0;
+}
+
+- (BOOL)readPhysicalFormat:(AudioStreamBasicDescription *)format fromStream:(AudioStreamID)streamID {
+	return [self readStreamFormat:format fromStream:streamID selector:kAudioStreamPropertyPhysicalFormat];
+}
+
+- (BOOL)readVirtualFormat:(AudioStreamBasicDescription *)format fromStream:(AudioStreamID)streamID {
+	return [self readStreamFormat:format fromStream:streamID selector:kAudioStreamPropertyVirtualFormat];
+}
+
+- (BOOL)findStreamFormatMatchingRepresentation:(AudioStreamBasicDescription)representation
+	                                  atSampleRate:(double)sampleRate
+	                                      streamID:(AudioStreamID)streamID
+	                               currentSelector:(AudioObjectPropertySelector)currentSelector
+	                             availableSelector:(AudioObjectPropertySelector)availableSelector
+	                                         format:(AudioStreamBasicDescription *)selectedFormat {
+	AudioStreamBasicDescription currentFormat = { 0 };
+	if([self readStreamFormat:&currentFormat fromStream:streamID selector:currentSelector] &&
+	   PhysicalFormatsHaveSameRepresentation(currentFormat, representation) &&
+	   fabs(currentFormat.mSampleRate - sampleRate) < 1.0) {
+		if(selectedFormat) *selectedFormat = currentFormat;
+		return YES;
+	}
+	AudioObjectPropertyAddress address = {
+		.mSelector = availableSelector,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(streamID, &address, 0, NULL, &size);
+	if(status != noErr || size < sizeof(AudioStreamRangedDescription)) {
+		return NO;
+	}
+	AudioStreamRangedDescription *descriptions = (AudioStreamRangedDescription *)malloc(size);
+	if(!descriptions) {
+		return NO;
+	}
+	status = AudioObjectGetPropertyData(streamID, &address, 0, NULL, &size, descriptions);
+	if(status != noErr) {
+		free(descriptions);
+		return NO;
+	}
+
+	BOOL found = NO;
+	const UInt32 count = size / (UInt32)sizeof(AudioStreamRangedDescription);
+	for(UInt32 i = 0; i < count; ++i) {
+		if(RangedPhysicalFormatSupportsSampleRate(descriptions[i], sampleRate) &&
+		   PhysicalFormatsHaveSameRepresentation(descriptions[i].mFormat, representation)) {
+			if(selectedFormat) {
+				*selectedFormat = descriptions[i].mFormat;
+				selectedFormat->mSampleRate = sampleRate;
+			}
+			found = YES;
+			break;
+		}
+	}
+	free(descriptions);
+	return found;
+}
+
+- (BOOL)findPhysicalFormatMatchingRepresentation:(AudioStreamBasicDescription)representation
+	                                  atSampleRate:(double)sampleRate
+	                                      streamID:(AudioStreamID)streamID
+	                                         format:(AudioStreamBasicDescription *)selectedFormat {
+	return [self findStreamFormatMatchingRepresentation:representation
+	                                      atSampleRate:sampleRate
+	                                          streamID:streamID
+	                                   currentSelector:kAudioStreamPropertyPhysicalFormat
+	                                 availableSelector:kAudioStreamPropertyAvailablePhysicalFormats
+	                                             format:selectedFormat];
+}
+
+- (BOOL)findVirtualFormatMatchingRepresentation:(AudioStreamBasicDescription)representation
+	                                 atSampleRate:(double)sampleRate
+	                                     streamID:(AudioStreamID)streamID
+	                                        format:(AudioStreamBasicDescription *)selectedFormat {
+	return [self findStreamFormatMatchingRepresentation:representation
+	                                      atSampleRate:sampleRate
+	                                          streamID:streamID
+	                                   currentSelector:kAudioStreamPropertyVirtualFormat
+	                                 availableSelector:kAudioStreamPropertyAvailableVirtualFormats
+	                                             format:selectedFormat];
+}
+
+- (BOOL)setStreamFormat:(AudioStreamBasicDescription)format
+	       onStream:(AudioStreamID)streamID
+	       selector:(AudioObjectPropertySelector)selector {
+	AudioObjectPropertyAddress address = {
+		.mSelector = selector,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	AudioStreamBasicDescription currentFormat = { 0 };
+	if([self readStreamFormat:&currentFormat fromStream:streamID selector:selector] &&
+	   PhysicalFormatsMatch(currentFormat, format)) {
+		return YES;
+	}
+	Boolean settable = false;
+	OSStatus status = AudioObjectIsPropertySettable(streamID, &address, &settable);
+	if(status != noErr || !settable) {
+		return NO;
+	}
+	status = AudioObjectSetPropertyData(streamID, &address, 0, NULL, sizeof(format), &format);
+	if(status != noErr) {
+		return NO;
+	}
+
+	// Hardware drivers commonly apply physical-format changes asynchronously.
+	for(size_t attempt = 0; attempt < 50; ++attempt) {
+		if([self readStreamFormat:&currentFormat fromStream:streamID selector:selector] &&
+		   PhysicalFormatsMatch(currentFormat, format)) {
+			return YES;
+		}
+		usleep(10000);
+	}
+	return NO;
+}
+
+- (BOOL)setPhysicalFormat:(AudioStreamBasicDescription)format onStream:(AudioStreamID)streamID {
+	return [self setStreamFormat:format onStream:streamID selector:kAudioStreamPropertyPhysicalFormat];
+}
+
+- (BOOL)setVirtualFormat:(AudioStreamBasicDescription)format onStream:(AudioStreamID)streamID {
+	return [self setStreamFormat:format onStream:streamID selector:kAudioStreamPropertyVirtualFormat];
+}
+
+- (NSArray<NSNumber *> *)activeOutputPhysicalStreams {
+	if(outputDeviceID == kAudioObjectUnknown || outputDeviceID == (AudioDeviceID)-1) return @[];
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyStreams,
+		.mScope = kAudioDevicePropertyScopeOutput,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(outputDeviceID, &address, 0, NULL, &size);
+	if(status != noErr || size < sizeof(AudioStreamID)) return @[];
+	AudioStreamID *streams = (AudioStreamID *)malloc(size);
+	if(!streams) return @[];
+	status = AudioObjectGetPropertyData(outputDeviceID, &address, 0, NULL, &size, streams);
+	if(status != noErr) {
+		free(streams);
+		return @[];
+	}
+
+	NSMutableArray<NSNumber *> *activeStreams = [NSMutableArray array];
+	AudioObjectPropertyAddress activeAddress = {
+		.mSelector = kAudioStreamPropertyIsActive,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	const UInt32 count = size / (UInt32)sizeof(AudioStreamID);
+	for(UInt32 i = 0; i < count; ++i) {
+		UInt32 active = 1;
+		UInt32 activeSize = sizeof(active);
+		status = AudioObjectGetPropertyData(streams[i], &activeAddress, 0, NULL, &activeSize, &active);
+		if(status != noErr || active) [activeStreams addObject:@(streams[i])];
+	}
+	free(streams);
+	return activeStreams;
+}
+
+- (NSDictionary<NSNumber *, NSValue *> *)currentStreamFormatSetForStreams:(NSArray<NSNumber *> *)streams
+	                                                               selector:(AudioObjectPropertySelector)selector {
+	if(!streams.count) return nil;
+	NSMutableDictionary<NSNumber *, NSValue *> *formats = [NSMutableDictionary dictionary];
+	for(NSNumber *streamNumber in streams) {
+		AudioStreamBasicDescription format = { 0 };
+		if(![self readStreamFormat:&format fromStream:streamNumber.unsignedIntValue selector:selector]) return nil;
+		formats[streamNumber] = PhysicalFormatValue(format);
+	}
+	return formats;
+}
+
+- (NSDictionary<NSNumber *, NSValue *> *)currentPhysicalFormatSetForStreams:(NSArray<NSNumber *> *)streams {
+	return [self currentStreamFormatSetForStreams:streams selector:kAudioStreamPropertyPhysicalFormat];
+}
+
+- (NSDictionary<NSNumber *, NSValue *> *)currentVirtualFormatSetForStreams:(NSArray<NSNumber *> *)streams {
+	return [self currentStreamFormatSetForStreams:streams selector:kAudioStreamPropertyVirtualFormat];
+}
+
+- (NSArray<NSValue *> *)availableStreamFormatsForStream:(AudioStreamID)streamID
+	                                           selector:(AudioObjectPropertySelector)selector
+	                                    currentSelector:(AudioObjectPropertySelector)currentSelector {
+	AudioObjectPropertyAddress address = {
+		.mSelector = selector,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(streamID, &address, 0, NULL, &size);
+	if(status == noErr && size >= sizeof(AudioStreamRangedDescription)) {
+		AudioStreamRangedDescription *descriptions = (AudioStreamRangedDescription *)malloc(size);
+		if(!descriptions) return @[];
+		status = AudioObjectGetPropertyData(streamID, &address, 0, NULL, &size, descriptions);
+		if(status == noErr) {
+			NSMutableArray<NSValue *> *values = [NSMutableArray array];
+			const UInt32 count = size / (UInt32)sizeof(AudioStreamRangedDescription);
+			for(UInt32 i = 0; i < count; ++i) [values addObject:RangedFormatValue(descriptions[i])];
+			free(descriptions);
+			return values;
+		}
+		free(descriptions);
+	}
+
+	// A few drivers expose only their current stream format. Treat it as a
+	// single-point capability instead of rejecting an otherwise usable device.
+	AudioStreamBasicDescription current = { 0 };
+	if(![self readStreamFormat:&current fromStream:streamID selector:currentSelector]) return @[];
+	AudioStreamRangedDescription description = {
+		.mFormat = current,
+		.mSampleRateRange = { current.mSampleRate, current.mSampleRate }
+	};
+	return @[ RangedFormatValue(description) ];
+}
+
+static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
+	                                        UInt32 requiredBits,
+	                                        BOOL requireDoPCarrier) {
+	const UInt32 bytesPerSample = AudioFormatBytesPerSample(format);
+	if(!AudioFormatIsSignedIntegerPCM(format) ||
+	   (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ||
+	   bytesPerSample < 2 || bytesPerSample > 4 ||
+	   format.mBitsPerChannel < requiredBits ||
+	   format.mBitsPerChannel > bytesPerSample * 8) return NO;
+	if(!requireDoPCarrier) return YES;
+
+	// Cog's native DoP carrier is the standard 24 valid bits in a high-aligned
+	// 32-bit integer slot. Requiring the exact representation avoids inserting
+	// a converter or guessing a driver's private Int32 DoP byte placement.
+	return AudioFormatIsDoPInteger(format);
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)integerTransportPairsForStream:(AudioStreamID)streamID
+	                                                            sampleRate:(double)sampleRate
+	                                                          requiredBits:(UInt32)requiredBits
+	                                                     requireDoPCarrier:(BOOL)requireDoPCarrier {
+	NSArray<NSValue *> *virtualFormats = [self availableStreamFormatsForStream:streamID
+	                                                                  selector:kAudioStreamPropertyAvailableVirtualFormats
+	                                                           currentSelector:kAudioStreamPropertyVirtualFormat];
+	NSArray<NSValue *> *physicalFormats = [self availableStreamFormatsForStream:streamID
+	                                                                   selector:kAudioStreamPropertyAvailablePhysicalFormats
+	                                                            currentSelector:kAudioStreamPropertyPhysicalFormat];
+	NSMutableArray<NSDictionary<NSString *, id> *> *pairs = [NSMutableArray array];
+	for(NSValue *virtualValue in virtualFormats) {
+		AudioStreamRangedDescription virtualDescription = { 0 };
+		if(!GetRangedFormatValue(virtualValue, &virtualDescription) ||
+		   !RangedPhysicalFormatSupportsSampleRate(virtualDescription, sampleRate)) continue;
+		AudioStreamBasicDescription virtualFormat = virtualDescription.mFormat;
+		virtualFormat.mSampleRate = sampleRate;
+		if(!IntegerTransportFormatIsUsable(virtualFormat, requiredBits, requireDoPCarrier) ||
+		   !(virtualFormat.mFormatFlags & kAudioFormatFlagIsNonMixable)) continue;
+
+		for(NSValue *physicalValue in physicalFormats) {
+			AudioStreamRangedDescription physicalDescription = { 0 };
+			if(!GetRangedFormatValue(physicalValue, &physicalDescription) ||
+			   !RangedPhysicalFormatSupportsSampleRate(physicalDescription, sampleRate)) continue;
+			AudioStreamBasicDescription physicalFormat = physicalDescription.mFormat;
+			physicalFormat.mSampleRate = sampleRate;
+			if(!IntegerTransportFormatIsUsable(physicalFormat, requiredBits, requireDoPCarrier) ||
+			   !PhysicalFormatsHaveSameRepresentation(virtualFormat, physicalFormat)) continue;
+
+			const UInt32 containerBits = AudioFormatBytesPerSample(virtualFormat) * 8;
+			const BOOL requiresHog = YES;
+			uint64_t score = (uint64_t)(virtualFormat.mBitsPerChannel - requiredBits) * UINT64_C(1000000000);
+			score += (uint64_t)(containerBits - virtualFormat.mBitsPerChannel) * UINT64_C(1000000);
+			if(virtualFormat.mFormatFlags & kAudioFormatFlagIsBigEndian) score += 1;
+			[pairs addObject:@{
+				@"virtual": PhysicalFormatValue(virtualFormat),
+				@"physical": PhysicalFormatValue(physicalFormat),
+				@"requiresHog": @(requiresHog),
+				@"score": @(score),
+			}];
+		}
+	}
+	[pairs sortUsingComparator:^NSComparisonResult(NSDictionary<NSString *, id> *first,
+	                                               NSDictionary<NSString *, id> *second) {
+		return [first[@"score"] compare:second[@"score"]];
+	}];
+	return pairs;
+}
+
+- (BOOL)findEndToEndIntegerFormatSetsForSampleRate:(double)sampleRate
+	                                    requiredBits:(UInt32)requiredBits
+	                               requireDoPCarrier:(BOOL)requireDoPCarrier
+	                                  virtualFormats:(NSDictionary<NSNumber *, NSValue *> **)selectedVirtualFormats
+	                                 physicalFormats:(NSDictionary<NSNumber *, NSValue *> **)selectedPhysicalFormats
+	                                     clientFormat:(AudioStreamBasicDescription *)selectedClientFormat
+	                                      requiresHog:(BOOL *)selectedRequiresHog {
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	// The direct HAL callback below currently renders one interleaved buffer.
+	// Multi-stream/aggregate devices remain on AUHAL until Cog can map their
+	// individual channel buffers without making device-specific assumptions.
+	if(streams.count != 1) return NO;
+	NSArray<NSDictionary<NSString *, id> *> *firstPairs =
+	    [self integerTransportPairsForStream:streams.firstObject.unsignedIntValue
+	                            sampleRate:sampleRate
+	                          requiredBits:requiredBits
+	                     requireDoPCarrier:requireDoPCarrier];
+	for(NSDictionary<NSString *, id> *firstPair in firstPairs) {
+		AudioStreamBasicDescription baseline = { 0 };
+		if(!GetPhysicalFormatValue(firstPair[@"virtual"], &baseline)) continue;
+		NSMutableDictionary<NSNumber *, NSValue *> *virtualSet = [NSMutableDictionary dictionary];
+		NSMutableDictionary<NSNumber *, NSValue *> *physicalSet = [NSMutableDictionary dictionary];
+		virtualSet[streams.firstObject] = firstPair[@"virtual"];
+		physicalSet[streams.firstObject] = firstPair[@"physical"];
+		BOOL allStreamsMatch = YES;
+		for(NSUInteger streamIndex = 1; streamIndex < streams.count; ++streamIndex) {
+			NSNumber *streamNumber = streams[streamIndex];
+			NSArray<NSDictionary<NSString *, id> *> *pairs =
+			    [self integerTransportPairsForStream:streamNumber.unsignedIntValue
+			                            sampleRate:sampleRate
+			                          requiredBits:requiredBits
+			                     requireDoPCarrier:requireDoPCarrier];
+			NSDictionary<NSString *, id> *matchingPair = nil;
+			for(NSDictionary<NSString *, id> *pair in pairs) {
+				AudioStreamBasicDescription candidate = { 0 };
+				if(GetPhysicalFormatValue(pair[@"virtual"], &candidate) &&
+				   StreamFormatsHaveSameSampleRepresentation(baseline, candidate, YES)) {
+					matchingPair = pair;
+					break;
+				}
+			}
+			if(!matchingPair) {
+				allStreamsMatch = NO;
+				break;
+			}
+			virtualSet[streamNumber] = matchingPair[@"virtual"];
+			physicalSet[streamNumber] = matchingPair[@"physical"];
+		}
+		if(!allStreamsMatch) continue;
+
+		AudioStreamBasicDescription clientFormat = baseline;
+		clientFormat.mFormatFlags &= ~kAudioFormatFlagIsNonMixable;
+		clientFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
+		const UInt32 bytesPerSample = AudioFormatBytesPerSample(baseline);
+		clientFormat.mBytesPerFrame = bytesPerSample * clientFormat.mChannelsPerFrame;
+		clientFormat.mBytesPerPacket = clientFormat.mBytesPerFrame * clientFormat.mFramesPerPacket;
+		clientFormat.mReserved = 0;
+		if(!clientFormat.mChannelsPerFrame ||
+		   (requireDoPCarrier && !AudioFormatIsDoPInteger(clientFormat))) continue;
+
+		if(selectedVirtualFormats) *selectedVirtualFormats = virtualSet;
+		if(selectedPhysicalFormats) *selectedPhysicalFormats = physicalSet;
+		if(selectedClientFormat) *selectedClientFormat = clientFormat;
+		if(selectedRequiresHog) *selectedRequiresHog = [firstPair[@"requiresHog"] boolValue];
+		return YES;
+	}
+	return NO;
+}
+
+- (BOOL)findExclusiveFloatVirtualFormatSetForInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                           sampleRate:(double)sampleRate
+	                                        virtualFormats:(NSDictionary<NSNumber *, NSValue *> **)selectedVirtualFormats
+	                                           clientFormat:(AudioStreamBasicDescription *)selectedClientFormat {
+	const BOOL sourceIsFloat32 = AudioFormatIsFloat32(inputFormat);
+	const BOOL sourceIsFloat64 = AudioFormatIsFloat64(inputFormat);
+	if(!sourceIsFloat32 && !sourceIsFloat64) {
+		DLog(@"Exclusive float skipped: source is not canonical interleaved Float32/Float64 (%@)",
+		     outputFormatDescription(inputFormat, NO));
+		return NO;
+	}
+	if(inputFormat.mChannelsPerFrame != deviceFormat.mChannelsPerFrame) {
+		DLog(@"Exclusive float skipped: source has %u channels but the output client has %u",
+		     (unsigned int)inputFormat.mChannelsPerFrame,
+		     (unsigned int)deviceFormat.mChannelsPerFrame);
+		return NO;
+	}
+
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	// The direct callback currently maps exactly one interleaved output buffer.
+	// Aggregate and multi-stream devices keep using AUHAL until their individual
+	// channel buffers can be described without device-specific assumptions.
+	if(streams.count != 1) {
+		DLog(@"Exclusive float skipped: direct output requires one active stream, found %lu",
+		     (unsigned long)streams.count);
+		return NO;
+	}
+	const NSNumber *streamNumber = streams.firstObject;
+	NSArray<NSValue *> *availableFormats =
+	    [self availableStreamFormatsForStream:streamNumber.unsignedIntValue
+	                               selector:kAudioStreamPropertyAvailableVirtualFormats
+	                        currentSelector:kAudioStreamPropertyVirtualFormat];
+	BOOL found = NO;
+	AudioStreamBasicDescription bestFormat = { 0 };
+	uint64_t bestScore = UINT64_MAX;
+	for(NSValue *value in availableFormats) {
+		AudioStreamRangedDescription description = { 0 };
+		if(!GetRangedFormatValue(value, &description) ||
+		   !RangedPhysicalFormatSupportsSampleRate(description, sampleRate)) continue;
+		AudioStreamBasicDescription candidate = description.mFormat;
+		candidate.mSampleRate = sampleRate;
+		if(candidate.mChannelsPerFrame != inputFormat.mChannelsPerFrame ||
+		   (sourceIsFloat32 ? !AudioFormatIsFloat32(candidate) : !AudioFormatIsFloat64(candidate))) continue;
+
+		// Prefer a driver's explicitly non-mixable float mode, while accepting its
+		// ordinary float virtual format under verified hog ownership as well.
+		const uint64_t score = (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ? 0 : 1;
+		if(!found || score < bestScore) {
+			found = YES;
+			bestScore = score;
+			bestFormat = candidate;
+		}
+	}
+	if(!found) {
+		DLog(@"Exclusive float skipped: no matching Float%u virtual format at %.0f Hz with %u channels",
+		     sourceIsFloat32 ? 32u : 64u,
+		     sampleRate,
+		     (unsigned int)inputFormat.mChannelsPerFrame);
+		return NO;
+	}
+
+	AudioStreamBasicDescription clientFormat = bestFormat;
+	clientFormat.mFormatFlags &= ~kAudioFormatFlagIsNonMixable;
+	clientFormat.mReserved = 0;
+	if(selectedVirtualFormats) *selectedVirtualFormats = @{ streamNumber: PhysicalFormatValue(bestFormat) };
+	if(selectedClientFormat) *selectedClientFormat = clientFormat;
+	DLog(@"Exclusive float selected: %@", outputFormatDescription(clientFormat, NO));
+	return YES;
+}
+
+- (BOOL)findIntegerPhysicalFormatForPhysicalStream:(AudioStreamID)streamID
+	                                    sampleRate:(double)sampleRate
+	                                  requiredBits:(UInt32)requiredBits
+	                             requireDoPCarrier:(BOOL)requireDoPCarrier
+	                                         format:(AudioStreamBasicDescription *)selectedFormat {
+	AudioStreamBasicDescription currentFormat = { 0 };
+	if(![self readPhysicalFormat:&currentFormat fromStream:streamID]) return NO;
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioStreamPropertyAvailablePhysicalFormats,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(streamID, &address, 0, NULL, &size);
+	if(status != noErr || size < sizeof(AudioStreamRangedDescription)) {
+		const UInt32 currentContainerBits = AudioFormatBytesPerSample(currentFormat) * 8;
+		const BOOL currentSupportsDoP = !requireDoPCarrier ||
+		                                ((currentFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+		                                 (currentFormat.mBitsPerChannel == 24 || currentFormat.mBitsPerChannel == 32) &&
+		                                 (currentContainerBits == 24 || currentContainerBits == 32) &&
+		                                 (currentContainerBits == currentFormat.mBitsPerChannel ||
+		                                  (currentFormat.mFormatFlags & kAudioFormatFlagIsAlignedHigh)));
+		if(AudioFormatIsIntegerPCM(currentFormat) &&
+		   !(currentFormat.mFormatFlags & kAudioFormatFlagIsNonMixable) &&
+		   currentSupportsDoP &&
+		   currentFormat.mBitsPerChannel >= requiredBits &&
+		   fabs(currentFormat.mSampleRate - sampleRate) < 1.0) {
+			if(selectedFormat) *selectedFormat = currentFormat;
+			return YES;
+		}
+		return NO;
+	}
+
+	AudioStreamRangedDescription *descriptions = (AudioStreamRangedDescription *)malloc(size);
+	if(!descriptions) return NO;
+	status = AudioObjectGetPropertyData(streamID, &address, 0, NULL, &size, descriptions);
+	if(status != noErr) {
+		free(descriptions);
+		return NO;
+	}
+	BOOL found = NO;
+	uint64_t bestScore = UINT64_MAX;
+	AudioStreamBasicDescription bestFormat = { 0 };
+	const UInt32 count = size / (UInt32)sizeof(AudioStreamRangedDescription);
+	for(UInt32 i = 0; i < count; ++i) {
+		AudioStreamBasicDescription candidate = descriptions[i].mFormat;
+		const UInt32 bytesPerSample = AudioFormatBytesPerSample(candidate);
+		const UInt32 containerBits = bytesPerSample * 8;
+		if(!RangedPhysicalFormatSupportsSampleRate(descriptions[i], sampleRate) ||
+		   !AudioFormatIsIntegerPCM(candidate) ||
+		   (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ||
+		   (requireDoPCarrier &&
+		    (!(candidate.mFormatFlags & kAudioFormatFlagIsSignedInteger) ||
+		     (candidate.mBitsPerChannel != 24 && candidate.mBitsPerChannel != 32) ||
+		     (containerBits != 24 && containerBits != 32) ||
+		     (containerBits != candidate.mBitsPerChannel &&
+		      !(candidate.mFormatFlags & kAudioFormatFlagIsAlignedHigh)))) ||
+		   candidate.mBitsPerChannel < requiredBits ||
+		   candidate.mBitsPerChannel > containerBits ||
+		   !bytesPerSample || bytesPerSample > 8 ||
+		   candidate.mChannelsPerFrame != currentFormat.mChannelsPerFrame) continue;
+
+		// Match the source precision first, then prefer the least padded
+		// container. Non-mixable variants were excluded above because AUHAL does
+		// not own the device exclusively. Thus native Int16 wins over a wider
+		// Int24/Int32 mode when the DAC genuinely exposes Int16.
+		uint64_t score = (uint64_t)(candidate.mBitsPerChannel - requiredBits) * UINT64_C(1000000);
+		score += containerBits - candidate.mBitsPerChannel;
+		if(!(candidate.mFormatFlags & kAudioFormatFlagIsSignedInteger)) score += 1;
+		if(!found || score < bestScore) {
+			found = YES;
+			bestScore = score;
+			bestFormat = candidate;
+			bestFormat.mSampleRate = sampleRate;
+		}
+	}
+	free(descriptions);
+	if(found && selectedFormat) *selectedFormat = bestFormat;
+	return found;
+}
+
+- (NSDictionary<NSNumber *, NSValue *> *)integerPhysicalFormatSetForSampleRate:(double)sampleRate
+	                                                               requiredBits:(UInt32)requiredBits
+	                                                          requireDoPCarrier:(BOOL)requireDoPCarrier {
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	if(!streams.count) return nil;
+	NSMutableDictionary<NSNumber *, NSValue *> *formats = [NSMutableDictionary dictionary];
+	for(NSNumber *streamNumber in streams) {
+		AudioStreamBasicDescription format = { 0 };
+		if(![self findIntegerPhysicalFormatForPhysicalStream:streamNumber.unsignedIntValue
+		                                           sampleRate:sampleRate
+		                                         requiredBits:requiredBits
+		                                    requireDoPCarrier:requireDoPCarrier
+		                                                format:&format]) return nil;
+		formats[streamNumber] = PhysicalFormatValue(format);
+	}
+	return formats;
+}
+
+- (BOOL)setStreamFormatSet:(NSDictionary<NSNumber *, NSValue *> *)formats
+	                selector:(AudioObjectPropertySelector)selector {
+	for(NSNumber *streamNumber in formats) {
+		AudioStreamBasicDescription format = { 0 };
+		if(!GetPhysicalFormatValue(formats[streamNumber], &format) ||
+		   ![self setStreamFormat:format onStream:streamNumber.unsignedIntValue selector:selector]) return NO;
+	}
+	for(NSNumber *streamNumber in formats) {
+		AudioStreamBasicDescription expected = { 0 }, current = { 0 };
+		if(!GetPhysicalFormatValue(formats[streamNumber], &expected) ||
+		   ![self readStreamFormat:&current fromStream:streamNumber.unsignedIntValue selector:selector] ||
+		   !PhysicalFormatsMatch(current, expected)) return NO;
+	}
+	return YES;
+}
+
+- (BOOL)setPhysicalFormatSet:(NSDictionary<NSNumber *, NSValue *> *)formats {
+	return [self setStreamFormatSet:formats selector:kAudioStreamPropertyPhysicalFormat];
+}
+
+- (BOOL)setVirtualFormatSet:(NSDictionary<NSNumber *, NSValue *> *)formats {
+	return [self setStreamFormatSet:formats selector:kAudioStreamPropertyVirtualFormat];
+}
+
+- (BOOL)findMixableFormatForStream:(AudioStreamID)streamID
+	                     currentFormat:(AudioStreamBasicDescription)currentFormat
+	                 availableSelector:(AudioObjectPropertySelector)availableSelector
+	                            format:(AudioStreamBasicDescription *)selectedFormat {
+	AudioObjectPropertyAddress address = {
+		.mSelector = availableSelector,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	OSStatus status = AudioObjectGetPropertyDataSize(streamID, &address, 0, NULL, &size);
+	if(status != noErr || size < sizeof(AudioStreamRangedDescription)) return NO;
+
+	AudioStreamRangedDescription *descriptions = (AudioStreamRangedDescription *)malloc(size);
+	if(!descriptions) return NO;
+	status = AudioObjectGetPropertyData(streamID, &address, 0, NULL, &size, descriptions);
+	if(status != noErr) {
+		free(descriptions);
+		return NO;
+	}
+
+	BOOL found = NO;
+	uint64_t bestScore = UINT64_MAX;
+	AudioStreamBasicDescription bestFormat = { 0 };
+	const BOOL currentIsFloat = !!(currentFormat.mFormatFlags & kAudioFormatFlagIsFloat);
+	const BOOL currentIsSigned = !!(currentFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger);
+	const UInt32 currentBytes = AudioFormatBytesPerSample(currentFormat);
+	const UInt32 count = size / (UInt32)sizeof(AudioStreamRangedDescription);
+	for(UInt32 i = 0; i < count; ++i) {
+		AudioStreamBasicDescription candidate = descriptions[i].mFormat;
+		const UInt32 candidateBytes = AudioFormatBytesPerSample(candidate);
+		if(!RangedPhysicalFormatSupportsSampleRate(descriptions[i], currentFormat.mSampleRate) ||
+		   candidate.mFormatID != kAudioFormatLinearPCM ||
+		   (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ||
+		   !candidateBytes ||
+		   candidate.mFramesPerPacket != 1 ||
+		   candidate.mChannelsPerFrame != currentFormat.mChannelsPerFrame) continue;
+
+		// Prefer the exact shared-mode twin of the current representation. If a
+		// driver does not expose one, choose its closest mixable PCM format at the
+		// same clock so AUHAL can attach and perform its normal safe fallback.
+		const BOOL candidateIsFloat = !!(candidate.mFormatFlags & kAudioFormatFlagIsFloat);
+		const BOOL candidateIsSigned = !!(candidate.mFormatFlags & kAudioFormatFlagIsSignedInteger);
+		const uint64_t bitDelta = currentFormat.mBitsPerChannel > candidate.mBitsPerChannel ?
+		                                  currentFormat.mBitsPerChannel - candidate.mBitsPerChannel :
+		                                  candidate.mBitsPerChannel - currentFormat.mBitsPerChannel;
+		const uint64_t byteDelta = currentBytes > candidateBytes ?
+		                                   currentBytes - candidateBytes : candidateBytes - currentBytes;
+		uint64_t score = (candidateIsFloat != currentIsFloat) ? UINT64_C(1000000000000) : 0;
+		score += (candidateIsSigned != currentIsSigned) ? UINT64_C(1000000000) : 0;
+		score += bitDelta * UINT64_C(1000000);
+		score += byteDelta * UINT64_C(1000);
+		if(!!(candidate.mFormatFlags & kAudioFormatFlagIsBigEndian) !=
+		   !!(currentFormat.mFormatFlags & kAudioFormatFlagIsBigEndian)) score += 100;
+		if(!!(candidate.mFormatFlags & kAudioFormatFlagIsPacked) !=
+		   !!(currentFormat.mFormatFlags & kAudioFormatFlagIsPacked)) score += 10;
+		if(!!(candidate.mFormatFlags & kAudioFormatFlagIsAlignedHigh) !=
+		   !!(currentFormat.mFormatFlags & kAudioFormatFlagIsAlignedHigh)) score += 1;
+
+		if(!found || score < bestScore) {
+			found = YES;
+			bestScore = score;
+			bestFormat = candidate;
+			bestFormat.mSampleRate = currentFormat.mSampleRate;
+		}
+	}
+	free(descriptions);
+	if(found && selectedFormat) *selectedFormat = bestFormat;
+	return found;
+}
+
+- (BOOL)ensureMixableStreamFormatsForAUHAL {
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	if(!streams.count) return YES;
+
+	const AudioObjectPropertySelector currentSelectors[] = {
+		kAudioStreamPropertyPhysicalFormat,
+		kAudioStreamPropertyVirtualFormat,
+	};
+	const AudioObjectPropertySelector availableSelectors[] = {
+		kAudioStreamPropertyAvailablePhysicalFormats,
+		kAudioStreamPropertyAvailableVirtualFormats,
+	};
+	for(size_t selectorIndex = 0; selectorIndex < 2; ++selectorIndex) {
+		NSMutableDictionary<NSNumber *, NSValue *> *mixableFormats = [NSMutableDictionary dictionary];
+		for(NSNumber *streamNumber in streams) {
+			const AudioStreamID streamID = streamNumber.unsignedIntValue;
+			AudioStreamBasicDescription current = { 0 };
+			if(![self readStreamFormat:&current fromStream:streamID selector:currentSelectors[selectorIndex]]) return NO;
+			if(!(current.mFormatFlags & kAudioFormatFlagIsNonMixable)) continue;
+
+			AudioStreamBasicDescription mixableFormat = { 0 };
+			if(![self findMixableFormatForStream:streamID
+			                            currentFormat:current
+			                        availableSelector:availableSelectors[selectorIndex]
+			                                   format:&mixableFormat]) {
+				return NO;
+			}
+			mixableFormats[streamNumber] = PhysicalFormatValue(mixableFormat);
+		}
+		if(mixableFormats.count &&
+		   ![self setStreamFormatSet:mixableFormats selector:currentSelectors[selectorIndex]]) return NO;
+	}
+	return YES;
+}
+
+- (BOOL)ensureAUHALBoundToOutputDevice {
+	if(!_au || outputDeviceID == kAudioObjectUnknown || outputDeviceID == (AudioDeviceID)-1) return NO;
+	if(_au.deviceID == outputDeviceID) return YES;
+
+	NSError *error = nil;
+	if(![_au setDeviceID:outputDeviceID error:&error] || error != nil || _au.deviceID != outputDeviceID) {
+		ALog(@"Unable to bind AUHAL to output device %u (actual device %u): %@",
+		     (unsigned int)outputDeviceID,
+		     (unsigned int)_au.deviceID,
+		     error);
+		return NO;
+	}
+	return YES;
+}
+
+- (BOOL)exclusiveOutputLayoutSupportsClientFormat:(AudioStreamBasicDescription)clientFormat {
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	if(streams.count != 1) return NO;
+
+	AudioStreamBasicDescription virtualFormat = { 0 };
+	if(![self readVirtualFormat:&virtualFormat fromStream:streams.firstObject.unsignedIntValue] ||
+	   !StreamFormatsHaveSameSampleRepresentation(clientFormat, virtualFormat, NO) ||
+	   virtualFormat.mChannelsPerFrame != clientFormat.mChannelsPerFrame) return NO;
+
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyStreamConfiguration,
+		.mScope = kAudioDevicePropertyScopeOutput,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = 0;
+	if(AudioObjectGetPropertyDataSize(outputDeviceID, &address, 0, NULL, &size) != noErr ||
+	   size < sizeof(AudioBufferList)) return NO;
+	AudioBufferList *configuration = (AudioBufferList *)malloc(size);
+	if(!configuration) return NO;
+	OSStatus status = AudioObjectGetPropertyData(outputDeviceID, &address, 0, NULL, &size, configuration);
+	const BOOL supported = status == noErr && configuration->mNumberBuffers == 1 &&
+	                       configuration->mBuffers[0].mNumberChannels == clientFormat.mChannelsPerFrame;
+	free(configuration);
+	return supported;
+}
+
+- (UInt32)maximumFramesForExclusiveIOProc {
+	UInt32 maximumFrames = 0;
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyBufferFrameSize,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	UInt32 size = sizeof(maximumFrames);
+	AudioObjectGetPropertyData(outputDeviceID, &address, 0, NULL, &size, &maximumFrames);
+
+	address.mSelector = kAudioDevicePropertyBufferFrameSizeRange;
+	AudioValueRange range = { 0 };
+	size = sizeof(range);
+	if(AudioObjectGetPropertyData(outputDeviceID, &address, 0, NULL, &size, &range) == noErr &&
+	   range.mMaximum > 0.0 && range.mMaximum <= UINT32_MAX) {
+		maximumFrames = MAX(maximumFrames, (UInt32)ceil(range.mMaximum));
+	}
+	return maximumFrames;
+}
+
+- (void)setDeviceVolumeTo100ForExclusiveOutputIfSupported {
+	if(!setDeviceVolumeTo100ForExclusiveOutput ||
+	   outputDeviceID == kAudioObjectUnknown || outputDeviceID == (AudioDeviceID)-1) return;
+
+	// The virtual main control maps to a device's main volume when present, or
+	// to its relevant per-channel controls while preserving their balance.
+	const AudioObjectPropertySelector selectors[] = {
+		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+		kAudioDevicePropertyVolumeScalar,
+	};
+	BOOL foundSettableControl = NO;
+	OSStatus lastStatus = noErr;
+	for(size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); ++i) {
+		AudioObjectPropertyAddress address = {
+			.mSelector = selectors[i],
+			.mScope = kAudioDevicePropertyScopeOutput,
+			.mElement = kAudioObjectPropertyElementMaster
+		};
+		if(!AudioObjectHasProperty(outputDeviceID, &address)) continue;
+
+		Boolean settable = false;
+		lastStatus = AudioObjectIsPropertySettable(outputDeviceID, &address, &settable);
+		if(lastStatus != noErr || !settable) continue;
+		foundSettableControl = YES;
+
+		Float32 maximumVolume = 1.0f;
+		lastStatus = AudioObjectSetPropertyData(outputDeviceID,
+		                                            &address,
+		                                            0,
+		                                            NULL,
+		                                            sizeof(maximumVolume),
+		                                            &maximumVolume);
+		if(lastStatus == noErr) {
+			DLog(@"Set output device %u volume to 100%% for exclusive output",
+			     (unsigned int)outputDeviceID);
+			return;
+		}
+	}
+
+	if(foundSettableControl) {
+		ALog(@"Unable to set output device %u volume to 100%% for exclusive output: %d",
+		     (unsigned int)outputDeviceID, (int)lastStatus);
+	}
+}
+
+- (BOOL)createExclusiveIOProc {
+	if(exclusiveIOProcID) {
+		return exclusiveIOProcDeviceID == outputDeviceID;
+	}
+	if(!_outputRenderBlock || ![self exclusiveOutputLayoutSupportsClientFormat:renderFormat]) return NO;
+
+	exclusiveMaximumFramesToRender = [self maximumFramesForExclusiveIOProc];
+	if(!exclusiveMaximumFramesToRender || ![self prepareOutputDoubleScratchForRenderFormat:renderFormat]) {
+		exclusiveMaximumFramesToRender = 0;
+		return NO;
+	}
+
+	const UInt32 bytesPerFrame = renderFormat.mBytesPerFrame;
+	const UInt32 channels = renderFormat.mChannelsPerFrame;
+	AURenderPullInputBlock renderBlock = [_outputRenderBlock copy];
+	AudioDeviceIOProcID ioProcID = NULL;
+	OSStatus status = AudioDeviceCreateIOProcIDWithBlock(&ioProcID,
+	                                                    outputDeviceID,
+	                                                    NULL,
+	                                                    ^(const AudioTimeStamp *inNow,
+	                                                      const AudioBufferList *inInputData,
+	                                                      const AudioTimeStamp *inInputTime,
+	                                                      AudioBufferList *outOutputData,
+	                                                      const AudioTimeStamp *inOutputTime) {
+		if(!outOutputData || outOutputData->mNumberBuffers != 1 ||
+		   !outOutputData->mBuffers[0].mData ||
+		   outOutputData->mBuffers[0].mNumberChannels != channels || !bytesPerFrame) return;
+		const AUAudioFrameCount frameCount = outOutputData->mBuffers[0].mDataByteSize / bytesPerFrame;
+		if(!frameCount) return;
+		AudioUnitRenderActionFlags actionFlags = 0;
+		const AudioTimeStamp *timestamp = inOutputTime ?: inNow;
+		renderBlock(&actionFlags, timestamp, frameCount, 0, outOutputData);
+	});
+	if(status != noErr || !ioProcID) {
+		ALog(@"Unable to create direct HAL output callback for device %u: %d",
+		     (unsigned int)outputDeviceID, (int)status);
+		exclusiveMaximumFramesToRender = 0;
+		return NO;
+	}
+
+	exclusiveIOProcID = ioProcID;
+	exclusiveIOProcDeviceID = outputDeviceID;
+	exclusiveIOProcRunning = NO;
+	return YES;
+}
+
+- (void)destroyExclusiveIOProc {
+	if(!exclusiveIOProcID) return;
+	if(exclusiveIOProcRunning) {
+		AudioDeviceStop(exclusiveIOProcDeviceID, exclusiveIOProcID);
+		exclusiveIOProcRunning = NO;
+	}
+	OSStatus status = AudioDeviceDestroyIOProcID(exclusiveIOProcDeviceID, exclusiveIOProcID);
+	if(status != noErr) {
+		ALog(@"Unable to destroy direct HAL output callback for device %u: %d",
+		     (unsigned int)exclusiveIOProcDeviceID, (int)status);
+	}
+	exclusiveIOProcID = NULL;
+	exclusiveIOProcDeviceID = kAudioObjectUnknown;
+	exclusiveMaximumFramesToRender = 0;
+}
+
+- (BOOL)startCurrentHardware:(NSError **)error {
+	if(exclusiveIOProcID) {
+		if(exclusiveIOProcRunning) {
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
+			return YES;
+		}
+		OSStatus status = AudioDeviceStart(exclusiveIOProcDeviceID, exclusiveIOProcID);
+		if(status == noErr) {
+			exclusiveIOProcRunning = YES;
+			[self setDeviceVolumeTo100ForExclusiveOutputIfSupported];
+			return YES;
+		}
+		if(error) *error = [NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil];
+		return NO;
+	}
+	return [_au startHardwareAndReturnError:error];
+}
+
+- (void)stopCurrentHardware {
+	if(exclusiveIOProcID) {
+		if(exclusiveIOProcRunning) {
+			AudioDeviceStop(exclusiveIOProcDeviceID, exclusiveIOProcID);
+			exclusiveIOProcRunning = NO;
+		}
+		return;
+	}
+	[_au stopHardware];
+}
+
+- (BOOL)hogModeOwner:(pid_t *)owner forDevice:(AudioDeviceID)deviceID {
+	if(!owner || deviceID == kAudioObjectUnknown || deviceID == (AudioDeviceID)-1) return NO;
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyHogMode,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	if(!AudioObjectHasProperty(deviceID, &address)) return NO;
+	UInt32 size = sizeof(*owner);
+	*owner = -1;
+	return AudioObjectGetPropertyData(deviceID, &address, 0, NULL, &size, owner) == noErr &&
+	       size == sizeof(*owner);
+}
+
+- (BOOL)currentProcessOwnsHogMode {
+	pid_t owner = -1;
+	return [self hogModeOwner:&owner forDevice:outputDeviceID] && owner == getpid();
+}
+
+- (BOOL)acquireHogModeForCurrentDevice {
+	pid_t owner = -1;
+	if(![self hogModeOwner:&owner forDevice:outputDeviceID]) return NO;
+	if(owner == getpid()) {
+		hogModeOwned = YES;
+		hogModeDeviceID = outputDeviceID;
+		return YES;
+	}
+	if(owner != -1) return NO;
+
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyHogMode,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	Boolean settable = false;
+	if(AudioObjectIsPropertySettable(outputDeviceID, &address, &settable) != noErr || !settable) return NO;
+	pid_t request = getpid();
+	if(AudioObjectSetPropertyData(outputDeviceID, &address, 0, NULL, sizeof(request), &request) != noErr ||
+	   ![self hogModeOwner:&owner forDevice:outputDeviceID] || owner != getpid()) return NO;
+	hogModeOwned = YES;
+	hogModeDeviceID = outputDeviceID;
+	return YES;
+}
+
+- (BOOL)releaseHogModeForCurrentDevice {
+	if(!hogModeOwned || hogModeDeviceID != outputDeviceID) return YES;
+	pid_t owner = -1;
+	if(![self hogModeOwner:&owner forDevice:outputDeviceID]) return NO;
+	if(owner != getpid()) {
+		hogModeOwned = NO;
+		hogModeDeviceID = kAudioObjectUnknown;
+		return owner == -1;
+	}
+
+	AudioObjectPropertyAddress address = {
+		.mSelector = kAudioDevicePropertyHogMode,
+		.mScope = kAudioObjectPropertyScopeGlobal,
+		.mElement = kAudioObjectPropertyElementMaster
+	};
+	pid_t request = getpid();
+	if(AudioObjectSetPropertyData(outputDeviceID, &address, 0, NULL, sizeof(request), &request) != noErr ||
+	   ![self hogModeOwner:&owner forDevice:outputDeviceID] || owner == getpid()) return NO;
+	hogModeOwned = NO;
+	hogModeDeviceID = kAudioObjectUnknown;
+	return YES;
+}
+
+- (BOOL)currentOutputUsesExclusiveTransport {
+	if(!exclusiveIOProcID || exclusiveIOProcDeviceID != outputDeviceID) return NO;
+	const AudioStreamBasicDescription clientFormat = renderFormat;
+
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	if(!streams.count) return NO;
+	for(NSNumber *streamNumber in streams) {
+		AudioStreamBasicDescription virtualFormat = { 0 };
+		const AudioStreamID streamID = streamNumber.unsignedIntValue;
+		if(![self readVirtualFormat:&virtualFormat fromStream:streamID] ||
+		   !StreamFormatsHaveSameSampleRepresentation(clientFormat, virtualFormat, NO) ||
+		   fabs(clientFormat.mSampleRate - virtualFormat.mSampleRate) >= 1.0) return NO;
+	}
+	return [self currentProcessOwnsHogMode];
+}
+
+- (BOOL)currentOutputIsEndToEndInteger {
+	if(![self currentOutputUsesExclusiveTransport] || !AudioFormatIsSignedIntegerPCM(renderFormat)) return NO;
+
+	NSArray<NSNumber *> *streams = [self activeOutputPhysicalStreams];
+	for(NSNumber *streamNumber in streams) {
+		AudioStreamBasicDescription virtualFormat = { 0 }, physicalFormat = { 0 };
+		const AudioStreamID streamID = streamNumber.unsignedIntValue;
+		if(![self readVirtualFormat:&virtualFormat fromStream:streamID] ||
+		   ![self readPhysicalFormat:&physicalFormat fromStream:streamID] ||
+		   !AudioFormatIsSignedIntegerPCM(virtualFormat) ||
+		   !AudioFormatIsSignedIntegerPCM(physicalFormat) ||
+		   !PhysicalFormatsMatch(virtualFormat, physicalFormat) ||
+		   !(virtualFormat.mFormatFlags & kAudioFormatFlagIsNonMixable)) return NO;
+	}
+	return YES;
+}
+
+- (BOOL)applyPreferredVirtualFormatSetAtSampleRate:(double)sampleRate {
+	NSDictionary<NSNumber *, NSValue *> *preferredVirtualFormats = preferExclusiveIntegerTransport ?
+	                                                                  preferredIntegerVirtualFormats :
+	                                                                  (preferExclusiveFloatTransport ? preferredFloatVirtualFormats : nil);
+	if(preferredVirtualFormats.count) {
+		NSArray<NSNumber *> *streams = preferredVirtualFormats.allKeys;
+		NSDictionary<NSNumber *, NSValue *> *currentFormats = [self currentVirtualFormatSetForStreams:streams];
+		if(currentFormats.count != preferredVirtualFormats.count) return NO;
+		BOOL alreadyConfigured = YES;
+		for(NSNumber *streamNumber in preferredVirtualFormats) {
+			AudioStreamBasicDescription current = { 0 }, target = { 0 };
+			if(!GetPhysicalFormatValue(currentFormats[streamNumber], &current) ||
+			   !GetPhysicalFormatValue(preferredVirtualFormats[streamNumber], &target)) return NO;
+			target.mSampleRate = sampleRate;
+			if(!PhysicalFormatsMatch(current, target)) alreadyConfigured = NO;
+		}
+		if(alreadyConfigured) return YES;
+
+		const BOOL capturedOriginal = !savedVirtualFormatValid;
+		if(capturedOriginal) {
+			savedVirtualFormatValid = YES;
+			savedVirtualFormatDeviceID = outputDeviceID;
+			savedVirtualFormats = currentFormats;
+		}
+		if([self setVirtualFormatSet:preferredVirtualFormats]) return YES;
+		if(capturedOriginal) {
+			savedVirtualFormatValid = NO;
+			savedVirtualFormats = nil;
+		}
+		return NO;
+	}
+
+	if(!savedVirtualFormatValid || savedVirtualFormatDeviceID != outputDeviceID) return YES;
+	NSMutableDictionary<NSNumber *, NSValue *> *restoreFormats = [NSMutableDictionary dictionary];
+	for(NSNumber *streamNumber in savedVirtualFormats) {
+		AudioStreamBasicDescription representation = { 0 }, restoreFormat = { 0 };
+		if(!GetPhysicalFormatValue(savedVirtualFormats[streamNumber], &representation) ||
+		   ![self findVirtualFormatMatchingRepresentation:representation
+		                                     atSampleRate:sampleRate
+		                                         streamID:streamNumber.unsignedIntValue
+		                                            format:&restoreFormat]) return NO;
+		restoreFormats[streamNumber] = PhysicalFormatValue(restoreFormat);
+	}
+	if(![self setVirtualFormatSet:restoreFormats]) return NO;
+	savedVirtualFormatValid = NO;
+	savedVirtualFormats = nil;
+	return YES;
+}
+
+- (BOOL)restoreSavedVirtualFormatSetAtCurrentSampleRate {
+	if(!savedVirtualFormatValid || savedVirtualFormatDeviceID != outputDeviceID) return YES;
+	const BOOL previousIntegerPreference = preferExclusiveIntegerTransport;
+	const BOOL previousFloatPreference = preferExclusiveFloatTransport;
+	preferExclusiveIntegerTransport = NO;
+	preferExclusiveFloatTransport = NO;
+	const double sampleRate = [self currentDeviceSampleRate];
+	const BOOL restored = sampleRate > 0.0 && [self applyPreferredVirtualFormatSetAtSampleRate:sampleRate];
+	preferExclusiveIntegerTransport = previousIntegerPreference;
+	preferExclusiveFloatTransport = previousFloatPreference;
+	return restored;
+}
+
+- (BOOL)applyPreferredPhysicalFormatSetAtSampleRate:(double)sampleRate {
+	if(preferIntegerPhysicalOutput) {
+		NSArray<NSNumber *> *streams = preferredIntegerPhysicalFormats.allKeys;
+		NSDictionary<NSNumber *, NSValue *> *currentFormats = [self currentPhysicalFormatSetForStreams:streams];
+		if(currentFormats.count != preferredIntegerPhysicalFormats.count) return NO;
+		BOOL alreadyConfigured = YES;
+		for(NSNumber *streamNumber in preferredIntegerPhysicalFormats) {
+			AudioStreamBasicDescription current = { 0 }, target = { 0 };
+			if(!GetPhysicalFormatValue(currentFormats[streamNumber], &current) ||
+			   !GetPhysicalFormatValue(preferredIntegerPhysicalFormats[streamNumber], &target)) return NO;
+			target.mSampleRate = sampleRate;
+			if(!PhysicalFormatsMatch(current, target)) alreadyConfigured = NO;
+		}
+		if(alreadyConfigured) return YES;
+
+		const BOOL capturedOriginal = !savedPhysicalFormatValid;
+		if(capturedOriginal) {
+			savedPhysicalFormatValid = YES;
+			savedPhysicalFormatDeviceID = outputDeviceID;
+			savedPhysicalFormats = currentFormats;
+		}
+		if([self setPhysicalFormatSet:preferredIntegerPhysicalFormats]) return YES;
+		if(capturedOriginal) {
+			savedPhysicalFormatValid = NO;
+			savedPhysicalFormats = nil;
+		}
+		return NO;
+	}
+
+	if(!savedPhysicalFormatValid || savedPhysicalFormatDeviceID != outputDeviceID) return YES;
+	NSMutableDictionary<NSNumber *, NSValue *> *restoreFormats = [NSMutableDictionary dictionary];
+	for(NSNumber *streamNumber in savedPhysicalFormats) {
+		AudioStreamBasicDescription representation = { 0 }, restoreFormat = { 0 };
+		if(!GetPhysicalFormatValue(savedPhysicalFormats[streamNumber], &representation) ||
+		   ![self findPhysicalFormatMatchingRepresentation:representation
+		                                      atSampleRate:sampleRate
+		                                          streamID:streamNumber.unsignedIntValue
+		                                             format:&restoreFormat]) return NO;
+		restoreFormats[streamNumber] = PhysicalFormatValue(restoreFormat);
+	}
+	if(![self setPhysicalFormatSet:restoreFormats]) return NO;
+	savedPhysicalFormatValid = NO;
+	savedPhysicalFormats = nil;
+	return YES;
+}
+
+- (BOOL)restoreSavedPhysicalFormatSetAtCurrentSampleRate {
+	if(!savedPhysicalFormatValid || savedPhysicalFormatDeviceID != outputDeviceID) return YES;
+	const BOOL previousPreference = preferIntegerPhysicalOutput;
+	preferIntegerPhysicalOutput = NO;
+	const double sampleRate = [self currentDeviceSampleRate];
+	const BOOL restored = sampleRate > 0.0 && [self applyPreferredPhysicalFormatSetAtSampleRate:sampleRate];
+	preferIntegerPhysicalOutput = previousPreference;
+	return restored;
+}
+
+- (void)configureSharedIntegerOutputAtSampleRate:(double)sampleRate
+	                                  requiredBits:(UInt32)requiredBits
+	                             requireDoPCarrier:(BOOL)requireDoPCarrier {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	preferExclusiveIntegerTransport = NO;
+	preferredIntegerTransportRequiresHog = NO;
+	preferredIntegerVirtualFormats = nil;
+	preferredIntegerPhysicalFormats = [self integerPhysicalFormatSetForSampleRate:sampleRate
+	                                                                  requiredBits:requiredBits
+	                                                             requireDoPCarrier:requireDoPCarrier];
+	preferIntegerPhysicalOutput = preferredIntegerPhysicalFormats.count > 0;
+	if(!preferIntegerPhysicalOutput) {
+		preferredIntegerPhysicalFormats = nil;
+		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+	} else if(requireDoPCarrier) {
+		preferredIntegerClientFormat = DoPIntegerRenderFormatForDeviceFormat(deviceFormat);
+	} else {
+		preferredIntegerClientFormat = IntegerClientFormatForSourceBits(requiredBits,
+		                                                              sampleRate,
+		                                                              deviceFormat.mChannelsPerFrame);
+	}
+}
+
+- (void)configurePreferredIntegerOutputAtSampleRate:(double)sampleRate
+	                                     requiredBits:(UInt32)requiredBits
+	                                requireDoPCarrier:(BOOL)requireDoPCarrier {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	if(exclusiveOutputEnabled) {
+		NSDictionary<NSNumber *, NSValue *> *virtualFormats = nil;
+		NSDictionary<NSNumber *, NSValue *> *physicalFormats = nil;
+		AudioStreamBasicDescription clientFormat = { 0 };
+		BOOL requiresHog = NO;
+		if([self findEndToEndIntegerFormatSetsForSampleRate:sampleRate
+		                                          requiredBits:requiredBits
+		                                     requireDoPCarrier:requireDoPCarrier
+		                                        virtualFormats:&virtualFormats
+		                                       physicalFormats:&physicalFormats
+		                                           clientFormat:&clientFormat
+		                                            requiresHog:&requiresHog]) {
+			preferExclusiveIntegerTransport = YES;
+			preferredIntegerTransportRequiresHog = requiresHog;
+			preferredIntegerVirtualFormats = virtualFormats;
+			preferredIntegerPhysicalFormats = physicalFormats;
+			preferredIntegerClientFormat = clientFormat;
+			preferIntegerPhysicalOutput = YES;
+			return;
+		}
+	}
+	[self configureSharedIntegerOutputAtSampleRate:sampleRate
+	                                      requiredBits:requiredBits
+	                                 requireDoPCarrier:requireDoPCarrier];
+}
+
+- (void)configurePreferredFloatOutputForInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                      sampleRate:(double)sampleRate {
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	if(!exclusiveOutputEnabled) return;
+
+	NSDictionary<NSNumber *, NSValue *> *virtualFormats = nil;
+	AudioStreamBasicDescription clientFormat = { 0 };
+	if([self findExclusiveFloatVirtualFormatSetForInputFormat:inputFormat
+	                                              sampleRate:sampleRate
+	                                           virtualFormats:&virtualFormats
+	                                              clientFormat:&clientFormat]) {
+		preferExclusiveFloatTransport = YES;
+		preferredFloatVirtualFormats = virtualFormats;
+		preferredFloatClientFormat = clientFormat;
+	}
 }
 
 - (BOOL)deviceSupportsSampleRate:(double)sampleRate {
@@ -1106,26 +2556,46 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)updateDeviceFormatLockedNotifyingController:(BOOL)notifyController requestedSampleRate:(double)requestedSampleRate {
-	AVAudioFormat *format = _au.outputBusses[0].format;
+	const BOOL targetDoPInteger = preferDoPIntegerOutput;
+	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
+	const BOOL targetIntegerPhysical = preferIntegerPhysicalOutput;
+	const BOOL targetEndToEndInteger = preferExclusiveIntegerTransport;
+	const BOOL targetExclusiveFloat = preferExclusiveFloatTransport && preferredFloatVirtualFormats.count > 0;
+	const BOOL targetExclusiveTransport = targetEndToEndInteger || targetExclusiveFloat;
+	AVAudioFormat *format = nil;
+	if(targetEndToEndInteger) {
+		AudioStreamBasicDescription exclusiveFormat = preferredIntegerClientFormat;
+		if(requestedSampleRate > 0.0) exclusiveFormat.mSampleRate = requestedSampleRate;
+		format = [[AVAudioFormat alloc] initWithStreamDescription:&exclusiveFormat];
+	} else if(targetExclusiveFloat) {
+		AudioStreamBasicDescription exclusiveFormat = preferredFloatClientFormat;
+		if(requestedSampleRate > 0.0) exclusiveFormat.mSampleRate = requestedSampleRate;
+		format = [[AVAudioFormat alloc] initWithStreamDescription:&exclusiveFormat];
+	} else {
+		format = _au.outputBusses[0].format;
+	}
 	if(!format) {
 		return NO;
 	}
 
-	const BOOL targetDoPInteger = preferDoPIntegerOutput;
-	const BOOL targetNativeHighPrecision = preferNativeHighPrecisionOutput && !targetDoPInteger;
 	const BOOL nativeFormatChanged = targetNativeHighPrecision &&
 	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
+	const BOOL integerPhysicalFormatChanged = targetIntegerPhysical &&
+	                                          !PhysicalFormatsHaveSameRepresentation(renderFormat, preferredIntegerClientFormat);
 	const BOOL requestedSampleRateChanged = requestedSampleRate > 0.0 &&
 	                                        fabs(renderFormat.mSampleRate - requestedSampleRate) >= 1.0;
 	if(outputDeviceIDChanged || !_deviceFormat || ![_deviceFormat isEqual:format] ||
 	   renderFormatDoPInteger != targetDoPInteger ||
 	   renderFormatNativeHighPrecision != targetNativeHighPrecision ||
-	   nativeFormatChanged || requestedSampleRateChanged) {
+	   renderFormatIntegerPhysical != targetIntegerPhysical ||
+	   renderFormatEndToEndInteger != targetEndToEndInteger ||
+	   nativeFormatChanged || integerPhysicalFormatChanged || requestedSampleRateChanged) {
 		NSError *err = nil;
 		AVAudioFormat *renderAVFormat;
 
 		_deviceFormat = format;
 		deviceFormat = *(format.streamDescription);
+		const UInt32 bytesPerSample = AudioFormatBytesPerSample(deviceFormat);
 
 		/// Seems some 3rd party devices return incorrect stuff...or I just don't like noninterleaved data.
 		deviceFormat.mFormatFlags &= ~kLinearPCMFormatFlagIsNonInterleaved;
@@ -1145,7 +2615,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(deviceFormat.mChannelsPerFrame > 8) {
 			deviceFormat.mChannelsPerFrame = 8;
 		}
-		deviceFormat.mBytesPerFrame = deviceFormat.mChannelsPerFrame * (deviceFormat.mBitsPerChannel / 8);
+		deviceFormat.mBytesPerFrame = deviceFormat.mChannelsPerFrame * bytesPerSample;
 		deviceFormat.mBytesPerPacket = deviceFormat.mBytesPerFrame * deviceFormat.mFramesPerPacket;
 
 		/* Set the channel layout for the audio queue */
@@ -1193,19 +2663,29 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
 			renderFormat.mBytesPerFrame = (UInt32)((renderFormat.mBitsPerChannel / 8) * renderFormat.mChannelsPerFrame);
 			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
+		} else if(targetIntegerPhysical) {
+			renderFormat = preferredIntegerClientFormat;
+			renderFormat.mSampleRate = deviceFormat.mSampleRate;
+			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerFrame = AudioFormatBytesPerSample(preferredIntegerClientFormat) * renderFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
 		} else {
 			renderFormat = deviceFormat;
 		}
 		renderAVFormat = [[AVAudioFormat alloc] initWithStreamDescription:&renderFormat channelLayout:[[AVAudioChannelLayout alloc] initWithLayoutTag:tag]];
 		resetting = YES;
-		[_au stopHardware];
-		if(renderAVFormat) {
+		[self stopCurrentHardware];
+		if(renderAVFormat && !targetExclusiveTransport) {
 			[_au.inputBusses[0] setFormat:renderAVFormat error:&err];
 		}
 		// DoP is already a packed bitstream at this point. A float fallback would
 		// corrupt it, so leave the previous bus representation in place and let the
 		// enclosing transaction restore the previous device clock.
 		if((!renderAVFormat || err != nil) && targetDoPInteger) {
+			resetting = NO;
+			return NO;
+		}
+		if((!renderAVFormat || err != nil) && targetIntegerPhysical) {
 			resetting = NO;
 			return NO;
 		}
@@ -1229,6 +2709,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		}
 		renderFormatDoPInteger = targetDoPInteger && preferDoPIntegerOutput;
 		renderFormatNativeHighPrecision = targetNativeHighPrecision && preferNativeHighPrecisionOutput;
+		renderFormatIntegerPhysical = targetIntegerPhysical && preferIntegerPhysicalOutput;
+		if(!targetEndToEndInteger) renderFormatEndToEndInteger = NO;
 
 		if(notifyController) {
 			[outputController setFormat:&deviceFormat channelConfig:deviceChannelConfig];
@@ -1242,11 +2724,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		resetting = NO;
 	}
 
-	// Logical tracks from the same source (for example, adjacent entries in a
-	// cue sheet) normally keep the existing AUHAL format. Re-publish it after
-	// every successful preparation so a track transition cannot leave a stale
-	// stopped-state indication merely because no hardware format changed.
-	[self postOutputFormatDescription:outputFormatDescription(renderFormat, renderFormatDoPInteger)];
 	return YES;
 }
 
@@ -1257,6 +2734,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		// before asking the DAC to change clocks or carrier representation.
 		const BOOL hardwareWasRunning = [self hardwareIsRunning];
 		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		const BOOL previousExclusiveIOProcCreated = exclusiveIOProcID != NULL;
 		const BOOL previousPaused = paused;
 		const double previousSampleRate = [self currentDeviceSampleRate];
 		AVAudioFormat *previousInputFormat = _au.inputBusses[0].format;
@@ -1266,16 +2744,84 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		const uint32_t previousDeviceChannelConfig = deviceChannelConfig;
 		const BOOL previousRenderFormatDoPInteger = renderFormatDoPInteger;
 		const BOOL previousRenderFormatNativeHighPrecision = renderFormatNativeHighPrecision;
+		const BOOL previousRenderFormatIntegerPhysical = renderFormatIntegerPhysical;
+		const BOOL previousRenderFormatEndToEndInteger = renderFormatEndToEndInteger;
+		const BOOL previousHogModeOwned = [self currentProcessOwnsHogMode];
+		const BOOL previousExclusiveFloat = previousExclusiveIOProcCreated && previousHogModeOwned &&
+		                                    (AudioFormatIsFloat32(previousRenderFormat) ||
+		                                     AudioFormatIsFloat64(previousRenderFormat));
+		if(previousHogModeOwned) {
+			hogModeOwned = YES;
+			hogModeDeviceID = outputDeviceID;
+		}
+		NSArray<NSNumber *> *previousPhysicalStreams = [self activeOutputPhysicalStreams];
+		NSDictionary<NSNumber *, NSValue *> *previousPhysicalFormats =
+		    [self currentPhysicalFormatSetForStreams:previousPhysicalStreams];
+		NSDictionary<NSNumber *, NSValue *> *previousVirtualFormats =
+		    [self currentVirtualFormatSetForStreams:previousPhysicalStreams];
+		const BOOL previousPhysicalFormatsValid =
+		    previousPhysicalStreams.count && previousPhysicalFormats.count == previousPhysicalStreams.count;
+		const BOOL previousVirtualFormatsValid =
+		    previousPhysicalStreams.count && previousVirtualFormats.count == previousPhysicalStreams.count;
+		const BOOL previousSavedPhysicalFormatValid = savedPhysicalFormatValid;
+		const AudioDeviceID previousSavedPhysicalFormatDeviceID = savedPhysicalFormatDeviceID;
+		NSDictionary<NSNumber *, NSValue *> *previousSavedPhysicalFormats = savedPhysicalFormats;
+		const BOOL previousSavedVirtualFormatValid = savedVirtualFormatValid;
+		const AudioDeviceID previousSavedVirtualFormatDeviceID = savedVirtualFormatDeviceID;
+		NSDictionary<NSNumber *, NSValue *> *previousSavedVirtualFormats = savedVirtualFormats;
+		const BOOL targetEndToEndInteger = preferExclusiveIntegerTransport &&
+		                                     preferredIntegerVirtualFormats.count > 0 &&
+		                                     preferredIntegerPhysicalFormats.count > 0;
+		const BOOL targetExclusiveFloat = preferExclusiveFloatTransport &&
+		                                  preferredFloatVirtualFormats.count > 0 &&
+		                                  (AudioFormatIsFloat32(preferredFloatClientFormat) ||
+		                                   AudioFormatIsFloat64(preferredFloatClientFormat));
+		const BOOL targetExclusiveTransport = targetEndToEndInteger || targetExclusiveFloat;
+		const BOOL targetRequiresHog = targetExclusiveFloat ||
+		                              (targetEndToEndInteger && preferredIntegerTransportRequiresHog);
 
 		resetting = YES;
 		if(hardwareWasRunning) {
-			[_au stopHardware];
+			[self stopCurrentHardware];
 		}
 		if(renderResourcesWereAllocated) {
 			[_au deallocateRenderResources];
 		}
+		if(previousExclusiveIOProcCreated) {
+			[self destroyExclusiveIOProc];
+		}
 
-		BOOL prepared = [self setDeviceSampleRate:sampleRate];
+		BOOL prepared = !targetRequiresHog || [self acquireHogModeForCurrentDevice];
+		if(prepared && targetExclusiveTransport) {
+			// Integer transport changes both sides of the stream. Float-exclusive
+			// transport changes only the client/virtual representation, leaving the
+			// driver's physical representation under its own generic negotiation.
+			if(targetEndToEndInteger && !savedPhysicalFormatValid && previousPhysicalFormatsValid) {
+				savedPhysicalFormatValid = YES;
+				savedPhysicalFormatDeviceID = outputDeviceID;
+				savedPhysicalFormats = previousPhysicalFormats;
+			}
+			if(!savedVirtualFormatValid && previousVirtualFormatsValid) {
+				savedVirtualFormatValid = YES;
+				savedVirtualFormatDeviceID = outputDeviceID;
+				savedVirtualFormats = previousVirtualFormats;
+			}
+		}
+		if(prepared) {
+			prepared = [self setDeviceSampleRate:sampleRate];
+		}
+		if(prepared) {
+			prepared = [self applyPreferredPhysicalFormatSetAtSampleRate:sampleRate];
+		}
+		if(prepared) {
+			prepared = [self applyPreferredVirtualFormatSetAtSampleRate:sampleRate];
+		}
+		if(prepared && !targetRequiresHog && hogModeOwned) {
+			prepared = [self releaseHogModeForCurrentDevice];
+		}
+		if(prepared && !targetExclusiveTransport) {
+			prepared = [self ensureAUHALBoundToOutputDevice];
+		}
 		if(prepared) {
 			outputdevicechanged = YES;
 			prepared = [self updateDeviceFormatLockedNotifyingController:NO requestedSampleRate:sampleRate];
@@ -1283,23 +2829,37 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		NSError *resourceError = nil;
 		if(prepared) {
-			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+			if(targetExclusiveTransport) {
+				prepared = [self createExclusiveIOProc];
+			} else {
+				prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil;
+			}
 		}
-		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
-		if(prepared && (!configuredInputFormat || fabs(configuredInputFormat.sampleRate - sampleRate) >= 1.0)) {
+		AVAudioFormat *configuredInputFormat = targetExclusiveTransport ? nil : _au.inputBusses[0].format;
+		if(prepared && !targetExclusiveTransport &&
+		   (!configuredInputFormat || fabs(configuredInputFormat.sampleRate - sampleRate) >= 1.0)) {
 			ALog(@"Core Audio retained a stale input-bus rate (requested %.0f Hz, got %.0f Hz)",
 			     sampleRate, configuredInputFormat ? configuredInputFormat.sampleRate : 0.0);
+			prepared = NO;
+		}
+		if(prepared && targetExclusiveTransport && ![self currentOutputUsesExclusiveTransport]) {
+			ALog(@"Core Audio did not retain the requested exclusive client and virtual format");
+			prepared = NO;
+		}
+		if(prepared && targetEndToEndInteger && ![self currentOutputIsEndToEndInteger]) {
+			ALog(@"Core Audio did not retain a matching integer virtual and physical format");
 			prepared = NO;
 		}
 
 		if(!prepared) {
 			ALog(@"Unable to apply Core Audio device format; restoring the previous output: %@", resourceError);
-			[_au stopHardware];
+			[self stopCurrentHardware];
 			if(_au.renderResourcesAllocated) {
 				[_au deallocateRenderResources];
 			}
+			[self destroyExclusiveIOProc];
 
-			// Restore the preferences that describe the last format AUHAL actually
+			// Restore the preferences that describe the last backend that actually
 			// rendered, rather than leaving a rejected DoP request latched.
 			preferDoPIntegerOutput = previousRenderFormatDoPInteger;
 			preferredDoPCarrierSampleRate = previousRenderFormatDoPInteger ? previousRenderFormat.mSampleRate : 0.0;
@@ -1309,17 +2869,48 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			} else {
 				bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 			}
+			preferIntegerPhysicalOutput = previousRenderFormatIntegerPhysical;
+			if(previousRenderFormatIntegerPhysical && previousPhysicalFormatsValid) {
+				preferredIntegerPhysicalFormats = previousPhysicalFormats;
+				preferredIntegerClientFormat = previousRenderFormat;
+			} else {
+				preferredIntegerPhysicalFormats = nil;
+				bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			}
+			preferExclusiveIntegerTransport = previousRenderFormatEndToEndInteger;
+			preferredIntegerTransportRequiresHog = previousHogModeOwned;
+			preferredIntegerVirtualFormats = previousRenderFormatEndToEndInteger && previousVirtualFormatsValid ?
+			                                     previousVirtualFormats : nil;
+			preferExclusiveFloatTransport = previousExclusiveFloat;
+			preferredFloatVirtualFormats = previousExclusiveFloat && previousVirtualFormatsValid ?
+			                                  previousVirtualFormats : nil;
+			if(previousExclusiveFloat) {
+				preferredFloatClientFormat = previousRenderFormat;
+			} else {
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+			}
 
 			BOOL restored = YES;
-			if(previousSampleRate > 0.0 && fabs(previousSampleRate - [self currentDeviceSampleRate]) >= 1.0) {
-				restored = [self setDeviceSampleRate:previousSampleRate];
+			if(previousHogModeOwned && ![self currentProcessOwnsHogMode]) {
+				restored = [self acquireHogModeForCurrentDevice];
 			}
-			NSError *rollbackError = nil;
-			if(previousInputFormat) {
-				[_au.inputBusses[0] setFormat:previousInputFormat error:&rollbackError];
-				restored = restored && rollbackError == nil;
-			} else {
-				restored = NO;
+			if(previousSampleRate > 0.0 && fabs(previousSampleRate - [self currentDeviceSampleRate]) >= 1.0) {
+				restored = [self setDeviceSampleRate:previousSampleRate] && restored;
+			}
+			if(previousPhysicalFormatsValid) {
+				restored = [self setPhysicalFormatSet:previousPhysicalFormats] && restored;
+			}
+			if(previousVirtualFormatsValid) {
+				restored = [self setVirtualFormatSet:previousVirtualFormats] && restored;
+			}
+			savedPhysicalFormatValid = previousSavedPhysicalFormatValid;
+			savedPhysicalFormatDeviceID = previousSavedPhysicalFormatDeviceID;
+			savedPhysicalFormats = previousSavedPhysicalFormats;
+			savedVirtualFormatValid = previousSavedVirtualFormatValid;
+			savedVirtualFormatDeviceID = previousSavedVirtualFormatDeviceID;
+			savedVirtualFormats = previousSavedVirtualFormats;
+			if(!previousHogModeOwned && hogModeOwned) {
+				restored = [self releaseHogModeForCurrentDevice] && restored;
 			}
 
 			_deviceFormat = previousDeviceAVFormat;
@@ -1328,8 +2919,23 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			deviceChannelConfig = previousDeviceChannelConfig;
 			renderFormatDoPInteger = previousRenderFormatDoPInteger;
 			renderFormatNativeHighPrecision = previousRenderFormatNativeHighPrecision;
-			rollbackError = nil;
-			restored = [_au allocateRenderResourcesAndReturnError:&rollbackError] && rollbackError == nil && restored;
+			renderFormatIntegerPhysical = previousRenderFormatIntegerPhysical;
+			renderFormatEndToEndInteger = previousRenderFormatEndToEndInteger;
+			NSError *rollbackError = nil;
+			if(previousExclusiveIOProcCreated) {
+				restored = [self createExclusiveIOProc] && restored;
+			} else {
+				restored = [self ensureAUHALBoundToOutputDevice] && restored;
+				if(previousInputFormat) {
+					[_au.inputBusses[0] setFormat:previousInputFormat error:&rollbackError];
+					restored = restored && rollbackError == nil;
+				} else {
+					restored = NO;
+				}
+				rollbackError = nil;
+				restored = [_au allocateRenderResourcesAndReturnError:&rollbackError] &&
+				           rollbackError == nil && restored;
+			}
 			doPActive = previousRenderFormatDoPInteger;
 			doPSeekPending = previousRenderFormatDoPInteger;
 			doPMarker = 0x05;
@@ -1344,6 +2950,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			return NO;
 		}
 
+		renderFormatEndToEndInteger = targetEndToEndInteger;
 		outputdevicechanged = NO;
 		restarted = NO;
 		resetting = NO;
@@ -1359,11 +2966,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	@synchronized(self) {
 		const BOOL hardwareWasRunning = [self hardwareIsRunning];
 		const BOOL renderResourcesWereAllocated = _au.renderResourcesAllocated;
+		const BOOL exclusiveIOProcWasCreated = exclusiveIOProcID != NULL;
 		if(hardwareWasRunning) {
-			[_au stopHardware];
+			[self stopCurrentHardware];
 		}
 		if(renderResourcesWereAllocated) {
 			[_au deallocateRenderResources];
+		}
+		if(exclusiveIOProcWasCreated) {
+			[self destroyExclusiveIOProc];
 		}
 
 		double requestedSampleRate = 0.0;
@@ -1402,13 +3013,16 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			}
 		}
 
+		const BOOL preferExclusiveTransport = preferExclusiveIntegerTransport || preferExclusiveFloatTransport;
 		BOOL prepared = [self updateDeviceFormatLockedNotifyingController:notifyController requestedSampleRate:requestedSampleRate];
-		if(renderResourcesWereAllocated) {
+		if(prepared && preferExclusiveTransport) {
+			prepared = [self createExclusiveIOProc];
+		} else if(renderResourcesWereAllocated) {
 			NSError *resourceError = nil;
 			prepared = [_au allocateRenderResourcesAndReturnError:&resourceError] && resourceError == nil && prepared;
 		}
-		AVAudioFormat *configuredInputFormat = _au.inputBusses[0].format;
-		if(prepared && (!configuredInputFormat ||
+		AVAudioFormat *configuredInputFormat = preferExclusiveTransport ? nil : _au.inputBusses[0].format;
+		if(prepared && !preferExclusiveTransport && (!configuredInputFormat ||
 		                fabs(configuredInputFormat.sampleRate - renderFormat.mSampleRate) >= 1.0)) {
 			prepared = NO;
 		}
@@ -1426,7 +3040,11 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)updateDeviceFormat {
-	return [self updateDeviceFormatNotifyingController:YES];
+	BOOL prepared = [self updateDeviceFormatNotifyingController:YES];
+	if(prepared) {
+		[self refreshOutputStatus];
+	}
+	return prepared;
 }
 
 - (AudioStreamBasicDescription)outputFormatForInputFormat:(AudioStreamBasicDescription)inputFormat {
@@ -1446,6 +3064,17 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 }
 
 - (BOOL)prepareForInputFormat:(AudioStreamBasicDescription)inputFormat {
+	// Treat the source description and the corresponding hardware transaction as
+	// one handoff. Changing a device clock/stream format invokes Core Audio
+	// listeners asynchronously; without this outer lock, the output thread can
+	// observe that notification before sourceFormat is committed and immediately
+	// renegotiate the outgoing track's format over the replacement track.
+	@synchronized(self) {
+		return [self prepareForInputFormatLocked:inputFormat];
+	}
+}
+
+- (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat {
 	const uint32_t inputChannelConfig = [outputController currentInputChannelConfig];
 	const BOOL inputFormatValid = inputFormat.mFormatID != 0 &&
 	                              inputFormat.mSampleRate > 0.0 &&
@@ -1486,6 +3115,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	}
 
 	if(!usesDoPCarrier) {
+		DLog(@"Preparing PCM source %@ (exclusive enabled: %@, source rate supported: %@)",
+		     outputFormatDescription(inputFormat, NO),
+		     exclusiveOutputEnabled ? @"yes" : @"no",
+		     sampleRateSupported ? @"yes" : @"no");
 		// A pending DoP seek is only meaningful while another DoP carrier is
 		// expected. If playback moves to PCM before that carrier arrives, do not
 		// keep replacing PCM buffers with DoP silence indefinitely.
@@ -1504,6 +3137,30 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		} else {
 			bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		}
+		if(sampleRateSupported && AudioFormatIsIntegerPCM(inputFormat) && inputFormat.mBitsPerChannel <= 32) {
+			[self configurePreferredIntegerOutputAtSampleRate:sampleRate
+			                                       requiredBits:inputFormat.mBitsPerChannel
+			                                  requireDoPCarrier:NO];
+		} else if(sampleRateSupported &&
+		          (AudioFormatIsFloat32(inputFormat) || AudioFormatIsFloat64(inputFormat))) {
+			preferExclusiveIntegerTransport = NO;
+			preferredIntegerTransportRequiresHog = NO;
+			preferredIntegerVirtualFormats = nil;
+			preferIntegerPhysicalOutput = NO;
+			preferredIntegerPhysicalFormats = nil;
+			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			[self configurePreferredFloatOutputForInputFormat:inputFormat sampleRate:sampleRate];
+		} else {
+			preferExclusiveIntegerTransport = NO;
+			preferredIntegerTransportRequiresHog = NO;
+			preferredIntegerVirtualFormats = nil;
+			preferExclusiveFloatTransport = NO;
+			preferredFloatVirtualFormats = nil;
+			preferIntegerPhysicalOutput = NO;
+			preferredIntegerPhysicalFormats = nil;
+			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+		}
 
 		// A matching hardware clock is a prerequisite for bit-perfect PCM.
 		// Unsupported rates still play through the existing converter fallback.
@@ -1511,17 +3168,71 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 			// The queued converter was intentionally configured for this source
 			// rate. Do not silently hand it to AUHAL for hidden SRC if the clock
 			// and render-format transition cannot be completed together.
+			const BOOL requestedExclusiveOutput = preferExclusiveIntegerTransport || preferExclusiveFloatTransport;
+			const BOOL requestedIntegerPhysicalOutput = preferIntegerPhysicalOutput;
 			BOOL prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
+			if(!prepared && requestedExclusiveOutput) {
+				ALog(@"Exclusive output was unavailable; retrying with shared Core Audio output");
+				preferDoPIntegerOutput = NO;
+				preferredDoPCarrierSampleRate = 0.0;
+				preferNativeHighPrecisionOutput = highPrecisionPCM && sampleRateSupported &&
+				                                    inputFormat.mChannelsPerFrame == deviceFormat.mChannelsPerFrame;
+				if(preferNativeHighPrecisionOutput) {
+					preferredNativeHighPrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
+					preferredNativeHighPrecisionFormat.mSampleRate = sampleRate;
+				}
+				if(AudioFormatIsIntegerPCM(inputFormat)) {
+					[self configureSharedIntegerOutputAtSampleRate:sampleRate
+					                                      requiredBits:inputFormat.mBitsPerChannel
+					                                 requireDoPCarrier:NO];
+				} else {
+					preferExclusiveIntegerTransport = NO;
+					preferredIntegerTransportRequiresHog = NO;
+					preferredIntegerVirtualFormats = nil;
+					preferExclusiveFloatTransport = NO;
+					preferredFloatVirtualFormats = nil;
+					preferIntegerPhysicalOutput = NO;
+					preferredIntegerPhysicalFormats = nil;
+					bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+					bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+				}
+				prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
+			}
+			if(!prepared && requestedIntegerPhysicalOutput) {
+				// A driver can advertise a physical format but reject it while another
+				// client owns the device. Preserve ordinary PCM playback in that case.
+				ALog(@"Integer physical output was rejected; retrying with the Core Audio mixable format");
+				preferDoPIntegerOutput = NO;
+				preferredDoPCarrierSampleRate = 0.0;
+				preferNativeHighPrecisionOutput = highPrecisionPCM && sampleRateSupported &&
+				                                    inputFormat.mChannelsPerFrame == deviceFormat.mChannelsPerFrame;
+				if(preferNativeHighPrecisionOutput) {
+					preferredNativeHighPrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
+					preferredNativeHighPrecisionFormat.mSampleRate = sampleRate;
+				}
+				preferIntegerPhysicalOutput = NO;
+				preferredIntegerPhysicalFormats = nil;
+				preferExclusiveIntegerTransport = NO;
+				preferredIntegerTransportRequiresHog = NO;
+				preferredIntegerVirtualFormats = nil;
+				preferExclusiveFloatTransport = NO;
+				preferredFloatVirtualFormats = nil;
+				bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+				prepared = [self applyDeviceSampleRateAndFormat:outputSampleRate];
+			}
 			if(prepared) {
 				sourceFormat = inputFormat;
 				sourceChannelConfig = inputChannelConfig;
 				sourceFormatValid = inputFormatValid;
-				hdcdDetected = NO;
+				[self refreshOutputStatus];
 			}
 			return prepared;
 		}
 
-		if(renderFormatDoPInteger || renderFormatNativeHighPrecision) {
+		if(renderFormatDoPInteger || renderFormatNativeHighPrecision || renderFormatIntegerPhysical ||
+		   renderFormatEndToEndInteger || exclusiveIOProcID || savedPhysicalFormatValid ||
+		   savedVirtualFormatValid || hogModeOwned) {
 			const double currentSampleRate = [self currentDeviceSampleRate];
 			BOOL prepared = currentSampleRate > 0.0 ? [self applyDeviceSampleRateAndFormat:currentSampleRate] :
 			                                                [self updateDeviceFormatNotifyingController:NO];
@@ -1532,7 +3243,6 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		sourceFormat = inputFormat;
 		sourceChannelConfig = inputChannelConfig;
 		sourceFormatValid = inputFormatValid;
-		hdcdDetected = NO;
 		[self refreshOutputStatus];
 		return YES;
 	}
@@ -1549,13 +3259,57 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	preferNativeHighPrecisionOutput = NO;
 	bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 	preferredDoPCarrierSampleRate = sampleRate;
+	if(sampleRateSupported) {
+		[self configurePreferredIntegerOutputAtSampleRate:sampleRate
+		                                       requiredBits:24
+		                                  requireDoPCarrier:YES];
+	} else {
+		preferExclusiveIntegerTransport = NO;
+		preferredIntegerTransportRequiresHog = NO;
+		preferredIntegerVirtualFormats = nil;
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
+		preferIntegerPhysicalOutput = NO;
+		preferredIntegerPhysicalFormats = nil;
+		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	}
+	const BOOL requestedExclusiveIntegerOutput = preferExclusiveIntegerTransport;
+	const BOOL requestedIntegerPhysicalOutput = preferIntegerPhysicalOutput;
 	BOOL prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+	if(!prepared && requestedExclusiveIntegerOutput) {
+		ALog(@"Exclusive DoP output was unavailable; retrying with shared integer Core Audio output");
+		preferDoPIntegerOutput = YES;
+		preferredDoPCarrierSampleRate = sampleRate;
+		preferNativeHighPrecisionOutput = NO;
+		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+		[self configureSharedIntegerOutputAtSampleRate:sampleRate
+		                                      requiredBits:24
+		                                 requireDoPCarrier:YES];
+		prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+	}
+	if(!prepared && requestedIntegerPhysicalOutput) {
+		preferDoPIntegerOutput = YES;
+		preferredDoPCarrierSampleRate = sampleRate;
+		preferNativeHighPrecisionOutput = NO;
+		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+		preferIntegerPhysicalOutput = NO;
+		preferredIntegerPhysicalFormats = nil;
+		preferExclusiveIntegerTransport = NO;
+		preferredIntegerTransportRequiresHog = NO;
+		preferredIntegerVirtualFormats = nil;
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
+		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+		prepared = [self applyDeviceSampleRateAndFormat:sampleRate];
+	}
 	if(prepared && renderFormatDoPInteger) {
 		sourceFormat = inputFormat;
 		sourceChannelConfig = inputChannelConfig;
 		sourceFormatValid = inputFormatValid;
-		hdcdDetected = NO;
 		[faderNode setDoPMode:YES];
+		[self refreshOutputStatus];
 		return YES;
 	}
 
@@ -1565,6 +3319,15 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	doPSeekPending = NO;
 	preferDoPIntegerOutput = NO;
 	preferredDoPCarrierSampleRate = 0.0;
+	preferIntegerPhysicalOutput = NO;
+	preferredIntegerPhysicalFormats = nil;
+	preferExclusiveIntegerTransport = NO;
+	preferredIntegerTransportRequiresHog = NO;
+	preferredIntegerVirtualFormats = nil;
+	preferExclusiveFloatTransport = NO;
+	preferredFloatVirtualFormats = nil;
+	bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
 	[faderNode setDoPMode:NO];
 	return NO;
 }
@@ -1666,7 +3429,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	__block NSFileHandle *logFile = _logFile;
 #endif
 
-	_au.outputProvider = ^AUAudioUnitStatus(AudioUnitRenderActionFlags *_Nonnull actionFlags, const AudioTimeStamp *_Nonnull timestamp, AUAudioFrameCount frameCount, NSInteger inputBusNumber, AudioBufferList *_Nonnull inputData) {
+	_outputRenderBlock = ^AUAudioUnitStatus(AudioUnitRenderActionFlags *_Nonnull actionFlags, const AudioTimeStamp *_Nonnull timestamp, AUAudioFrameCount frameCount, NSInteger inputBusNumber, AudioBufferList *_Nonnull inputData) {
 		if(!frameCount) return 0;
 
 		const int channels = format->mChannelsPerFrame;
@@ -1683,6 +3446,89 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		inputData->mBuffers[0].mNumberChannels = channels;
 		
 		if(_self->resetting) {
+			return 0;
+		}
+
+		const BOOL renderDirectDoP = _self->renderFormatDoPInteger && AudioFormatIsDoPInteger(*renderASBD);
+		if(renderDirectDoP) {
+			@autoreleasepool {
+				if(!_self->faded) {
+					while(renderedSamples < frameCount) {
+						[refLock lock];
+						AudioChunk *chunk = nil;
+						if(![_self->bufferNode.buffer isEmpty]) {
+							chunk = [_self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+						}
+						[refLock unlock];
+
+						size_t chunkFrames = chunk ? [chunk frameCount] : 0;
+						if(chunkFrames) {
+							_self->prebufferReached = YES;
+							double streamTimestamp = [chunk streamTimestamp];
+							if(!streamTimestamp || _self->streamTimestamp > streamTimestamp) {
+								_self->prebufferSignaled = NO;
+							}
+							_self->streamTimestamp = streamTimestamp;
+
+							const AudioStreamBasicDescription chunkFormat = [chunk format];
+							NSData *sampleData = [chunk removeSamples:chunkFrames];
+							size_t inputTodo = MIN(chunkFrames, frameCount - renderedSamples);
+							uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+							                       renderedSamples * renderASBD->mBytesPerPacket;
+							uint8_t nextDoPMarker = 0x05;
+							const BOOL compatibleCarrier = AudioFormatIsDoPInteger(chunkFormat) &&
+							                               chunkFormat.mChannelsPerFrame == (UInt32)channels &&
+							                               chunkFormat.mBytesPerPacket == renderASBD->mBytesPerPacket;
+							const BOOL inputIsDoP = [chunk isDoP] && compatibleCarrier &&
+							                          audioBufferIsDoP([sampleData bytes], chunkFormat, inputTodo, &nextDoPMarker);
+
+							if(!inputIsDoP) {
+								// Never feed PCM or a damaged marker sequence to a DAC that is
+								// currently locked to DoP. Consume the transition and substitute
+								// valid DoP silence with the expected marker phase.
+								fillDoPSilence(destination, *renderASBD, inputTodo, &_self->doPMarker);
+							} else {
+								const uint8_t firstDoPMarker = (inputTodo % 2) ?
+								                                     ((nextDoPMarker == 0x05) ? 0xFA : 0x05) :
+								                                     nextDoPMarker;
+								const uint8_t *source = (const uint8_t *)[sampleData bytes];
+								if(firstDoPMarker != _self->doPMarker) {
+									// Drop a repeated marker at a buffer join instead of making the
+									// DAC lose DoP lock.
+									source += chunkFormat.mBytesPerPacket;
+									--inputTodo;
+								}
+								memcpy(destination, source, inputTodo * renderASBD->mBytesPerPacket);
+								_self->doPActive = YES;
+								_self->doPSeekPending = NO;
+								_self->doPMarker = nextDoPMarker;
+								if(_self->fading) {
+									_self->faded = _self->fadeStep < 0.0;
+									_self->fading = NO;
+									_self->fadeStep = 0.0f;
+									_self->fadeLevel = _self->faded ? 0.0f : 1.0f;
+								}
+							}
+							renderedSamples += (int)inputTodo;
+						}
+
+						if((_self->stopping && !_self->fadingstop) || _self->resetting ||
+						   _self->faded || !chunk || !chunkFrames) break;
+					}
+				}
+
+				if(renderedSamples < frameCount) {
+					uint8_t *destination = (uint8_t *)inputData->mBuffers[0].mData +
+					                       renderedSamples * renderASBD->mBytesPerPacket;
+					fillDoPSilence(destination, *renderASBD, frameCount - renderedSamples, &_self->doPMarker);
+				}
+
+				[_self updateLatency:(double)renderedSamples / format->mSampleRate];
+#ifdef OUTPUT_LOG
+				NSData *outData = [NSData dataWithBytes:inputData->mBuffers[0].mData length:inputData->mBuffers[0].mDataByteSize];
+				[logFile writeData:outData];
+#endif
+			}
 			return 0;
 		}
 		
@@ -1709,7 +3555,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 					[refLock lock];
 					AudioChunk *chunk = nil;
 					if(![_self->bufferNode.buffer isEmpty]) {
-						chunk = [self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+						chunk = [_self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
 					}
 					[refLock unlock];
 
@@ -1759,7 +3605,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 					[refLock lock];
 					AudioChunk *chunk = nil;
 					if(![_self->bufferNode.buffer isEmpty]) {
-						chunk = [self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
+						chunk = [_self->bufferNode.buffer removeSamples:frameCount - renderedSamples];
 					}
 					[refLock unlock];
 
@@ -1789,12 +3635,14 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 							break;
 						}
 						uint8_t nextDoPMarker = 0x05;
-						BOOL inputIsDoP = audioBufferIsDoP64(samplePtr, channels, inputTodo, &nextDoPMarker);
+						AudioStreamBasicDescription floatDoPFormat = AudioFormatAsFloat64(chunkFormat);
+						BOOL inputIsDoP = [chunk isDoP] &&
+						                  audioBufferIsDoP(samplePtr, floatDoPFormat, inputTodo, &nextDoPMarker);
 
 						if(_self->doPSeekPending && !inputIsDoP) {
 							// Never expose transitional or stale PCM-looking data while a
 							// DoP seek is waiting for the first verified post-seek carrier.
-							fillDoPSilence64(outSamples + renderedSamples * channels, channels, inputTodo, &_self->doPMarker);
+							fillDoPSilence(outSamples + renderedSamples * channels, floatDoPFormat, inputTodo, &_self->doPMarker);
 							outputContainsDoP = YES;
 						} else if(inputIsDoP) {
 							// A DoP carrier must remain bit-perfect. Complete a pending
@@ -1844,7 +3692,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				// PCM zeroes make a DoP DAC lose lock. Keep it locked across pause,
 				// initial startup, track changes, and brief underruns with standard
 				// DSD silence.
-				fillDoPSilence64(outSamples + renderedSamples * channels, channels, frameCount - renderedSamples, &_self->doPMarker);
+				AudioStreamBasicDescription floatDoPFormat = AudioFormatAsFloat64(*renderASBD);
+				fillDoPSilence(outSamples + renderedSamples * channels, floatDoPFormat, frameCount - renderedSamples, &_self->doPMarker);
 				outputContainsDoP = YES;
 			}
 
@@ -1863,7 +3712,12 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 				} else if(_self->renderFormatNativeHighPrecision) {
 					convertFloat64BufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, outputSampleCount);
 				} else {
-					convertFloat64BufferToS32((int32_t *)inputData->mBuffers[0].mData, outSamples, outputSampleCount, outputContainsDoP);
+					if(!convertFloat64BufferToIntegerPCM(inputData->mBuffers[0].mData,
+					                                          outSamples,
+					                                          outputSampleCount,
+					                                          *renderASBD)) {
+						bzero(inputData->mBuffers[0].mData, inputData->mBuffers[0].mDataByteSize);
+					}
 				}
 			}
 
@@ -1889,6 +3743,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		return 0;
 	};
+	_au.outputProvider = _outputRenderBlock;
 }
 
 - (BOOL)setup {
@@ -1919,11 +3774,33 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		preferNativeHighPrecisionOutput = NO;
 		renderFormatNativeHighPrecision = NO;
 		bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+		preferIntegerPhysicalOutput = NO;
+		renderFormatIntegerPhysical = NO;
+		preferredIntegerPhysicalFormats = nil;
+		preferExclusiveIntegerTransport = NO;
+		renderFormatEndToEndInteger = NO;
+		preferredIntegerTransportRequiresHog = NO;
+		preferredIntegerVirtualFormats = nil;
+		bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+		preferExclusiveFloatTransport = NO;
+		preferredFloatVirtualFormats = nil;
+		bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+		savedPhysicalFormatValid = NO;
+		savedPhysicalFormatDeviceID = kAudioObjectUnknown;
+		savedPhysicalFormats = nil;
+		savedVirtualFormatValid = NO;
+		savedVirtualFormatDeviceID = kAudioObjectUnknown;
+		savedVirtualFormats = nil;
+		hogModeOwned = NO;
+		hogModeDeviceID = kAudioObjectUnknown;
+		exclusiveIOProcID = NULL;
+		exclusiveIOProcDeviceID = kAudioObjectUnknown;
+		exclusiveIOProcRunning = NO;
+		exclusiveMaximumFramesToRender = 0;
 		bzero(&renderFormat, sizeof(renderFormat));
 		bzero(&sourceFormat, sizeof(sourceFormat));
 		sourceChannelConfig = 0;
 		sourceFormatValid = NO;
-		hdcdDetected = NO;
 
 		cutOffInput = NO;
 		fadeTarget = 1.0;
@@ -1968,6 +3845,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		}
 
 		suspendOutputOnPause = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"suspendOutputOnPause"];
+		exclusiveOutputEnabled = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"exclusiveIntegerOutput"];
+		setDeviceVolumeTo100ForExclusiveOutput = [[[NSUserDefaultsController sharedUserDefaultsController] defaults] boolForKey:@"setDeviceVolumeTo100ForExclusiveOutput"];
 
 		[self audioOutputBlock];
 
@@ -2000,6 +3879,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.outputDevice" options:0 context:kOutputCoreAudioContext];
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.suspendOutputOnPause" options:0 context:kOutputCoreAudioContext];
+		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.exclusiveIntegerOutput" options:0 context:kOutputCoreAudioContext];
+		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.setDeviceVolumeTo100ForExclusiveOutput" options:0 context:kOutputCoreAudioContext];
 		for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
 			[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:keyPath options:0 context:kOutputCoreAudioContext];
 		}
@@ -2074,6 +3955,8 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		if(observersapplied) {
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.outputDevice" context:kOutputCoreAudioContext];
 			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.suspendOutputOnPause" context:kOutputCoreAudioContext];
+			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.exclusiveIntegerOutput" context:kOutputCoreAudioContext];
+			[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.setDeviceVolumeTo100ForExclusiveOutput" context:kOutputCoreAudioContext];
 			for(NSString *keyPath in signalIntegrityPreferenceKeyPaths()) {
 				[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:keyPath context:kOutputCoreAudioContext];
 			}
@@ -2133,8 +4016,25 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 					}
 				}
 			}
-			[_au stopHardware];
+			[self stopCurrentHardware];
+			if(_au.renderResourcesAllocated) {
+				[_au deallocateRenderResources];
+			}
+			[self destroyExclusiveIOProc];
+			BOOL restoredStreamFormats = [self restoreSavedPhysicalFormatSetAtCurrentSampleRate];
+			if(!restoredStreamFormats) {
+				ALog(@"Unable to restore the device's previous physical output format");
+			}
+			restoredStreamFormats = [self restoreSavedVirtualFormatSetAtCurrentSampleRate] && restoredStreamFormats;
+			if(!restoredStreamFormats) {
+				ALog(@"Unable to restore all previous device stream formats; selecting mixable fallbacks");
+				[self ensureMixableStreamFormatsForAUHAL];
+			}
+			if(![self releaseHogModeForCurrentDevice]) {
+				ALog(@"Unable to release exclusive ownership of the output device");
+			}
 			_au = nil;
+			_outputRenderBlock = nil;
 		}
 		if(outputDoubleScratch) {
 			free(outputDoubleScratch);
@@ -2195,17 +4095,17 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 - (void)pause {
 	paused = YES;
 	if(started)
-		[_au stopHardware];
+		[self stopCurrentHardware];
 }
 
 - (BOOL)hardwareIsRunning {
-	return _au != nil && _au.isRunning;
+	return exclusiveIOProcID ? exclusiveIOProcRunning : (_au != nil && _au.isRunning);
 }
 
 - (void)resume {
 	[self stopIdle];
 	NSError *err = nil;
-	if(_au && !_au.renderResourcesAllocated) {
+	if(_au && !exclusiveIOProcID && !_au.renderResourcesAllocated) {
 		if(![_au allocateRenderResourcesAndReturnError:&err] || err != nil) {
 			ALog(@"Unable to restore Core Audio render resources: %@", err);
 			paused = NO;
@@ -2216,7 +4116,35 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 	}
 	BOOL hardwareStarted = [self hardwareIsRunning];
 	if(!hardwareStarted) {
-		hardwareStarted = [_au startHardwareAndReturnError:&err];
+		hardwareStarted = [self startCurrentHardware:&err];
+		if(!hardwareStarted && exclusiveIOProcID && sourceFormatValid) {
+			// Registration can succeed even when a driver rejects AudioDeviceStart.
+			// Restore the device's mixable virtual format and retry through AUHAL so
+			// opting into exclusive mode can never turn a playable track into silence.
+			ALog(@"Direct HAL output could not start; retrying with shared Core Audio output: %@", err);
+			if(AudioFormatIsFloat32(sourceFormat) || AudioFormatIsFloat64(sourceFormat)) {
+				preferExclusiveFloatTransport = NO;
+				preferredFloatVirtualFormats = nil;
+				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+				preferExclusiveIntegerTransport = NO;
+				preferredIntegerTransportRequiresHog = NO;
+				preferredIntegerVirtualFormats = nil;
+				preferIntegerPhysicalOutput = NO;
+				preferredIntegerPhysicalFormats = nil;
+				bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			} else {
+				const BOOL requireDoPCarrier = renderFormatDoPInteger;
+				const UInt32 requiredBits = requireDoPCarrier ? 24 : sourceFormat.mBitsPerChannel;
+				[self configureSharedIntegerOutputAtSampleRate:renderFormat.mSampleRate
+				                                      requiredBits:requiredBits
+				                                 requireDoPCarrier:requireDoPCarrier];
+			}
+			if([self applyDeviceSampleRateAndFormat:renderFormat.mSampleRate]) {
+				[self refreshOutputStatus];
+				err = nil;
+				hardwareStarted = [self startCurrentHardware:&err];
+			}
+		}
 		if(!hardwareStarted) {
 			hardwareStarted = [self hardwareIsRunning];
 		}
@@ -2243,10 +4171,7 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 
 - (void)sustainHDCD {
 	secondsHdcdSustained = 10.0;
-	if(!hdcdDetected) {
-		hdcdDetected = YES;
-		[self refreshOutputStatus];
-	}
+	[self refreshOutputStatus];
 }
 
 - (void)setShouldPlayOutBuffer:(BOOL)s {

@@ -331,21 +331,14 @@ static uint8_t reverse_bits8(uint8_t value) {
 	return value;
 }
 
-static float convert_dop_word_to_f32(uint8_t first, uint8_t second, uint8_t marker) {
+static int32_t pack_dop_word_s32(uint8_t first, uint8_t second, uint8_t marker) {
 	const uint32_t packed = ((uint32_t)marker << 24) | ((uint32_t)first << 16) | ((uint32_t)second << 8);
 	int32_t signedPacked;
 	memcpy(&signedPacked, &packed, sizeof(signedPacked));
-	return (float)((double)signedPacked / 2147483648.0);
+	return signedPacked;
 }
 
-static double convert_dop_word_to_f64(uint8_t first, uint8_t second, uint8_t marker) {
-	const uint32_t packed = ((uint32_t)marker << 24) | ((uint32_t)first << 16) | ((uint32_t)second << 8);
-	int32_t signedPacked;
-	memcpy(&signedPacked, &packed, sizeof(signedPacked));
-	return (double)signedPacked / 2147483648.0;
-}
-
-static size_t convert_dsd_to_dop_f32(float *output, const uint8_t *input, size_t inputFrames, size_t channels, BOOL reverseBits, uint8_t *pendingFrame, BOOL *hasPendingFrame, uint8_t *nextMarker) {
+static size_t convert_dsd_to_dop_s32(int32_t *output, const uint8_t *input, size_t inputFrames, size_t channels, BOOL reverseBits, uint8_t *pendingFrame, BOOL *hasPendingFrame, uint8_t *nextMarker) {
 	if(!output || !input || !channels || channels > 32) return 0;
 
 	size_t inputFrame = 0;
@@ -358,7 +351,7 @@ static size_t convert_dsd_to_dop_f32(float *output, const uint8_t *input, size_t
 		for(size_t channel = 0; channel < channels; ++channel) {
 			const uint8_t first = reverseBits ? reverse_bits8(pendingFrame[channel]) : pendingFrame[channel];
 			const uint8_t second = reverseBits ? reverse_bits8(input[channel]) : input[channel];
-			output[channel] = convert_dop_word_to_f32(first, second, marker);
+			output[channel] = pack_dop_word_s32(first, second, marker);
 		}
 		marker = (marker == 0x05) ? 0xFA : 0x05;
 		inputFrame = 1;
@@ -374,50 +367,7 @@ static size_t convert_dsd_to_dop_f32(float *output, const uint8_t *input, size_t
 				first = reverse_bits8(first);
 				second = reverse_bits8(second);
 			}
-			output[outputFrame * channels + channel] = convert_dop_word_to_f32(first, second, marker);
-		}
-		marker = (marker == 0x05) ? 0xFA : 0x05;
-		inputFrame += 2;
-		++outputFrame;
-	}
-
-	if(inputFrame < inputFrames) {
-		memcpy(pendingFrame, input + inputFrame * channels, channels);
-		*hasPendingFrame = YES;
-	}
-
-	*nextMarker = marker;
-	return outputFrame;
-}
-
-static size_t convert_dsd_to_dop_f64(double *output, const uint8_t *input, size_t inputFrames, size_t channels, BOOL reverseBits, uint8_t *pendingFrame, BOOL *hasPendingFrame, uint8_t *nextMarker) {
-	if(!output || !input || !channels || channels > 32) return 0;
-
-	size_t inputFrame = 0;
-	size_t outputFrame = 0;
-	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
-
-	if(*hasPendingFrame && inputFrames) {
-		for(size_t channel = 0; channel < channels; ++channel) {
-			const uint8_t first = reverseBits ? reverse_bits8(pendingFrame[channel]) : pendingFrame[channel];
-			const uint8_t second = reverseBits ? reverse_bits8(input[channel]) : input[channel];
-			output[channel] = convert_dop_word_to_f64(first, second, marker);
-		}
-		marker = (marker == 0x05) ? 0xFA : 0x05;
-		inputFrame = 1;
-		outputFrame = 1;
-		*hasPendingFrame = NO;
-	}
-
-	while(inputFrame + 1 < inputFrames) {
-		for(size_t channel = 0; channel < channels; ++channel) {
-			uint8_t first = input[inputFrame * channels + channel];
-			uint8_t second = input[(inputFrame + 1) * channels + channel];
-			if(reverseBits) {
-				first = reverse_bits8(first);
-				second = reverse_bits8(second);
-			}
-			output[outputFrame * channels + channel] = convert_dop_word_to_f64(first, second, marker);
+			output[outputFrame * channels + channel] = pack_dop_word_s32(first, second, marker);
 		}
 		marker = (marker == 0x05) ? 0xFA : 0x05;
 		inputFrame += 2;
@@ -697,6 +647,7 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 		[ret setChannelConfig:[chunk channelConfig]];
 		[ret setLossless:[chunk lossless]];
 		[ret setDsdDoPReverseBits:[chunk dsdDoPReverseBits]];
+		[ret setDoP:[chunk isDoP]];
 		[ret setStreamTimestamp:streamTimestamp];
 		[ret setStreamTimeRatio:[chunk streamTimeRatio]];
 		[ret assignData:removedData];
@@ -751,6 +702,7 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 		[ret setChannelConfig:[chunk channelConfig]];
 		[ret setLossless:[chunk lossless]];
 		[ret setDsdDoPReverseBits:[chunk dsdDoPReverseBits]];
+		[ret setDoP:[chunk isDoP]];
 		[ret setStreamTimestamp:streamTimestamp];
 		[ret setStreamTimeRatio:[chunk streamTimeRatio]];
 		[ret assignData:removedData];
@@ -832,6 +784,7 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 
 		if(!totalFrameCount) {
 			[outputChunk setDsdDoPReverseBits:[chunk dsdDoPReverseBits]];
+			[outputChunk setDoP:[chunk isDoP]];
 		}
 
 		if(chunk.resetForward) {
@@ -871,7 +824,11 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 	inConverter = YES;
 
 	AudioStreamBasicDescription chunkFormat = [inChunk format];
-	if(![inChunk frameCount]) {
+	// Despite these methods' historical floating-point names, DoP is an opaque integer
+	// bitstream. Preserve only explicitly tagged DoP chunks; ordinary 24-bit PCM
+	// using the same ASBD still follows the normal PCM conversion below.
+	if(![inChunk frameCount] ||
+	   ([inChunk isDoP] && AudioFormatIsDoPInteger(chunkFormat))) {
 		inConverter = NO;
 		return inChunk;
 	}
@@ -937,6 +894,7 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 
 		if(inputFormat.mBitsPerChannel == 1) {
 			if(outputDSDAsDoP && inputFormat.mChannelsPerFrame <= sizeof(dsdDoPPendingFrame)) {
+				floatFormat = AudioFormatAsDoPInteger(inputFormat);
 				floatFormat.mSampleRate *= 1.0 / 16.0;
 			} else {
 #if DSD_DECIMATE
@@ -987,6 +945,9 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 	BOOL isBigEndian = !!(inputFormat.mFormatFlags & kAudioFormatFlagIsBigEndian);
 	BOOL isAlignedHigh = !!(inputFormat.mFormatFlags & kAudioFormatFlagIsAlignedHigh);
 	const size_t storageBytesPerSample = inputFormat.mBytesPerFrame / inputFormat.mChannelsPerFrame;
+	const BOOL outputIsDoP = inputFormat.mBitsPerChannel == 1 &&
+	                         outputDSDAsDoP &&
+	                         inputFormat.mChannelsPerFrame <= sizeof(dsdDoPPendingFrame);
 
 	double streamTimestamp = [inChunk streamTimestamp];
 
@@ -1055,14 +1016,10 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 			const size_t buffer_adder = (inputBuffer == &tempData[0]) ? buffer_adder_base : 0;
 			samplesRead = bytesReadFromInput / inputFormat.mBytesPerPacket;
 			if(outputDSDAsDoP && inputFormat.mChannelsPerFrame <= sizeof(dsdDoPPendingFrame)) {
-				if(toFloat64) {
-					samplesRead = convert_dsd_to_dop_f64((double *)(&tempData[buffer_adder]), (const uint8_t *)inputBuffer, samplesRead, inputFormat.mChannelsPerFrame, [inChunk dsdDoPReverseBits], dsdDoPPendingFrame, &dsdDoPHasPendingFrame, &dsdDoPMarker);
-				} else {
-					samplesRead = convert_dsd_to_dop_f32((float *)(&tempData[buffer_adder]), (const uint8_t *)inputBuffer, samplesRead, inputFormat.mChannelsPerFrame, [inChunk dsdDoPReverseBits], dsdDoPPendingFrame, &dsdDoPHasPendingFrame, &dsdDoPMarker);
-				}
-				bitsPerSample = toFloat64 ? 64 : 32;
+				samplesRead = convert_dsd_to_dop_s32((int32_t *)(&tempData[buffer_adder]), (const uint8_t *)inputBuffer, samplesRead, inputFormat.mChannelsPerFrame, [inChunk dsdDoPReverseBits], dsdDoPPendingFrame, &dsdDoPHasPendingFrame, &dsdDoPMarker);
+				bitsPerSample = 24;
 				bytesReadFromInput = samplesRead * floatFormat.mBytesPerPacket;
-				isFloat = YES;
+				isUnsigned = NO;
 				inputBuffer = &tempData[buffer_adder];
 				inputChanged = YES;
 			} else {
@@ -1152,20 +1109,23 @@ static void swap_sample_endianness(uint8_t *buffer, size_t storageBytes, size_t 
 		}
 
 #ifdef _DEBUG
-		if(toFloat64) {
-			[BadSampleCleaner cleanSamples64:(double *)inputBuffer
-								 amount:bytesReadFromInput / sizeof(double)
-							   location:@"post int to Float64 conversion"];
-		} else {
-			[BadSampleCleaner cleanSamples:(float *)inputBuffer
-							amount:bytesReadFromInput / sizeof(float)
-						  location:@"post int to Float32 conversion"];
+		if(!outputIsDoP) {
+			if(toFloat64) {
+				[BadSampleCleaner cleanSamples64:(double *)inputBuffer
+									 amount:bytesReadFromInput / sizeof(double)
+								   location:@"post int to Float64 conversion"];
+			} else {
+				[BadSampleCleaner cleanSamples:(float *)inputBuffer
+								amount:bytesReadFromInput / sizeof(float)
+							  location:@"post int to Float32 conversion"];
+			}
 		}
 #endif
 	}
 
 	AudioChunk *outChunk = [AudioChunk new];
 	[outChunk setFormat:floatFormat];
+	[outChunk setDoP:outputIsDoP];
 	[outChunk setChannelConfig:inputChannelConfig];
 	[outChunk setLossless:inputLossless];
 	[outChunk setStreamTimestamp:streamTimestamp];

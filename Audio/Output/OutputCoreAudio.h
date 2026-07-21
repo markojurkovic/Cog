@@ -85,6 +85,8 @@ using std::atomic_long;
 	BOOL outputdevicechanged;
 
 	BOOL suspendOutputOnPause;
+	BOOL exclusiveOutputEnabled;
+	BOOL setDeviceVolumeTo100ForExclusiveOutput;
 
 	double volume;
 
@@ -103,7 +105,6 @@ using std::atomic_long;
 	uint32_t realStreamChannelConfig;
 	uint32_t streamChannelConfig;
 	BOOL sourceFormatValid;
-	BOOL hdcdDetected;
 
 	BOOL preferDoPIntegerOutput;
 	BOOL renderFormatDoPInteger;
@@ -111,12 +112,36 @@ using std::atomic_long;
 	BOOL preferNativeHighPrecisionOutput;
 	BOOL renderFormatNativeHighPrecision;
 	AudioStreamBasicDescription preferredNativeHighPrecisionFormat;
+	BOOL preferIntegerPhysicalOutput;
+	BOOL renderFormatIntegerPhysical;
+	NSDictionary<NSNumber *, NSValue *> *preferredIntegerPhysicalFormats;
+	BOOL preferExclusiveIntegerTransport;
+	BOOL renderFormatEndToEndInteger;
+	BOOL preferredIntegerTransportRequiresHog;
+	NSDictionary<NSNumber *, NSValue *> *preferredIntegerVirtualFormats;
+	AudioStreamBasicDescription preferredIntegerClientFormat;
+	BOOL preferExclusiveFloatTransport;
+	NSDictionary<NSNumber *, NSValue *> *preferredFloatVirtualFormats;
+	AudioStreamBasicDescription preferredFloatClientFormat;
+	BOOL savedPhysicalFormatValid;
+	AudioDeviceID savedPhysicalFormatDeviceID;
+	NSDictionary<NSNumber *, NSValue *> *savedPhysicalFormats;
+	BOOL savedVirtualFormatValid;
+	AudioDeviceID savedVirtualFormatDeviceID;
+	NSDictionary<NSNumber *, NSValue *> *savedVirtualFormats;
+	BOOL hogModeOwned;
+	AudioDeviceID hogModeDeviceID;
+	AudioDeviceIOProcID exclusiveIOProcID;
+	AudioDeviceID exclusiveIOProcDeviceID;
+	BOOL exclusiveIOProcRunning;
+	UInt32 exclusiveMaximumFramesToRender;
 
 	double *outputDoubleScratch;
 	double *inputDoubleScratch;
 	size_t outputDoubleScratchCapacity;
 
 	AUAudioUnit *_au;
+	AURenderPullInputBlock _outputRenderBlock;
 
 	size_t _bufferSize;
 

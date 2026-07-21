@@ -20,11 +20,9 @@ extern "C" {
 extern double fadeTimeMS;
 
 extern BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_t count, float *fadeLevel, float fadeStep, float fadeTarget);
-extern BOOL audioBufferIsDoP(const float *samples, size_t channels, size_t count, uint8_t * _Nullable nextMarker);
-extern void fillDoPSilence(float *samples, size_t channels, size_t count, uint8_t *nextMarker);
 extern BOOL fadeAudio64(const double *inSamples, double *outSamples, size_t channels, size_t count, double *fadeLevel, double fadeStep, double fadeTarget);
-extern BOOL audioBufferIsDoP64(const double *samples, size_t channels, size_t count, uint8_t * _Nullable nextMarker);
-extern void fillDoPSilence64(double *samples, size_t channels, size_t count, uint8_t *nextMarker);
+extern BOOL audioBufferIsDoP(const void *samples, AudioStreamBasicDescription format, size_t count, uint8_t * _Nullable nextMarker);
+extern BOOL fillDoPSilence(void *samples, AudioStreamBasicDescription format, size_t count, uint8_t *nextMarker);
 
 #ifdef __cplusplus
 }

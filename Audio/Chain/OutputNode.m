@@ -329,6 +329,12 @@
 	return converter ? [converter appliesVolumeScaling] : NO;
 }
 
+- (BOOL)currentInputHDCDDetected {
+	AudioPlayer *audioPlayer = controller;
+	BufferChain *bufferChain = [audioPlayer bufferChain];
+	return bufferChain ? [bufferChain hdcdDetected] : NO;
+}
+
 - (void)refreshOutputStatus {
 	[output refreshOutputStatus];
 }

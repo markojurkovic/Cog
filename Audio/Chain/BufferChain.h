@@ -7,6 +7,7 @@
 //
 
 #import <Cocoa/Cocoa.h>
+#import <stdatomic.h>
 
 #import <CogAudio/AudioPlayer.h>
 #import <CogAudio/ConverterNode.h>
@@ -24,6 +25,7 @@
 
 	id controller;
 	BOOL outputPreparationFailed;
+	atomic_bool hdcdDetected;
 }
 
 - (id)initWithController:(id)c;
@@ -81,6 +83,7 @@
 - (double)secondsBuffered;
 
 - (void)sustainHDCD;
+- (BOOL)hdcdDetected;
 
 - (void)restartPlaybackAtCurrentPosition;
 

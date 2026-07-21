@@ -326,9 +326,11 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<double>;
 			size_t frameCount = [chunk frameCount];
 
 			NSData *sampleData = [chunk removeSamples:frameCount];
-			if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+			const AudioStreamBasicDescription chunkFormat = [chunk format];
+			if([chunk isDoP] && audioBufferIsDoP([sampleData bytes], chunkFormat, frameCount, NULL)) {
 				AudioChunk *outputChunk = [AudioChunk new];
-				[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
+				[outputChunk setFormat:chunkFormat];
+				[outputChunk setDoP:YES];
 				if(inputChannelConfig) {
 					[outputChunk setChannelConfig:inputChannelConfig];
 				}
@@ -366,9 +368,11 @@ using Stretch = signalsmith::stretch::SignalsmithStretch<double>;
 		size_t frameCount = [chunk frameCount];
 
 		NSData *sampleData = [chunk removeSamples:frameCount];
-		if(audioBufferIsDoP64((const double *)[sampleData bytes], inputFormat.mChannelsPerFrame, frameCount, NULL)) {
+		const AudioStreamBasicDescription chunkFormat = [chunk format];
+		if([chunk isDoP] && audioBufferIsDoP([sampleData bytes], chunkFormat, frameCount, NULL)) {
 			AudioChunk *outputChunk = [AudioChunk new];
-			[outputChunk setFormat:AudioFormatAsFloat64(inputFormat)];
+			[outputChunk setFormat:chunkFormat];
+			[outputChunk setDoP:YES];
 			if(inputChannelConfig) {
 				[outputChunk setChannelConfig:inputChannelConfig];
 			}

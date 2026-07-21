@@ -41,6 +41,12 @@ void PrintStreamDesc(AudioStreamBasicDescription *inDesc) {
 	DLog(@"- - - - - - - - - - - - - - - - - - - -\n");
 }
 
+static void convertDoPFloat64CarrierToS32(int32_t *output, const double *input, size_t count) {
+	for(size_t i = 0; i < count; ++i) {
+		output[i] = (int32_t)llrint(input[i] * 2147483648.0);
+	}
+}
+
 @implementation ConverterNode {
 	NSRecursiveLock *mutex;
 }
@@ -465,14 +471,23 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 
 	if(ioNumberPackets) {
 		AudioChunk *chunk = [AudioChunk new];
-		nodeFormat = processedFormat;
-		[chunk setFormat:processedFormat];
+		[self addObservers];
+		const size_t frameCount = ioNumberPackets / floatFormat.mBytesPerPacket;
+		const BOOL bufferIsDoP = audioBufferIsDoP(floatBuffer, processedFormat, frameCount, NULL);
+		doPStream = doPStream || bufferIsDoP;
+		AudioStreamBasicDescription chunkFormat = processedFormat;
+		if(bufferIsDoP && AudioFormatIsFloat64(processedFormat)) {
+			convertDoPFloat64CarrierToS32((int32_t *)floatBuffer,
+			                                (const double *)floatBuffer,
+			                                frameCount * processedFormat.mChannelsPerFrame);
+			chunkFormat = AudioFormatAsDoPInteger(processedFormat);
+		}
+		nodeFormat = chunkFormat;
+		[chunk setFormat:chunkFormat];
 		if(nodeChannelConfig) {
 			[chunk setChannelConfig:nodeChannelConfig];
 		}
-		[self addObservers];
-		const size_t frameCount = ioNumberPackets / floatFormat.mBytesPerPacket;
-		doPStream = doPStream || audioBufferIsDoP64((const double *)floatBuffer, floatFormat.mChannelsPerFrame, frameCount, NULL);
+		[chunk setDoP:bufferIsDoP];
 		if(!doPStream) {
 			scale_by_volume_double((double *)floatBuffer, ioNumberPackets / sizeof(double), volumeScale);
 		}
@@ -603,6 +618,9 @@ static double db_to_scale(double db) {
 	}
 
 	floatFormat = AudioFormatAsFloat64(inputFormat);
+	if(outputDSDAsDoP) {
+		floatFormat = AudioFormatAsDoPInteger(inputFormat);
+	}
 
 #if DSD_DECIMATE
 	if(inputFormat.mBitsPerChannel == 1) {
@@ -651,7 +669,7 @@ static double db_to_scale(double db) {
 
 	latencyEaten = 0;
 	latencyEatenPost = 0;
-	doPStream = NO;
+	doPStream = outputDSDAsDoP;
 
 	[self refreshVolumeScalingLocked:volumeScalingPreference];
 	nodeFormat = (nativePrecisionCandidate && volumeScale == 1.0) ? nativePrecisionFormat : processedFormat;

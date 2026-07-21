@@ -13,18 +13,35 @@
 
 double fadeTimeMS = 200.0;
 
-static uint8_t doPMarkerForSample(float sample) {
-	int32_t packed = (int32_t)llrint((double)sample * 2147483648.0);
-	return (uint8_t)(((uint32_t)packed) >> 24);
+static BOOL doPMarkerForSample(const void *samples,
+	                           AudioStreamBasicDescription format,
+	                           size_t sampleIndex,
+	                           uint8_t *marker) {
+	if(!samples || !marker) return NO;
+	int32_t packed;
+	if(AudioFormatIsDoPInteger(format)) {
+		memcpy(&packed, (const uint8_t *)samples + sampleIndex * sizeof(packed), sizeof(packed));
+	} else if(AudioFormatIsFloat64(format)) {
+		const double sample = ((const double *)samples)[sampleIndex];
+		if(!isfinite(sample) || sample >= 1.0 || sample < -1.0) return NO;
+		packed = (int32_t)llrint(sample * 2147483648.0);
+	} else if(AudioFormatIsFloat32(format)) {
+		const float sample = ((const float *)samples)[sampleIndex];
+		if(!isfinite(sample) || sample >= 1.0f || sample < -1.0f) return NO;
+		packed = (int32_t)llrint((double)sample * 2147483648.0);
+	} else {
+		return NO;
+	}
+	*marker = (uint8_t)(((uint32_t)packed) >> 24);
+	return YES;
 }
 
-static uint8_t doPMarkerForSample64(double sample) {
-	int32_t packed = (int32_t)llrint(sample * 2147483648.0);
-	return (uint8_t)(((uint32_t)packed) >> 24);
-}
-
-BOOL audioBufferIsDoP(const float *samples, size_t channels, size_t count, uint8_t *nextMarker) {
-	if(!samples || !channels || !count) return NO;
+BOOL audioBufferIsDoP(const void *samples, AudioStreamBasicDescription format, size_t count, uint8_t *nextMarker) {
+	const size_t channels = format.mChannelsPerFrame;
+	if(!samples || !channels || !count ||
+	   (!AudioFormatIsDoPInteger(format) &&
+	    !AudioFormatIsFloat64(format) &&
+	    !AudioFormatIsFloat32(format))) return NO;
 
 	// A DoP frame has the same 0x05/0xFA marker in every channel, and the
 	// marker alternates on every frame. Validate the complete buffer: callers use
@@ -32,11 +49,14 @@ BOOL audioBufferIsDoP(const float *samples, size_t channels, size_t count, uint8
 	// DAC lose DoP lock.
 	uint8_t previousMarker = 0;
 	for(size_t frame = 0; frame < count; ++frame) {
-		const uint8_t marker = doPMarkerForSample(samples[frame * channels]);
+		uint8_t marker = 0;
+		if(!doPMarkerForSample(samples, format, frame * channels, &marker)) return NO;
 		if(marker != 0x05 && marker != 0xFA) return NO;
 		if(frame && marker == previousMarker) return NO;
 		for(size_t channel = 1; channel < channels; ++channel) {
-			if(doPMarkerForSample(samples[frame * channels + channel]) != marker) return NO;
+			uint8_t channelMarker = 0;
+			if(!doPMarkerForSample(samples, format, frame * channels + channel, &channelMarker) ||
+			   channelMarker != marker) return NO;
 		}
 		previousMarker = marker;
 	}
@@ -47,54 +67,38 @@ BOOL audioBufferIsDoP(const float *samples, size_t channels, size_t count, uint8
 	return YES;
 }
 
-BOOL audioBufferIsDoP64(const double *samples, size_t channels, size_t count, uint8_t *nextMarker) {
-	if(!samples || !channels || !count) return NO;
-
-	uint8_t previousMarker = 0;
+BOOL fillDoPSilence(void *samples, AudioStreamBasicDescription format, size_t count, uint8_t *nextMarker) {
+	const size_t channels = format.mChannelsPerFrame;
+	if(!samples || !channels || !nextMarker ||
+	   (!AudioFormatIsDoPInteger(format) &&
+	    !AudioFormatIsFloat64(format) &&
+	    !AudioFormatIsFloat32(format))) return NO;
+	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
 	for(size_t frame = 0; frame < count; ++frame) {
-		const uint8_t marker = doPMarkerForSample64(samples[frame * channels]);
-		if(marker != 0x05 && marker != 0xFA) return NO;
-		if(frame && marker == previousMarker) return NO;
-		for(size_t channel = 1; channel < channels; ++channel) {
-			if(doPMarkerForSample64(samples[frame * channels + channel]) != marker) return NO;
+		const uint32_t packed = ((uint32_t)marker << 24) | (0x69U << 16) | (0x69U << 8);
+		if(AudioFormatIsDoPInteger(format)) {
+			for(size_t channel = 0; channel < channels; ++channel) {
+				memcpy((uint8_t *)samples + (frame * channels + channel) * sizeof(packed), &packed, sizeof(packed));
+			}
+		} else if(AudioFormatIsFloat64(format)) {
+			int32_t signedPacked;
+			memcpy(&signedPacked, &packed, sizeof(signedPacked));
+			const double silence = (double)signedPacked / 2147483648.0;
+			for(size_t channel = 0; channel < channels; ++channel) {
+				((double *)samples)[frame * channels + channel] = silence;
+			}
+		} else {
+			int32_t signedPacked;
+			memcpy(&signedPacked, &packed, sizeof(signedPacked));
+			const float silence = (float)((double)signedPacked / 2147483648.0);
+			for(size_t channel = 0; channel < channels; ++channel) {
+				((float *)samples)[frame * channels + channel] = silence;
+			}
 		}
-		previousMarker = marker;
+		marker = (marker == 0x05) ? 0xFA : 0x05;
 	}
-
-	if(nextMarker) {
-		*nextMarker = (previousMarker == 0x05) ? 0xFA : 0x05;
-	}
+	*nextMarker = marker;
 	return YES;
-}
-
-void fillDoPSilence(float *samples, size_t channels, size_t count, uint8_t *nextMarker) {
-	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
-	for(size_t frame = 0; frame < count; ++frame) {
-		const uint32_t packed = ((uint32_t)marker << 24) | (0x69U << 16) | (0x69U << 8);
-		int32_t signedPacked;
-		memcpy(&signedPacked, &packed, sizeof(signedPacked));
-		const float silence = (float)((double)signedPacked / 2147483648.0);
-		for(size_t channel = 0; channel < channels; ++channel) {
-			samples[frame * channels + channel] = silence;
-		}
-		marker = (marker == 0x05) ? 0xFA : 0x05;
-	}
-	*nextMarker = marker;
-}
-
-void fillDoPSilence64(double *samples, size_t channels, size_t count, uint8_t *nextMarker) {
-	uint8_t marker = (*nextMarker == 0xFA) ? 0xFA : 0x05;
-	for(size_t frame = 0; frame < count; ++frame) {
-		const uint32_t packed = ((uint32_t)marker << 24) | (0x69U << 16) | (0x69U << 8);
-		int32_t signedPacked;
-		memcpy(&signedPacked, &packed, sizeof(signedPacked));
-		const double silence = (double)signedPacked / 2147483648.0;
-		for(size_t channel = 0; channel < channels; ++channel) {
-			samples[frame * channels + channel] = silence;
-		}
-		marker = (marker == 0x05) ? 0xFA : 0x05;
-	}
-	*nextMarker = marker;
 }
 
 BOOL fadeAudio(const float *inSamples, float *outSamples, size_t channels, size_t count, float *fadeLevel, float fadeStep, float fadeTarget) {
@@ -215,7 +219,7 @@ BOOL fadeAudio64(const double *inSamples, double *outSamples, size_t channels, s
 			// Will always be input request size or less
 			size_t samplesToMix = [chunk frameCount];
 			NSData *sampleData = [chunk removeSamples:samplesToMix];
-			if(audioBufferIsDoP64((const double *)[sampleData bytes], channels, samplesToMix, NULL)) {
+			if([chunk isDoP] && audioBufferIsDoP([sampleData bytes], [chunk format], samplesToMix, NULL)) {
 				// DoP is a bitstream disguised as PCM. Mixing or fading it corrupts
 				// both its marker bytes and its DSD payload, so use a hard cut.
 				return true;

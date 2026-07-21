@@ -203,14 +203,17 @@
 
 	size_t frameCount = [chunk frameCount];
 	NSData *sampleData = [chunk removeSamples:frameCount];
+	const AudioStreamBasicDescription chunkFormat = [chunk format];
 	const double *inSamples = (const double *)[sampleData bytes];
-	const AudioStreamBasicDescription processingInputFormat = AudioFormatAsFloat64(inputFormat);
 	const AudioStreamBasicDescription processingOutputFormat = AudioFormatAsFloat64(outputFormat);
 	uint8_t nextDoPMarker = 0x05;
 	if(fabs(inputFormat.mSampleRate - outputFormat.mSampleRate) < 1.0 &&
-	   audioBufferIsDoP64(inSamples, inputFormat.mChannelsPerFrame, frameCount, &nextDoPMarker)) {
+	   [chunk isDoP] &&
+	   audioBufferIsDoP([sampleData bytes], chunkFormat, frameCount, &nextDoPMarker)) {
+		AudioStreamBasicDescription doPOutputFormat = AudioFormatAsDoPInteger(outputFormat);
 		AudioChunk *outputChunk = [AudioChunk new];
-		[outputChunk setFormat:processingOutputFormat];
+		[outputChunk setFormat:doPOutputFormat];
+		[outputChunk setDoP:YES];
 		if(outputChannelConfig) {
 			[outputChunk setChannelConfig:outputChannelConfig];
 		}
@@ -218,8 +221,8 @@
 		if(chunk.resetForward) outputChunk.resetForward = YES;
 		[outputChunk setStreamTimestamp:streamTimestamp];
 		[outputChunk setStreamTimeRatio:[chunk streamTimeRatio]];
-		if(processingInputFormat.mChannelsPerFrame == processingOutputFormat.mChannelsPerFrame &&
-		   processingInputFormat.mBytesPerPacket == processingOutputFormat.mBytesPerPacket) {
+		if(chunkFormat.mChannelsPerFrame == doPOutputFormat.mChannelsPerFrame &&
+		   chunkFormat.mBytesPerPacket == doPOutputFormat.mBytesPerPacket) {
 			[outputChunk assignData:sampleData];
 		} else {
 			const size_t inputChannels = inputFormat.mChannelsPerFrame;
@@ -227,9 +230,11 @@
 			const size_t channelsToCopy = MIN(inputChannels, outputChannels);
 			const uint8_t firstMarker = (frameCount % 2) ? ((nextDoPMarker == 0x05) ? 0xFA : 0x05) : nextDoPMarker;
 			uint8_t marker = firstMarker;
-			fillDoPSilence64(&outBuffer[0], outputChannels, frameCount, &marker);
+			fillDoPSilence(&outBuffer[0], doPOutputFormat, frameCount, &marker);
 			for(size_t frame = 0; frame < frameCount; ++frame) {
-				memcpy(&outBuffer[frame * outputChannels], &inSamples[frame * inputChannels], channelsToCopy * sizeof(double));
+				memcpy(&outBuffer[frame * outputChannels],
+				       (const int32_t *)[sampleData bytes] + frame * inputChannels,
+				       channelsToCopy * sizeof(int32_t));
 			}
 			[outputChunk assignSamples:&outBuffer[0] frameCount:frameCount];
 		}
