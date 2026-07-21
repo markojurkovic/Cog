@@ -53,8 +53,8 @@ void showSentryConsent(NSWindow *window) {
 - (void)awakeFromNib {
 	[super awakeFromNib];
 
-	outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Device: —", @"No active Cog signal-integrity or output format information");
-	outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's Core Audio handoff and the selected device's physical output stream.", @"Cog signal-integrity and output format tooltip");
+	outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Core Audio: — → Device: —", @"No active Cog signal-integrity or output format information");
+	outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's app, Core Audio virtual, and device physical formats.", @"Cog signal-integrity and output format tooltip");
 	outputFormatField.accessibilityLabel = NSLocalizedString(@"Cog signal integrity and Core Audio output formats", @"Cog signal-integrity and output formats accessibility label");
 	[[NSNotificationCenter defaultCenter] addObserver:self
 	                                         selector:@selector(coreAudioOutputFormatDidChange:)
@@ -76,6 +76,7 @@ void showSentryConsent(NSWindow *window) {
 
 - (void)coreAudioOutputFormatDidChange:(NSNotification *)notification {
 	NSString *formatDescription = notification.userInfo[CogCoreAudioOutputFormatDescriptionKey];
+	NSString *virtualFormatDescription = notification.userInfo[CogCoreAudioVirtualFormatDescriptionKey];
 	NSString *deviceFormatDescription = notification.userInfo[CogCoreAudioDeviceFormatDescriptionKey];
 	if(formatDescription.length) {
 		outputFormatSource = notification.object;
@@ -91,22 +92,37 @@ void showSentryConsent(NSWindow *window) {
 		}
 		NSString *deviceDescription = deviceFormatDescription.length ? deviceFormatDescription :
 		                                                                 NSLocalizedString(@"Unavailable", @"Physical device format unavailable");
-		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"Cog: %@ · App: %@ → Device: %@", @"Cog signal-integrity state, Core Audio client format, and physical device format"),
+		NSString *virtualDescription = virtualFormatDescription.length ? virtualFormatDescription :
+		                                                                   NSLocalizedString(@"Unavailable", @"Core Audio virtual format unavailable");
+		const BOOL endToEndInteger = [notification.userInfo[CogCoreAudioEndToEndIntegerTransportKey] boolValue];
+		const BOOL hogModeOwned = [notification.userInfo[CogCoreAudioHogModeOwnedKey] boolValue];
+		NSString *transportDescription = endToEndInteger ?
+		                                     (hogModeOwned ? NSLocalizedString(@" · End-to-end integer · Exclusive", @"Exclusive end-to-end integer transport status") :
+		                                                     NSLocalizedString(@" · End-to-end integer", @"Shared end-to-end integer transport status")) : @"";
+		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"Cog: %@ · App: %@ → Core Audio: %@ → Device: %@%@", @"Cog signal-integrity state, app client format, Core Audio virtual format, physical device format, and transport state"),
 		                                                               integrityDescription,
 		                                                               formatDescription,
-		                                                               deviceDescription];
-		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"Cog signal path: %@\n%@\nCore Audio, driver, and hardware processing are not included.\n\nCog → Core Audio: %@\nDevice physical stream: %@", @"Detailed Cog signal-integrity and output format tooltip"),
+		                                                               virtualDescription,
+		                                                               deviceDescription,
+		                                                               transportDescription];
+		NSString *integerTransportDetails = endToEndInteger ?
+		                                           (hogModeOwned ? NSLocalizedString(@"Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams; Cog owns the device exclusively.", @"Exclusive integer transport tooltip") :
+		                                                           NSLocalizedString(@"Verified integer transport from Cog's app client through the reported Core Audio virtual and physical streams without exclusive ownership.", @"Shared integer transport tooltip")) :
+		                                           NSLocalizedString(@"End-to-end integer transport is not active.", @"Inactive integer transport tooltip");
+		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"Cog signal path: %@\n%@\n%@\nDriver and hardware processing beyond the reported physical stream are not included.\n\nApp client format: %@\nCore Audio virtual stream: %@\nDevice physical stream: %@", @"Detailed Cog signal-integrity and output format tooltip"),
 		                                                            integrityDescription,
 		                                                            integrityDetails,
+		                                                            integerTransportDetails,
 		                                                            formatDescription,
+		                                                            virtualDescription,
 		                                                            deviceDescription];
 	} else if(!notification.object || notification.object == outputFormatSource) {
 		// An old output can finish stopping after its replacement has already
 		// published the same format. Ignore that stale clear instead of replacing
 		// the active format with a dash during track transitions.
 		outputFormatSource = nil;
-		outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Device: —", @"No active Cog signal-integrity or output format information");
-		outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's Core Audio handoff and the selected device's physical output stream.", @"Cog signal-integrity and output format tooltip");
+		outputFormatField.stringValue = NSLocalizedString(@"Cog: — · App: — → Core Audio: — → Device: —", @"No active Cog signal-integrity or output format information");
+		outputFormatField.toolTip = NSLocalizedString(@"Shows whether Cog preserves decoded source samples, followed by Cog's app, Core Audio virtual, and device physical formats.", @"Cog signal-integrity and output format tooltip");
 	}
 }
 

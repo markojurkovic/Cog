@@ -769,6 +769,7 @@ static BOOL consentLastEnabled = NO;
 	[userDefaultsValuesDict setObject:@NO forKey:@"selectionFollowsPlayback"];
 
 	[userDefaultsValuesDict setObject:@YES forKey:@"suspendOutputOnPause"];
+	[userDefaultsValuesDict setObject:@NO forKey:@"exclusiveIntegerOutput"];
 	[userDefaultsValuesDict setObject:@YES forKey:@"enableFading"];
 
 	// Register and sync defaults

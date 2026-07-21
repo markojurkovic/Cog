@@ -85,6 +85,7 @@ using std::atomic_long;
 	BOOL outputdevicechanged;
 
 	BOOL suspendOutputOnPause;
+	BOOL exclusiveIntegerOutput;
 
 	double volume;
 
@@ -113,10 +114,19 @@ using std::atomic_long;
 	BOOL preferIntegerPhysicalOutput;
 	BOOL renderFormatIntegerPhysical;
 	NSDictionary<NSNumber *, NSValue *> *preferredIntegerPhysicalFormats;
+	BOOL preferExclusiveIntegerTransport;
+	BOOL renderFormatEndToEndInteger;
+	BOOL preferredIntegerTransportRequiresHog;
+	NSDictionary<NSNumber *, NSValue *> *preferredIntegerVirtualFormats;
 	AudioStreamBasicDescription preferredIntegerClientFormat;
 	BOOL savedPhysicalFormatValid;
 	AudioDeviceID savedPhysicalFormatDeviceID;
 	NSDictionary<NSNumber *, NSValue *> *savedPhysicalFormats;
+	BOOL savedVirtualFormatValid;
+	AudioDeviceID savedVirtualFormatDeviceID;
+	NSDictionary<NSNumber *, NSValue *> *savedVirtualFormats;
+	BOOL hogModeOwned;
+	AudioDeviceID hogModeDeviceID;
 
 	double *outputDoubleScratch;
 	double *inputDoubleScratch;

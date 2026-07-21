@@ -24,6 +24,9 @@ private final class OutputPrefs: ObservableObject {
     @Published var suspendOutputOnPause: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(suspendOutputOnPause, forKey: "suspendOutputOnPause") }
     }
+    @Published var exclusiveIntegerOutput: Bool {
+        didSet { guard isActive else { return }; UserDefaults.standard.set(exclusiveIntegerOutput, forKey: "exclusiveIntegerOutput") }
+    }
     @Published var enableFading: Bool {
         didSet { guard isActive else { return }; UserDefaults.standard.set(enableFading, forKey: "enableFading") }
     }
@@ -45,6 +48,7 @@ private final class OutputPrefs: ObservableObject {
         enableFSurround = d.bool(forKey: "enableFSurround")
         volumeLimit = d.object(forKey: "volumeLimit") as? Bool ?? true
         suspendOutputOnPause = d.object(forKey: "suspendOutputOnPause") as? Bool ?? true
+        exclusiveIntegerOutput = d.object(forKey: "exclusiveIntegerOutput") as? Bool ?? false
         enableFading = d.object(forKey: "enableFading") as? Bool ?? true
         enableHdcd = d.object(forKey: "enableHDCD") as? Bool ?? true
         halveDSDVolume = d.object(forKey: "halveDSDVolume") as? Bool ?? false
@@ -121,6 +125,17 @@ struct OutputPaneView: View {
             Toggle("Limit volume to prevent clipping", isOn: $prefs.volumeLimit)
             Toggle("Suspend output when paused", isOn: $prefs.suspendOutputOnPause)
             Toggle("Fade playback transitions", isOn: $prefs.enableFading)
+            Section {
+                Toggle(
+                    "Use exclusive mode for end-to-end integer output",
+                    isOn: $prefs.exclusiveIntegerOutput
+                )
+                Text("When an integer source and the selected device support it, Cog may take exclusive control of the device and other apps will not be able to play through it. Unsupported devices continue using shared output.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } header: {
+                Text("Output ownership").bold()
+            }
             Section {
                 Toggle(
                     "Enable HDCD Peak and Low Level Range Extend",
