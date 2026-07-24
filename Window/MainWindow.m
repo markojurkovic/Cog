@@ -94,20 +94,16 @@ void showSentryConsent(NSWindow *window) {
 		                                                                 NSLocalizedString(@"Unavailable", @"Physical device format unavailable");
 		NSString *virtualDescription = virtualFormatDescription.length ? virtualFormatDescription :
 		                                                                   NSLocalizedString(@"Unavailable", @"Core Audio virtual format unavailable");
-		const BOOL endToEndInteger = [notification.userInfo[CogCoreAudioEndToEndIntegerTransportKey] boolValue];
 		const BOOL exclusiveTransport = [notification.userInfo[CogCoreAudioExclusiveTransportKey] boolValue];
 		NSString *transportStatus = exclusiveTransport ?
-		                                NSLocalizedString(@" · Exclusive", @"Exclusive audio transport status") :
-		                                (endToEndInteger ? NSLocalizedString(@" · Integer", @"End-to-end integer transport status") : @"");
-		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@%@", @"Signal integrity, active app format, and concise transport status"),
+		                                NSLocalizedString(@" · Exclusive", @"Exclusive audio transport status") : @"";
+		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@%@", @"Signal integrity, active app format, and exclusive transport status"),
 		                                                               integrityDescription,
 		                                                               formatDescription,
 		                                                               transportStatus];
 		NSString *transportDetails = exclusiveTransport ?
-		                                         (endToEndInteger ? NSLocalizedString(@"Exclusive integer", @"Exclusive integer transport tooltip value") :
-		                                                             NSLocalizedString(@"Exclusive", @"Exclusive transport tooltip value")) :
-		                                         (endToEndInteger ? NSLocalizedString(@"End-to-end integer", @"End-to-end integer transport tooltip value") :
-		                                                             NSLocalizedString(@"Shared", @"Shared audio transport tooltip value"));
+		                                 NSLocalizedString(@"Exclusive", @"Exclusive transport tooltip value") :
+		                                 NSLocalizedString(@"Shared", @"Shared audio transport tooltip value");
 		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"%@\n%@\n\nTransport: %@\nApp: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown.", @"Detailed but concise audio output tooltip"),
 		                                                            integrityDescription,
 		                                                            integrityDetails,
