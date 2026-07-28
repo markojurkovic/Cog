@@ -7,19 +7,19 @@
     " · Exclusive" : {
       "comment" : "Exclusive audio transport status"
     },
-    "%@\n%@\n\nTransport: %@\nApp: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown." : {
-      "comment" : "Detailed but concise audio output tooltip",
+    "%@\n%@\n\nSource: %@\nCog output: %@\nTransport: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown." : {
+      "comment" : "Detailed audio source and output tooltip",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "%1$@\n%2$@\n\nTransport: %3$@\nApp: %4$@\nCore Audio: %5$@\nDevice: %6$@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown."
+            "value" : "%1$@\n%2$@\n\nSource: %3$@\nCog output: %4$@\nTransport: %5$@\nCore Audio: %6$@\nDevice: %7$@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown."
           }
         }
       }
     },
     "%@ · %@%@" : {
-      "comment" : "Signal integrity, active app format, and concise transport status",
+      "comment" : "Signal integrity, Cog output format, and exclusive transport status",
       "localizations" : {
         "en" : {
           "stringUnit" : {

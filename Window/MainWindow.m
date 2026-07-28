@@ -76,6 +76,8 @@ void showSentryConsent(NSWindow *window) {
 
 - (void)coreAudioOutputFormatDidChange:(NSNotification *)notification {
 	NSString *formatDescription = notification.userInfo[CogCoreAudioOutputFormatDescriptionKey];
+	NSString *statusFormatDescription = notification.userInfo[CogCoreAudioOutputStatusFormatDescriptionKey];
+	NSString *sourceFormatDescription = notification.userInfo[CogCoreAudioSourceFormatDescriptionKey];
 	NSString *virtualFormatDescription = notification.userInfo[CogCoreAudioVirtualFormatDescriptionKey];
 	NSString *deviceFormatDescription = notification.userInfo[CogCoreAudioDeviceFormatDescriptionKey];
 	if(formatDescription.length) {
@@ -94,21 +96,24 @@ void showSentryConsent(NSWindow *window) {
 		                                                                 NSLocalizedString(@"Unavailable", @"Physical device format unavailable");
 		NSString *virtualDescription = virtualFormatDescription.length ? virtualFormatDescription :
 		                                                                   NSLocalizedString(@"Unavailable", @"Core Audio virtual format unavailable");
+		NSString *sourceDescription = sourceFormatDescription.length ? sourceFormatDescription :
+		                                                                  NSLocalizedString(@"Unavailable", @"Decoded source format unavailable");
 		const BOOL exclusiveTransport = [notification.userInfo[CogCoreAudioExclusiveTransportKey] boolValue];
 		NSString *transportStatus = exclusiveTransport ?
 		                                NSLocalizedString(@" · Exclusive", @"Exclusive audio transport status") : @"";
-		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@%@", @"Signal integrity, active app format, and exclusive transport status"),
+		outputFormatField.stringValue = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@%@", @"Signal integrity, Cog output format, and exclusive transport status"),
 		                                                               integrityDescription,
-		                                                               formatDescription,
+		                                                               statusFormatDescription.length ? statusFormatDescription : formatDescription,
 		                                                               transportStatus];
 		NSString *transportDetails = exclusiveTransport ?
 		                                 NSLocalizedString(@"Exclusive", @"Exclusive transport tooltip value") :
 		                                 NSLocalizedString(@"Shared", @"Shared audio transport tooltip value");
-		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"%@\n%@\n\nTransport: %@\nApp: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown.", @"Detailed but concise audio output tooltip"),
+		outputFormatField.toolTip = [NSString stringWithFormat:NSLocalizedString(@"%@\n%@\n\nSource: %@\nCog output: %@\nTransport: %@\nCore Audio: %@\nDevice: %@\n\nFormats are reported by Core Audio; later driver or hardware processing is not shown.", @"Detailed audio source and output tooltip"),
 		                                                            integrityDescription,
 		                                                            integrityDetails,
-		                                                            transportDetails,
+		                                                            sourceDescription,
 		                                                            formatDescription,
+		                                                            transportDetails,
 		                                                            virtualDescription,
 		                                                            deviceDescription];
 	} else if(!notification.object || notification.object == outputFormatSource) {

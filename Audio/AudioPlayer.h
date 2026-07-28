@@ -23,6 +23,8 @@
 
 FOUNDATION_EXPORT NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification;
 FOUNDATION_EXPORT NSString *const CogCoreAudioOutputFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioOutputStatusFormatDescriptionKey;
+FOUNDATION_EXPORT NSString *const CogCoreAudioSourceFormatDescriptionKey;
 FOUNDATION_EXPORT NSString *const CogCoreAudioVirtualFormatDescriptionKey;
 FOUNDATION_EXPORT NSString *const CogCoreAudioDeviceFormatDescriptionKey;
 FOUNDATION_EXPORT NSString *const CogCoreAudioEndToEndIntegerTransportKey;
