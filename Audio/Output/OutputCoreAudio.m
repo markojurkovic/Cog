@@ -34,6 +34,8 @@ static NSNotificationName CogPlaybackDidBeginNotificiation = @"CogPlaybackDidBeg
 
 NSNotificationName const CogCoreAudioOutputFormatDidChangeNotification = @"CogCoreAudioOutputFormatDidChangeNotification";
 NSString *const CogCoreAudioOutputFormatDescriptionKey = @"CogCoreAudioOutputFormatDescription";
+NSString *const CogCoreAudioOutputStatusFormatDescriptionKey = @"CogCoreAudioOutputStatusFormatDescription";
+NSString *const CogCoreAudioSourceFormatDescriptionKey = @"CogCoreAudioSourceFormatDescription";
 NSString *const CogCoreAudioVirtualFormatDescriptionKey = @"CogCoreAudioVirtualFormatDescription";
 NSString *const CogCoreAudioDeviceFormatDescriptionKey = @"CogCoreAudioDeviceFormatDescription";
 NSString *const CogCoreAudioEndToEndIntegerTransportKey = @"CogCoreAudioEndToEndIntegerTransport";
@@ -125,22 +127,7 @@ static NSString *outputSampleRateDescription(double sampleRate) {
 	return [NSString stringWithFormat:@"%.0f Hz", sampleRate];
 }
 
-static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOOL isDoP) {
-	NSString *formatName;
-	if(isDoP) {
-		formatName = @"DoP";
-	} else if(format.mFormatID == kAudioFormatLinearPCM) {
-		if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
-			formatName = [NSString stringWithFormat:@"Float%u PCM", (unsigned int)format.mBitsPerChannel];
-		} else if(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
-			formatName = [NSString stringWithFormat:@"Int%u PCM", (unsigned int)format.mBitsPerChannel];
-		} else {
-			formatName = [NSString stringWithFormat:@"UInt%u PCM", (unsigned int)format.mBitsPerChannel];
-		}
-	} else {
-		formatName = @"Core Audio";
-	}
-
+static NSString *outputFormatDescriptionWithName(AudioStreamBasicDescription format, NSString *formatName) {
 	const BOOL nonInterleaved = !!(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
 	const UInt32 bytesPerSample = nonInterleaved ? format.mBytesPerFrame :
 	                                              (format.mChannelsPerFrame ? format.mBytesPerFrame / format.mChannelsPerFrame : 0);
@@ -162,6 +149,56 @@ static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOO
 		description = [description stringByAppendingString:NSLocalizedString(@" · Non-mixable", @"Non-mixable Core Audio stream format")];
 	}
 	return description;
+}
+
+static NSString *outputFormatDescription(AudioStreamBasicDescription format, BOOL isDoP) {
+	NSString *formatName;
+	if(isDoP) {
+		formatName = @"DoP";
+	} else if(format.mFormatID == kAudioFormatLinearPCM) {
+		if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+			formatName = [NSString stringWithFormat:@"Float%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else if(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+			formatName = [NSString stringWithFormat:@"Int%u PCM", (unsigned int)format.mBitsPerChannel];
+		} else {
+			formatName = [NSString stringWithFormat:@"UInt%u PCM", (unsigned int)format.mBitsPerChannel];
+		}
+	} else {
+		formatName = @"Core Audio";
+	}
+	return outputFormatDescriptionWithName(format, formatName);
+}
+
+static NSString *outputStatusFormatDescription(AudioStreamBasicDescription format, BOOL isDoP) {
+	NSString *formatName;
+	if(isDoP) {
+		formatName = @"DoP";
+	} else if(format.mFormatID == kAudioFormatLinearPCM) {
+		if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+			formatName = [NSString stringWithFormat:@"Float%u", (unsigned int)format.mBitsPerChannel];
+		} else if(format.mFormatFlags & kAudioFormatFlagIsSignedInteger) {
+			formatName = [NSString stringWithFormat:@"Int%u", (unsigned int)format.mBitsPerChannel];
+		} else {
+			formatName = [NSString stringWithFormat:@"UInt%u", (unsigned int)format.mBitsPerChannel];
+		}
+	} else {
+		formatName = @"Core Audio";
+	}
+	NSString *description = [NSString stringWithFormat:@"%@ · %@",
+	                                                        formatName,
+	                                                        outputSampleRateDescription(format.mSampleRate)];
+	if(format.mFormatFlags & kAudioFormatFlagIsNonMixable) {
+		description = [description stringByAppendingString:NSLocalizedString(@" · Non-mixable", @"Non-mixable Core Audio stream format")];
+	}
+	return description;
+}
+
+static NSString *sourceFormatDescription(AudioStreamBasicDescription format) {
+	if(format.mBitsPerChannel != 1) {
+		return outputFormatDescription(format, NO);
+	}
+	return [NSString stringWithFormat:@"DSD · %@ · 1-bit",
+	                                  outputSampleRateDescription(format.mSampleRate)];
 }
 
 static NSString *streamOutputFormatDescription(AudioDeviceID deviceID,
@@ -380,7 +417,12 @@ static void *kOutputCoreAudioContext = &kOutputCoreAudioContext;
 		NSString *virtualDescription = virtualOutputFormatDescription(activeDeviceID);
 		NSString *deviceDescription = physicalOutputFormatDescription(activeDeviceID);
 		NSMutableDictionary *formatInfo = [@{ CogCoreAudioOutputFormatDescriptionKey: description } mutableCopy];
+		formatInfo[CogCoreAudioOutputStatusFormatDescriptionKey] =
+		    outputStatusFormatDescription(renderFormat, renderFormatDoPInteger);
 		[formatInfo addEntriesFromDictionary:[self signalIntegrityInfo]];
+		if(sourceFormatValid) {
+			formatInfo[CogCoreAudioSourceFormatDescriptionKey] = sourceFormatDescription(sourceFormat);
+		}
 		if(virtualDescription) {
 			formatInfo[CogCoreAudioVirtualFormatDescriptionKey] = virtualDescription;
 		}
