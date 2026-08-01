@@ -96,6 +96,20 @@ static SandboxBroker *kSharedSandboxBroker = nil;
 	return [NSClassFromString(@"PlaylistController") sharedPersistentContainer];
 }
 
++ (NSURL *_Nullable)filePathURLForURL:(NSURL *)url {
+	if(![url isFileURL]) return url;
+
+	NSURL *filePathURL = [url filePathURL];
+	if(!filePathURL) return nil;
+
+	NSString *fragment = [url fragment];
+	if(![fragment length]) return filePathURL;
+
+	NSURLComponents *components = [NSURLComponents componentsWithURL:filePathURL resolvingAgainstBaseURL:NO];
+	components.fragment = fragment;
+	return [components URL];
+}
+
 + (NSURL *_Nullable)urlWithoutFragment:(NSURL *)url {
 	if(![url isFileURL]) return url;
 

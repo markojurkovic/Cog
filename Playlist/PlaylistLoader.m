@@ -458,6 +458,8 @@ static inline BOOL isCueSheetTrackURL(NSURL *url) {
 		@try {
 			if(!url) continue;
 			if([url isFileURL]) {
+				NSURL *filePathURL = [SandboxBroker filePathURLForURL:url];
+				if(filePathURL) url = filePathURL;
 				if(![url path]) continue;
 				BOOL isDir;
 				if([[NSFileManager defaultManager] fileExistsAtPath:[url path] isDirectory:&isDir]) {
