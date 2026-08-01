@@ -3708,7 +3708,7 @@
       }
     },
     "Unavailable" : {
-      "comment" : "Core Audio virtual format unavailable\nPhysical device format unavailable"
+      "comment" : "Core Audio virtual format unavailable\nDecoded source format unavailable\nPhysical device format unavailable"
     },
     "Unknown" : {
       "comment" : "Unknown Cog signal-integrity state"
