@@ -28,11 +28,12 @@
 }
 
 - (BOOL)open:(NSURL *)url {
-	[self setURL:url];
-
 	id sandboxBrokerClass = NSClassFromString(@"SandboxBroker");
 	id sandboxBroker = [sandboxBrokerClass sharedSandboxBroker];
 
+	NSURL *filePathURL = [sandboxBrokerClass filePathURLForURL:url];
+	if(filePathURL) url = filePathURL;
+	[self setURL:url];
 	sbHandle = [sandboxBroker beginFolderAccess:url];
 
 	NSString *path = [url path];

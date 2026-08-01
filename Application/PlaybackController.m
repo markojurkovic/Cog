@@ -7,6 +7,7 @@
 #import "PlaylistController.h"
 #import "PlaylistEntry.h"
 #import "PlaylistLoader.h"
+#import "SandboxBroker.h"
 
 #import "MainWindow.h"
 #import "MiniWindow.h"
@@ -87,6 +88,13 @@ static inline void dispatch_async_or_reentrant(dispatch_queue_t queue, dispatch_
 	[mainQueue addOperation:operation];
 }
 
+@end
+
+@interface PlaybackController ()
+@property(strong) NSAlert *fileUnavailableAlert;
+@property(strong) PlaylistEntry *pendingUnavailableEntry;
+- (BOOL)isFileAvailableForEntry:(PlaylistEntry *)entry;
+- (void)handleUnavailableFileForEntry:(PlaylistEntry *)entry stopPlayback:(BOOL)stopPlayback;
 @end
 
 @interface FadeTimerData : NSObject {
@@ -256,6 +264,8 @@ static double reverseSpeedScale(double input, double min, double max) {
 }
 
 - (IBAction)stop:(id)sender {
+	self.pendingUnavailableEntry = nil;
+
 	[[NSUserDefaults standardUserDefaults] setInteger:CogStatusStopped forKey:@"lastPlaybackStatus"];
 
 	[self audioPlayer:audioPlayer removeEqualizer:_eq];
@@ -327,11 +337,16 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 
 - (void)playEntry:(PlaylistEntry *)pe startPaused:(BOOL)paused andSeekTo:(id)offset {
 	if(!pe.url) {
-		pe.error = YES;
-		pe.errorMessage = NSLocalizedStringFromTableInBundle(@"ErrorMessageBadFile", nil, [NSBundle bundleForClass:[self class]], @"");
 		[SentrySDK captureMessage:[NSString stringWithFormat:@"Attempted to play a bad file with no URL: %@", pe.urlString]];
+		[self handleUnavailableFileForEntry:pe stopPlayback:YES];
 		return;
 	}
+	if(![self isFileAvailableForEntry:pe]) {
+		DLog(@"Attempted to play an unavailable file: %@", pe.urlString);
+		[self handleUnavailableFileForEntry:pe stopPlayback:YES];
+		return;
+	}
+	self.pendingUnavailableEntry = nil;
 
 	//[SentrySDK captureMessage:[NSString stringWithFormat:@"Playing track: %@", pe.url]];
 
@@ -379,6 +394,56 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 	double seekTime = pe.seekable ? [offset doubleValue] : 0.0;
 
 	[audioPlayer performSelectorOnMainThread:@selector(playBG:withUserInfo:withRGInfo:startPaused:andSeekTo:) withObjects:pe.url, pe, makeRGInfo(pe), @(paused), @(seekTime), nil];
+}
+
+- (BOOL)isFileAvailableForEntry:(PlaylistEntry *)entry {
+	NSURL *url = entry.url;
+	if(!url) return NO;
+	if(![url isFileURL]) return YES;
+
+	NSURL *filePathURL = [SandboxBroker filePathURLForURL:url];
+	if(!filePathURL || ![[filePathURL path] length]) return NO;
+
+	SandboxBroker *sandboxBroker = [SandboxBroker sharedSandboxBroker];
+	const void *sandboxHandle = [sandboxBroker beginFolderAccess:filePathURL];
+
+	BOOL isDirectory = NO;
+	BOOL available = [[NSFileManager defaultManager] fileExistsAtPath:[filePathURL path]
+														 isDirectory:&isDirectory] && !isDirectory;
+
+	[sandboxBroker endFolderAccess:sandboxHandle];
+	return available;
+}
+
+- (void)handleUnavailableFileForEntry:(PlaylistEntry *)entry stopPlayback:(BOOL)stopPlayback {
+	self.pendingUnavailableEntry = nil;
+	if(!entry) return;
+
+	entry.error = YES;
+	entry.errorMessage = NSLocalizedString(@"ErrorMessageFileUnavailable", @"Playlist error shown when a local file cannot be accessed");
+	[playlistController commitPersistentStoreAsync];
+
+	NSString *location = [[SandboxBroker filePathURLForURL:entry.url] path];
+	if(![location length]) location = entry.display;
+	if(![location length]) location = entry.urlString;
+	if(![location length]) location = NSLocalizedString(@"FileUnavailableUnknownEntry", @"Fallback label for a missing playlist entry with no usable name or URL");
+
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if(stopPlayback && self.playbackStatus != CogStatusStopped && self.playbackStatus != CogStatusStopping) {
+			[self stop:nil];
+		}
+
+		if(self.fileUnavailableAlert) return;
+
+		NSAlert *alert = [NSAlert new];
+		self.fileUnavailableAlert = alert;
+		alert.alertStyle = NSAlertStyleWarning;
+		alert.messageText = NSLocalizedString(@"FileUnavailableAlertMessageText", @"Title of an alert shown when a playlist file cannot be accessed");
+		alert.informativeText = [NSString stringWithFormat:NSLocalizedString(@"FileUnavailableAlertInformativeText", @"Alert text explaining that a playlist file is unavailable; placeholder is its path or display name"), location];
+		[alert addButtonWithTitle:NSLocalizedString(@"GrantPathOK", @"OK button text")];
+		[alert runModal];
+		self.fileUnavailableAlert = nil;
+	});
 }
 
 - (IBAction)next:(id)sender {
@@ -858,21 +923,21 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 		pe = nil;
 	else {
 		pe = [playlistController getNextEntry:curEntry];
-		if(pe && [pe metadataLoaded] != YES) {
+	}
+
+	if(pe && (!pe.url || ![self isFileAvailableForEntry:pe])) {
+		[player setNextStream:nil];
+		self.pendingUnavailableEntry = pe;
+	} else if(pe && pe.url) {
+		self.pendingUnavailableEntry = nil;
+		if([pe metadataLoaded] != YES) {
 			NSArray *entries = @[pe];
 			[playlistLoader performSelectorInBackground:@selector(loadInfoForEntries:) withObject:entries];
 		}
-	}
-
-	if(pe && pe.url) {
 		//[SentrySDK captureMessage:[NSString stringWithFormat:@"Beginning decoding track: %@", pe.url]];
 		[player setNextStream:pe.url withUserInfo:pe withRGInfo:makeRGInfo(pe)];
-	} else if(pe) {
-		[SentrySDK captureMessage:@"Invalid playlist entry reached"];
-		[player setNextStream:nil];
-		pe.error = YES;
-		pe.errorMessage = NSLocalizedStringFromTableInBundle(@"ErrorMessageBadFile", nil, [NSBundle bundleForClass:[self class]], @"");
 	} else {
+		self.pendingUnavailableEntry = nil;
 		//[SentrySDK captureMessage:@"End of playlist reached"];
 		[player setNextStream:nil];
 	}
@@ -971,6 +1036,13 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 }
 
 - (void)audioPlayer:(AudioPlayer *)player didStopNaturally:(id)userInfo {
+	PlaylistEntry *unavailableEntry = self.pendingUnavailableEntry;
+	if(unavailableEntry) {
+		self.pendingUnavailableEntry = nil;
+		[self handleUnavailableFileForEntry:unavailableEntry stopPlayback:NO];
+		return;
+	}
+
 	if([[NSUserDefaults standardUserDefaults] boolForKey:@"quitOnNaturalStop"]) {
 		//[SentrySDK captureMessage:@"Playback stopped naturally, terminating app"];
 		[NSApp terminate:nil];
@@ -979,6 +1051,10 @@ NSDictionary *makeRGInfo(PlaylistEntry *pe) {
 
 - (void)audioPlayer:(AudioPlayer *)player restartPlaybackAtCurrentPosition:(id)userInfo {
 	PlaylistEntry *pe = [playlistController currentEntry];
+	if(!pe || ![self isFileAvailableForEntry:pe]) {
+		if(pe) [self handleUnavailableFileForEntry:pe stopPlayback:YES];
+		return;
+	}
 	BOOL paused = playbackStatus == CogStatusPaused;
 	//[SentrySDK captureMessage:[NSString stringWithFormat:@"Playback restarting for track: %@", pe.url]];
 	[player performSelectorOnMainThread:@selector(playBG:withUserInfo:withRGInfo:startPaused:andSeekTo:) withObjects:pe.url, pe, makeRGInfo(pe), @(paused), @(pe.seekable ? pe.currentPosition : 0.0), nil];

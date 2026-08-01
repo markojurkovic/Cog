@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (SandboxBroker *)sharedSandboxBroker;
 
++ (NSURL *_Nullable)filePathURLForURL:(NSURL *)url;
 + (NSURL *_Nullable)urlWithoutFragment:(NSURL *)url;
 + (BOOL)isPath:(NSURL *)path aSubdirectoryOf:(NSURL *)directory;
 
