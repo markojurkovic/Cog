@@ -1074,22 +1074,6 @@
         }
       }
     },
-    "ErrorMessageBadFile" : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Unable to parse metadata for bad file."
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "No se han podido analizar los metadatos de un archivo defectuoso."
-          }
-        }
-      }
-    },
     "ErrorMessageFileUnavailable" : {
       "comment" : "Playlist error shown when a local file cannot be accessed",
       "localizations" : {
