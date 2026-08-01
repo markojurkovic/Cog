@@ -1090,6 +1090,23 @@
         }
       }
     },
+    "ErrorMessageFileUnavailable" : {
+      "comment" : "Playlist error shown when a local file cannot be accessed",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "File unavailable."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Archivo no disponible."
+          }
+        }
+      }
+    },
     "ErrorMetadata" : {
       "localizations" : {
         "en" : {
@@ -1275,6 +1292,57 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Bandeja de archivos"
+          }
+        }
+      }
+    },
+    "FileUnavailableAlertInformativeText" : {
+      "comment" : "Alert text explaining that a playlist file is unavailable; placeholder is its path or display name",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cog can’t access:\n\n%@\n\nMake the file available and try again, or choose another playlist entry."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cog no puede acceder a:\n\n%@\n\nHaz que el archivo vuelva a estar disponible e inténtalo de nuevo, o elige otra entrada de la lista de reproducción."
+          }
+        }
+      }
+    },
+    "FileUnavailableAlertMessageText" : {
+      "comment" : "Title of an alert shown when a playlist file cannot be accessed",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "File Unavailable"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Archivo no disponible"
+          }
+        }
+      }
+    },
+    "FileUnavailableUnknownEntry" : {
+      "comment" : "Fallback label for a missing playlist entry with no usable name or URL",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unknown playlist entry"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entrada desconocida de la lista de reproducción"
           }
         }
       }
