@@ -964,17 +964,6 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 	free(devids);
 }
 
-static BOOL inputFormatUsesDoPCarrierRate(AudioStreamBasicDescription inputFormat) {
-	if(inputFormat.mBitsPerChannel == 1) {
-		return YES;
-	}
-
-	const BOOL isFloat = !!(inputFormat.mFormatFlags & kAudioFormatFlagIsFloat);
-	return !isFloat &&
-	       inputFormat.mBitsPerChannel >= 24 &&
-	       inputFormat.mSampleRate >= 176400.0;
-}
-
 static double preferredDeviceSampleRateForInputFormat(AudioStreamBasicDescription inputFormat) {
 	if(inputFormat.mBitsPerChannel == 1) {
 		return inputFormat.mSampleRate / 16.0;
@@ -3145,13 +3134,11 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	                                    sampleRate;
 	const BOOL outputSampleRateSupported = outputSampleRate > 0.0 &&
 	                                           [self deviceSupportsSampleRate:outputSampleRate];
-	// Native DSD can be converted to PCM when the selected device cannot run
-	// the required DoP carrier clock. An already packed DoP/PCM stream cannot
-	// be resampled without corrupting its marker and payload bytes, so keep the
-	// strict failure behavior for that representation.
-	const BOOL usesDoPCarrier = !highPrecisionPCM &&
-	                            inputFormatUsesDoPCarrierRate(inputFormat) &&
-	                            (!nativeDSD || sampleRateSupported);
+	// Only a native DSD source requires Cog to establish a DoP carrier here.
+	// Sample rate and integer depth alone cannot distinguish DoP from ordinary
+	// high-resolution PCM; treating every 24-bit stream at 176.4 kHz or above
+	// as DoP replaces valid PCM with carrier silence.
+	const BOOL usesDoPCarrier = nativeDSD && sampleRateSupported;
 	if(nativeDSD && !sampleRateSupported) {
 		DLog(@"DoP carrier rate %.0f Hz is unavailable; converting native DSD to %.0f Hz PCM", sampleRate, outputSampleRate);
 	}
