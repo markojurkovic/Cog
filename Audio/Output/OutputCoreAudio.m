@@ -268,6 +268,8 @@ static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
 - (BOOL)currentOutputUsesExclusiveTransport;
 - (BOOL)currentOutputIsEndToEndInteger;
 - (BOOL)currentProcessOwnsHogMode;
+- (void)configurePreferredFloatOutputForConvertedDSDInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                                sampleRate:(double)sampleRate;
 - (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat;
 @end
 
@@ -2404,6 +2406,21 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	}
 }
 
+- (void)configurePreferredFloatOutputForConvertedDSDInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                                sampleRate:(double)sampleRate {
+	// DSD-to-PCM conversion produces Float64 internally. Prefer an equally precise
+	// direct device stream, but allow Float32 when that is the only float client
+	// representation exposed by the device (as with Apple USB-C EarPods). The
+	// render callback already performs the final Float64-to-Float32 conversion.
+	AudioStreamBasicDescription convertedPCMFormat = AudioFormatAsFloat64(inputFormat);
+	convertedPCMFormat.mSampleRate = sampleRate;
+	[self configurePreferredFloatOutputForInputFormat:convertedPCMFormat sampleRate:sampleRate];
+	if(preferExclusiveFloatTransport) return;
+
+	convertedPCMFormat = AudioFormatAsFloat32(convertedPCMFormat);
+	[self configurePreferredFloatOutputForInputFormat:convertedPCMFormat sampleRate:sampleRate];
+}
+
 - (BOOL)deviceSupportsSampleRate:(double)sampleRate {
 	NSNumber *cacheKey = @(sampleRate);
 	@synchronized(sampleRateSupportCache) {
@@ -3134,6 +3151,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	                                    sampleRate;
 	const BOOL outputSampleRateSupported = outputSampleRate > 0.0 &&
 	                                           [self deviceSupportsSampleRate:outputSampleRate];
+	const BOOL convertsDSDToPCM = nativeDSD && !sampleRateSupported && outputSampleRateSupported;
 	// Only a native DSD source requires Cog to establish a DoP carrier here.
 	// Sample rate and integer depth alone cannot distinguish DoP from ordinary
 	// high-resolution PCM; treating every 24-bit stream at 176.4 kHz or above
@@ -3166,7 +3184,16 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		} else {
 			bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
 		}
-		if(sampleRateSupported && AudioFormatIsIntegerPCM(inputFormat) && inputFormat.mBitsPerChannel <= 32) {
+		if(convertsDSDToPCM) {
+			preferExclusiveIntegerTransport = NO;
+			preferredIntegerTransportRequiresHog = NO;
+			preferredIntegerVirtualFormats = nil;
+			preferIntegerPhysicalOutput = NO;
+			preferredIntegerPhysicalFormats = nil;
+			bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
+			[self configurePreferredFloatOutputForConvertedDSDInputFormat:inputFormat
+			                                                   sampleRate:outputSampleRate];
+		} else if(sampleRateSupported && AudioFormatIsIntegerPCM(inputFormat) && inputFormat.mBitsPerChannel <= 32) {
 			[self configurePreferredIntegerOutputAtSampleRate:sampleRate
 			                                       requiredBits:inputFormat.mBitsPerChannel
 			                                  requireDoPCarrier:NO];
@@ -4151,7 +4178,8 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			// Restore the device's mixable virtual format and retry through AUHAL so
 			// opting into exclusive mode can never turn a playable track into silence.
 			ALog(@"Direct HAL output could not start; retrying with shared Core Audio output: %@", err);
-			if(AudioFormatIsFloat32(sourceFormat) || AudioFormatIsFloat64(sourceFormat)) {
+			const BOOL sourceConvertsDSDToPCM = sourceFormat.mBitsPerChannel == 1 && !renderFormatDoPInteger;
+			if(AudioFormatIsFloat32(sourceFormat) || AudioFormatIsFloat64(sourceFormat) || sourceConvertsDSDToPCM) {
 				preferExclusiveFloatTransport = NO;
 				preferredFloatVirtualFormats = nil;
 				bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
