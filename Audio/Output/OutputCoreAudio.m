@@ -713,6 +713,18 @@ current_device_listener(AudioObjectID inObjectID, UInt32 inNumberAddresses, cons
 			DLog(@"THERE'S NO DEFAULT OUTPUT DEVICE");
 			return kAudioHardwareBadDeviceError;
 		}
+		// Hogging the system-default device can make Core Audio temporarily publish
+		// another device as the default rather than kAudioObjectUnknown. Do not
+		// follow that synthetic change and tear down the exclusive transaction Cog
+		// just established. Once hog mode is released, a subsequent notification
+		// can safely move Cog to the user's actual default device.
+		if(outputDeviceID != kAudioObjectUnknown && outputDeviceID != (AudioDeviceID)-1 &&
+		   outputDeviceID != deviceID && [self currentProcessOwnsHogMode]) {
+			DLog(@"Ignoring transient default output %u while Cog owns device %u",
+			     (unsigned int)deviceID,
+			     (unsigned int)outputDeviceID);
+			return noErr;
+		}
 	}
 
 	if(_au) {
