@@ -78,6 +78,7 @@ static void *kConverterNodeContext = &kConverterNodeContext;
 
 		mutex = [NSRecursiveLock new];
 		volumeScalingPreference = [[NSUserDefaults standardUserDefaults] stringForKey:@"volumeScaling"];
+		enableHDCD = [[NSUserDefaults standardUserDefaults] boolForKey:@"enableHDCD"];
 
 #ifdef LOG_CHAINS
 		[self initLogFiles];
@@ -90,6 +91,7 @@ static void *kConverterNodeContext = &kConverterNodeContext;
 - (void)addObservers {
 	if(!observersAdded) {
 		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.volumeScaling" options:(NSKeyValueObservingOptionInitial|NSKeyValueObservingOptionNew) context:kConverterNodeContext];
+		[[NSUserDefaultsController sharedUserDefaultsController] addObserver:self forKeyPath:@"values.enableHDCD" options:(NSKeyValueObservingOptionInitial|NSKeyValueObservingOptionNew) context:kConverterNodeContext];
 		observersAdded = YES;
 	}
 }
@@ -97,6 +99,7 @@ static void *kConverterNodeContext = &kConverterNodeContext;
 - (void)removeObservers {
 	if(observersAdded) {
 		[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.volumeScaling" context:kConverterNodeContext];
+		[[NSUserDefaultsController sharedUserDefaultsController] removeObserver:self forKeyPath:@"values.enableHDCD" context:kConverterNodeContext];
 		observersAdded = NO;
 	}
 }
@@ -132,6 +135,21 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 	*buffer = resizedBuffer;
 	*capacity = requiredCapacity;
 	return YES;
+}
+
+- (BOOL)nativePrecisionPassthroughEnabledLocked {
+	if(!nativePrecisionCandidate || volumeScale != 1.0) return NO;
+
+	const size_t bytesPerSample = inputFormat.mChannelsPerFrame ?
+	                                  inputFormat.mBytesPerFrame / inputFormat.mChannelsPerFrame : 0;
+	const BOOL hdcdProcessingRequired = enableHDCD && rememberedLossless &&
+	                                    !(inputFormat.mFormatFlags & kAudioFormatFlagIsFloat) &&
+	                                    !!(inputFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+	                                    inputFormat.mBitsPerChannel == 16 &&
+	                                    bytesPerSample == sizeof(int16_t) &&
+	                                    inputFormat.mChannelsPerFrame == 2 &&
+	                                    inputFormat.mSampleRate == 44100;
+	return !hdcdProcessingRequired;
 }
 
 - (BOOL)paused {
@@ -186,7 +204,7 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 		return nil;
 	}
 
-	if(nativePrecisionCandidate && volumeScale == 1.0 && inpOffset == inpSize) {
+	if([self nativePrecisionPassthroughEnabledLocked] && inpOffset == inpSize) {
 		AudioStreamBasicDescription inf;
 		uint32_t config;
 		if([self peekFormat:&inf channelConfig:&config]) {
@@ -212,7 +230,6 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 
 		const AudioStreamBasicDescription sourceFormat = [inputChunk format];
 		const BOOL sourceIsFloat = !!(sourceFormat.mFormatFlags & kAudioFormatFlagIsFloat);
-		const BOOL sourceIsUnsigned = !sourceIsFloat && !(sourceFormat.mFormatFlags & kAudioFormatFlagIsSignedInteger);
 #if __BIG_ENDIAN__
 		const BOOL sourceNeedsSwap = !(sourceFormat.mFormatFlags & kAudioFormatFlagIsBigEndian);
 #else
@@ -224,7 +241,11 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 		nodeChannelConfig = inputChannelConfig;
 		nodeLossless = rememberedLossless;
 
-		if(!sourceNeedsSwap && !sourceIsUnsigned) {
+		const BOOL sourceMatchesCanonical = sourceFormat.mFormatFlags == nativePrecisionFormat.mFormatFlags &&
+		                                    sourceFormat.mBitsPerChannel == nativePrecisionFormat.mBitsPerChannel &&
+		                                    sourceFormat.mBytesPerFrame == nativePrecisionFormat.mBytesPerFrame &&
+		                                    sourceFormat.mBytesPerPacket == nativePrecisionFormat.mBytesPerPacket;
+		if((sourceIsFloat && !sourceNeedsSwap) || (!sourceIsFloat && sourceMatchesCanonical)) {
 			[inputChunk setFormat:nativePrecisionFormat];
 			[inputChunk setChannelConfig:inputChannelConfig];
 			[mutex unlock];
@@ -236,10 +257,11 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 		const BOOL resetForward = inputChunk.resetForward;
 		const BOOL isHDCD = [inputChunk isHDCD];
 		NSData *inputData = [inputChunk removeSamples:frameCount];
-		NSMutableData *outputData = [inputData mutableCopy];
-		uint8_t *samples = (uint8_t *)[outputData mutableBytes];
 		const size_t sampleCount = frameCount * sourceFormat.mChannelsPerFrame;
+		NSMutableData *outputData = nil;
 		if(sourceIsFloat) {
+			outputData = [inputData mutableCopy];
+			uint8_t *samples = (uint8_t *)[outputData mutableBytes];
 			for(size_t i = 0; i < sampleCount; ++i) {
 				uint64_t value;
 				memcpy(&value, samples + i * sizeof(value), sizeof(value));
@@ -247,12 +269,15 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 				memcpy(samples + i * sizeof(value), &value, sizeof(value));
 			}
 		} else {
-			for(size_t i = 0; i < sampleCount; ++i) {
-				uint32_t value;
-				memcpy(&value, samples + i * sizeof(value), sizeof(value));
-				if(sourceNeedsSwap) value = __builtin_bswap32(value);
-				if(sourceIsUnsigned) value ^= 0x80000000U;
-				memcpy(samples + i * sizeof(value), &value, sizeof(value));
+			const size_t outputLength = frameCount * nativePrecisionFormat.mBytesPerFrame;
+			outputData = [NSMutableData dataWithLength:outputLength];
+			if(!AudioConvertIntegerPCM([outputData mutableBytes],
+			                           nativePrecisionFormat,
+			                           [inputData bytes],
+			                           sourceFormat,
+			                           sampleCount)) {
+				[mutex unlock];
+				return nil;
 			}
 		}
 
@@ -260,6 +285,8 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 		[outputChunk setFormat:nativePrecisionFormat];
 		[outputChunk setChannelConfig:inputChannelConfig];
 		[outputChunk setLossless:[inputChunk lossless]];
+		[outputChunk setDsdDoPReverseBits:[inputChunk dsdDoPReverseBits]];
+		[outputChunk setDoP:[inputChunk isDoP]];
 		[outputChunk setStreamTimestamp:timestamp];
 		[outputChunk setStreamTimeRatio:timeRatio];
 		outputChunk.resetForward = resetForward;
@@ -516,6 +543,13 @@ static BOOL ensureBufferCapacity(void **buffer, size_t *capacity, size_t require
 		if([keyPath isEqualToString:@"values.volumeScaling"]) {
 			// User reset the volume scaling option
 			[self refreshVolumeScaling];
+		} else if([keyPath isEqualToString:@"values.enableHDCD"]) {
+			[mutex lock];
+			enableHDCD = [[NSUserDefaults standardUserDefaults] boolForKey:@"enableHDCD"];
+			if(nativePrecisionCandidate) {
+				nodeFormat = [self nativePrecisionPassthroughEnabledLocked] ? nativePrecisionFormat : processedFormat;
+			}
+			[mutex unlock];
 		}
 	} else {
 		[super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
@@ -529,7 +563,9 @@ static double db_to_scale(double db) {
 - (void)refreshVolumeScalingLocked:(NSString *)scaling {
 	if(rgInfo == nil) {
 		volumeScale = 1.0;
-		if(nativePrecisionCandidate) nodeFormat = nativePrecisionFormat;
+		if(nativePrecisionCandidate) {
+			nodeFormat = [self nativePrecisionPassthroughEnabledLocked] ? nativePrecisionFormat : processedFormat;
+		}
 		return;
 	}
 
@@ -572,7 +608,7 @@ static double db_to_scale(double db) {
 	}
 	volumeScale = scale;
 	if(nativePrecisionCandidate) {
-		nodeFormat = (volumeScale == 1.0) ? nativePrecisionFormat : processedFormat;
+		nodeFormat = [self nativePrecisionPassthroughEnabledLocked] ? nativePrecisionFormat : processedFormat;
 	}
 }
 
@@ -604,6 +640,7 @@ static double db_to_scale(double db) {
 	inputChannelConfig = inputConfig;
 
 	rememberedLossless = lossless;
+	[self addObservers];
 
 	const BOOL outputDSDAsDoP = (inputFormat.mBitsPerChannel == 1 &&
 	                             inputFormat.mChannelsPerFrame == outputFormat.mChannelsPerFrame &&
@@ -631,8 +668,8 @@ static double db_to_scale(double db) {
 	inpOffset = 0;
 	inpSize = 0;
 
-	// High-precision sources keep their native integer or Float64 representation
-	// while the path is transparent; active gain or resampling uses Float64.
+	// Integer PCM and Float64 sources keep their native precision while the path
+	// is transparent; active gain, HDCD decoding, or resampling uses Float64.
 	processedFormat = floatFormat;
 	processedFormat.mSampleRate = outputFormat.mSampleRate;
 	nativePrecisionFormat = AudioFormatAsCanonicalHighPrecisionPCM(inputFormat);
@@ -672,7 +709,7 @@ static double db_to_scale(double db) {
 	doPStream = outputDSDAsDoP;
 
 	[self refreshVolumeScalingLocked:volumeScalingPreference];
-	nodeFormat = (nativePrecisionCandidate && volumeScale == 1.0) ? nativePrecisionFormat : processedFormat;
+	nodeFormat = [self nativePrecisionPassthroughEnabledLocked] ? nativePrecisionFormat : processedFormat;
 
 	PrintStreamDesc(&inf);
 	PrintStreamDesc(&nodeFormat);

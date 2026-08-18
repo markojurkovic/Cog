@@ -9,6 +9,8 @@
 
 #import "CoreAudioUtils.h"
 
+#include <math.h>
+
 BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format) {
 	const AudioFormatFlags layoutFlags = kAudioFormatFlagIsFloat |
 	                                     kAudioFormatFlagIsBigEndian |
@@ -39,19 +41,153 @@ BOOL AudioFormatIsFloat64(AudioStreamBasicDescription format) {
 	       format.mBytesPerPacket == format.mBytesPerFrame;
 }
 
-BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format) {
+static BOOL AudioFormatHasSupportedIntegerPCMLayout(AudioStreamBasicDescription format,
+                                                    size_t *bytesPerSample) {
 	if(format.mFormatID != kAudioFormatLinearPCM ||
-	   (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) ||
-	   format.mFramesPerPacket != 1) {
+	   (format.mFormatFlags & (kAudioFormatFlagIsFloat |
+	                           kAudioFormatFlagIsNonInterleaved |
+	                           kLinearPCMFormatFlagsSampleFractionMask)) ||
+	   format.mBitsPerChannel < 2 || format.mBitsPerChannel > 32 ||
+	   !format.mChannelsPerFrame || format.mFramesPerPacket != 1 ||
+	   !format.mBytesPerFrame ||
+	   format.mBytesPerFrame % format.mChannelsPerFrame ||
+	   format.mBytesPerPacket != format.mBytesPerFrame) {
 		return NO;
 	}
 
-	const BOOL isFloat = !!(format.mFormatFlags & kAudioFormatFlagIsFloat);
-	const size_t bytesPerSample = isFloat ? sizeof(double) : sizeof(int32_t);
-	return ((isFloat && format.mBitsPerChannel == 64) ||
-	        (!isFloat && format.mBitsPerChannel == 32)) &&
-	       format.mBytesPerFrame == bytesPerSample * format.mChannelsPerFrame &&
-	       format.mBytesPerPacket == format.mBytesPerFrame;
+	const size_t storageBytes = format.mBytesPerFrame / format.mChannelsPerFrame;
+	if(storageBytes < 1 || storageBytes > sizeof(uint32_t) ||
+	   format.mBitsPerChannel > storageBytes * 8) {
+		return NO;
+	}
+	if(bytesPerSample) *bytesPerSample = storageBytes;
+	return YES;
+}
+
+BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format) {
+	if(format.mFormatFlags & kAudioFormatFlagIsFloat) {
+		return format.mFormatID == kAudioFormatLinearPCM &&
+		       !(format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) &&
+		       format.mBitsPerChannel == 64 &&
+		       format.mChannelsPerFrame > 0 &&
+		       format.mFramesPerPacket == 1 &&
+		       format.mBytesPerFrame == sizeof(double) * format.mChannelsPerFrame &&
+		       format.mBytesPerPacket == format.mBytesPerFrame;
+	}
+	return AudioFormatHasSupportedIntegerPCMLayout(format, NULL);
+}
+
+static uint64_t AudioLoadPCMWord(const uint8_t *input, size_t storageBytes, BOOL bigEndian) {
+	uint64_t word = 0;
+	if(bigEndian) {
+		for(size_t byte = 0; byte < storageBytes; ++byte) {
+			word = (word << 8) | input[byte];
+		}
+	} else {
+		for(size_t byte = 0; byte < storageBytes; ++byte) {
+			word |= (uint64_t)input[byte] << (byte * 8);
+		}
+	}
+	return word;
+}
+
+static int64_t AudioLoadCenteredIntegerSample(const uint8_t *input,
+                                              size_t storageBytes,
+                                              UInt32 validBits,
+                                              AudioFormatFlags flags) {
+	const BOOL bigEndian = !!(flags & kAudioFormatFlagIsBigEndian);
+	const BOOL alignedHigh = !(flags & kAudioFormatFlagIsPacked) &&
+	                         !!(flags & kAudioFormatFlagIsAlignedHigh);
+	uint64_t word = AudioLoadPCMWord(input, storageBytes, bigEndian);
+	const size_t storageBits = storageBytes * 8;
+	if(alignedHigh && validBits < storageBits) {
+		word >>= storageBits - validBits;
+	}
+
+	const uint64_t validMask = (UINT64_C(1) << validBits) - 1;
+	const uint64_t signBit = UINT64_C(1) << (validBits - 1);
+	word &= validMask;
+	if(flags & kAudioFormatFlagIsSignedInteger) {
+		return (int64_t)(word ^ signBit) - (int64_t)signBit;
+	}
+	return (int64_t)word - (int64_t)signBit;
+}
+
+static void AudioStoreCenteredIntegerSample(uint8_t *output,
+                                            size_t storageBytes,
+                                            UInt32 validBits,
+                                            AudioFormatFlags flags,
+                                            int64_t centered) {
+	const BOOL bigEndian = !!(flags & kAudioFormatFlagIsBigEndian);
+	const BOOL alignedHigh = !(flags & kAudioFormatFlagIsPacked) &&
+	                         !!(flags & kAudioFormatFlagIsAlignedHigh);
+	const size_t storageBits = storageBytes * 8;
+	const uint64_t validMask = (UINT64_C(1) << validBits) - 1;
+	const uint64_t signBit = UINT64_C(1) << (validBits - 1);
+	uint64_t word = (flags & kAudioFormatFlagIsSignedInteger) ?
+	                    ((uint64_t)centered & validMask) :
+	                    ((uint64_t)(centered + (int64_t)signBit) & validMask);
+	if(alignedHigh && validBits < storageBits) {
+		word <<= storageBits - validBits;
+	}
+
+	for(size_t byte = 0; byte < storageBytes; ++byte) {
+		const size_t destinationByte = bigEndian ? storageBytes - byte - 1 : byte;
+		output[destinationByte] = (uint8_t)(word >> (byte * 8));
+	}
+}
+
+BOOL AudioConvertIntegerPCM(void *output,
+                            AudioStreamBasicDescription outputFormat,
+                            const void *input,
+                            AudioStreamBasicDescription inputFormat,
+                            size_t sampleCount) {
+	size_t inputBytes = 0, outputBytes = 0;
+	if(!output || !input ||
+	   !AudioFormatHasSupportedIntegerPCMLayout(inputFormat, &inputBytes) ||
+	   !AudioFormatHasSupportedIntegerPCMLayout(outputFormat, &outputBytes) ||
+	   outputFormat.mBitsPerChannel < inputFormat.mBitsPerChannel) {
+		return NO;
+	}
+
+	const uint8_t *inputSamples = (const uint8_t *)input;
+	uint8_t *outputSamples = (uint8_t *)output;
+	const UInt32 precisionShift = outputFormat.mBitsPerChannel - inputFormat.mBitsPerChannel;
+	const int64_t precisionScale = INT64_C(1) << precisionShift;
+	for(size_t sample = 0; sample < sampleCount; ++sample) {
+		const int64_t centered = AudioLoadCenteredIntegerSample(inputSamples + sample * inputBytes,
+		                                                            inputBytes,
+		                                                            inputFormat.mBitsPerChannel,
+		                                                            inputFormat.mFormatFlags);
+		AudioStoreCenteredIntegerSample(outputSamples + sample * outputBytes,
+		                                outputBytes,
+		                                outputFormat.mBitsPerChannel,
+		                                outputFormat.mFormatFlags,
+		                                centered * precisionScale);
+	}
+	return YES;
+}
+
+BOOL AudioConvertIntegerPCMToFloat64(double *output,
+                                     const void *input,
+                                     AudioStreamBasicDescription inputFormat,
+                                     size_t sampleCount) {
+	size_t inputBytes = 0;
+	if(!output || !input ||
+	   !AudioFormatHasSupportedIntegerPCMLayout(inputFormat, &inputBytes)) {
+		return NO;
+	}
+
+	const uint8_t *inputSamples = (const uint8_t *)input;
+	const double scale = ldexp(1.0, (int)inputFormat.mBitsPerChannel - 1);
+	for(size_t sample = 0; sample < sampleCount; ++sample) {
+		const int64_t centered = AudioLoadCenteredIntegerSample(inputSamples + sample * inputBytes,
+		                                                            inputBytes,
+		                                                            inputFormat.mBitsPerChannel,
+		                                                            inputFormat.mFormatFlags);
+		output[sample] = (double)centered / scale;
+	}
+	return YES;
 }
 
 BOOL AudioFormatIsDoPInteger(AudioStreamBasicDescription format) {
@@ -93,12 +229,20 @@ AudioStreamBasicDescription AudioFormatAsFloat64(AudioStreamBasicDescription for
 
 AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBasicDescription format) {
 	const BOOL isFloat = !!(format.mFormatFlags & kAudioFormatFlagIsFloat);
+	const UInt32 validBits = format.mBitsPerChannel;
+	UInt32 storageBytes = sizeof(double);
+	if(!isFloat) {
+		storageBytes = validBits <= 16 ? sizeof(int16_t) : sizeof(int32_t);
+	}
 	format.mFormatID = kAudioFormatLinearPCM;
 	format.mFormatFlags = isFloat ? kAudioFormatFlagsNativeFloatPacked :
-	                                (kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian);
-	format.mBitsPerChannel = isFloat ? 64 : 32;
+	                                (kAudioFormatFlagIsSignedInteger |
+	                                 ((validBits == storageBytes * 8) ? kAudioFormatFlagIsPacked :
+	                                                                     kAudioFormatFlagIsAlignedHigh) |
+	                                 kAudioFormatFlagsNativeEndian);
+	format.mBitsPerChannel = isFloat ? 64 : validBits;
 	format.mFramesPerPacket = 1;
-	format.mBytesPerFrame = (UInt32)((isFloat ? sizeof(double) : sizeof(int32_t)) * format.mChannelsPerFrame);
+	format.mBytesPerFrame = (UInt32)(storageBytes * format.mChannelsPerFrame);
 	format.mBytesPerPacket = format.mBytesPerFrame;
 	format.mReserved = 0;
 	return format;

@@ -68,6 +68,12 @@ static NSArray<NSString *> *signalIntegrityPreferenceKeyPaths(void) {
 	return keyPaths;
 }
 
+static UInt32 pcmFloatSignificandBits(AudioStreamBasicDescription format) {
+	if(AudioFormatIsFloat32(format)) return 24;
+	if(AudioFormatIsFloat64(format)) return 53;
+	return 0;
+}
+
 static BOOL pcmRepresentationPreservesSamples(AudioStreamBasicDescription source,
                                                AudioStreamBasicDescription destination) {
 	if(source.mFormatID != kAudioFormatLinearPCM ||
@@ -84,8 +90,7 @@ static BOOL pcmRepresentationPreservesSamples(AudioStreamBasicDescription source
 	}
 
 	if(destinationIsFloat) {
-		const UInt32 significandBits = destination.mBitsPerChannel == 32 ? 24 :
-		                               destination.mBitsPerChannel == 64 ? 53 : 0;
+		const UInt32 significandBits = pcmFloatSignificandBits(destination);
 		return significandBits >= source.mBitsPerChannel;
 	}
 
@@ -268,6 +273,8 @@ static NSString *virtualOutputFormatDescription(AudioDeviceID deviceID) {
 - (BOOL)currentOutputUsesExclusiveTransport;
 - (BOOL)currentOutputIsEndToEndInteger;
 - (BOOL)currentProcessOwnsHogMode;
+- (void)configurePreferredFloatOutputForInputFormat:(AudioStreamBasicDescription)inputFormat
+	                                      sampleRate:(double)sampleRate;
 - (void)configurePreferredFloatOutputForConvertedDSDInputFormat:(AudioStreamBasicDescription)inputFormat
 	                                                sampleRate:(double)sampleRate;
 - (BOOL)prepareForInputFormatLocked:(AudioStreamBasicDescription)inputFormat;
@@ -1175,22 +1182,6 @@ static BOOL convertFloat64BufferToIntegerPCM(void *output,
 	return YES;
 }
 
-static int32_t convertPCMFloat64ToFullS32(double sample) {
-	if(isnan(sample)) return 0;
-	if(sample >= 1.0) return INT32_MAX;
-	if(sample <= -1.0) return INT32_MIN;
-	int64_t scaled = llrint(sample * 2147483648.0);
-	if(scaled > INT32_MAX) return INT32_MAX;
-	if(scaled < INT32_MIN) return INT32_MIN;
-	return (int32_t)scaled;
-}
-
-static void convertFloat64BufferToFullS32(int32_t *output, const double *input, size_t count) {
-	for(size_t i = 0; i < count; ++i) {
-		output[i] = convertPCMFloat64ToFullS32(input[i]);
-	}
-}
-
 static void convertFloat64BufferToF32(float *output, const double *input, size_t count) {
 	vDSP_vdpsp(input, 1, output, 1, count);
 }
@@ -1207,11 +1198,7 @@ static BOOL convertPCMBufferToFloat64(double *output, const void *input, AudioSt
 	if(!AudioFormatIsHighPrecisionPCM(format)) {
 		return NO;
 	}
-
-	vDSP_vflt32D((const int32_t *)input, 1, output, 1, count);
-	const double scale = 2147483648.0;
-	vDSP_vsdivD(output, 1, &scale, output, 1, count);
-	return YES;
+	return AudioConvertIntegerPCMToFloat64(output, input, format, count);
 }
 
 static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first, AudioStreamBasicDescription second) {
@@ -1226,9 +1213,10 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		return NO;
 	}
 	return first.mChannelsPerFrame == second.mChannelsPerFrame &&
-	       first.mBytesPerPacket == second.mBytesPerPacket &&
-	       !!(first.mFormatFlags & kAudioFormatFlagIsFloat) ==
-	       !!(second.mFormatFlags & kAudioFormatFlagIsFloat);
+	       first.mFormatFlags == second.mFormatFlags &&
+	       first.mBitsPerChannel == second.mBitsPerChannel &&
+	       first.mBytesPerFrame == second.mBytesPerFrame &&
+	       first.mBytesPerPacket == second.mBytesPerPacket;
 }
 
 - (BOOL)prepareOutputDoubleScratchForRenderFormat:(AudioStreamBasicDescription)format {
@@ -1634,8 +1622,9 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	                                           clientFormat:(AudioStreamBasicDescription *)selectedClientFormat {
 	const BOOL sourceIsFloat32 = AudioFormatIsFloat32(inputFormat);
 	const BOOL sourceIsFloat64 = AudioFormatIsFloat64(inputFormat);
-	if(!sourceIsFloat32 && !sourceIsFloat64) {
-		DLog(@"Exclusive float skipped: source is not canonical interleaved Float32/Float64 (%@)",
+	const BOOL sourceIsInteger = AudioFormatIsSignedIntegerPCM(inputFormat);
+	if(!sourceIsFloat32 && !sourceIsFloat64 && !sourceIsInteger) {
+		DLog(@"Exclusive float skipped: source is not supported lossless PCM (%@)",
 		     outputFormatDescription(inputFormat, NO));
 		return NO;
 	}
@@ -1663,18 +1652,25 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	BOOL found = NO;
 	AudioStreamBasicDescription bestFormat = { 0 };
 	uint64_t bestScore = UINT64_MAX;
+	const UInt32 sourceSignificandBits = sourceIsFloat32 ? 24 :
+	                                         (sourceIsFloat64 ? 53 : inputFormat.mBitsPerChannel);
 	for(NSValue *value in availableFormats) {
 		AudioStreamRangedDescription description = { 0 };
 		if(!GetRangedFormatValue(value, &description) ||
 		   !RangedPhysicalFormatSupportsSampleRate(description, sampleRate)) continue;
 		AudioStreamBasicDescription candidate = description.mFormat;
 		candidate.mSampleRate = sampleRate;
+		const UInt32 candidateSignificandBits = pcmFloatSignificandBits(candidate);
 		if(candidate.mChannelsPerFrame != inputFormat.mChannelsPerFrame ||
-		   (sourceIsFloat32 ? !AudioFormatIsFloat32(candidate) : !AudioFormatIsFloat64(candidate))) continue;
+		   !candidateSignificandBits ||
+		   !pcmRepresentationPreservesSamples(inputFormat, candidate)) continue;
 
 		// Prefer a driver's explicitly non-mixable float mode, while accepting its
-		// ordinary float virtual format under verified hog ownership as well.
-		const uint64_t score = (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ? 0 : 1;
+		// ordinary float virtual format under verified hog ownership as well. Within
+		// either class, use the narrowest representation that preserves every source
+		// sample (Float32 through 24-bit integer PCM, otherwise Float64 when offered).
+		uint64_t score = (candidate.mFormatFlags & kAudioFormatFlagIsNonMixable) ? 0 : UINT64_C(1000);
+		score += candidateSignificandBits - sourceSignificandBits;
 		if(!found || score < bestScore) {
 			found = YES;
 			bestScore = score;
@@ -1682,10 +1678,10 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		}
 	}
 	if(!found) {
-		DLog(@"Exclusive float skipped: no matching Float%u virtual format at %.0f Hz with %u channels",
-		     sourceIsFloat32 ? 32u : 64u,
+		DLog(@"Exclusive float skipped: no lossless float virtual format at %.0f Hz with %u channels for %u significant bits",
 		     sampleRate,
-		     (unsigned int)inputFormat.mChannelsPerFrame);
+		     (unsigned int)inputFormat.mChannelsPerFrame,
+		     (unsigned int)sourceSignificandBits);
 		return NO;
 	}
 
@@ -2373,6 +2369,12 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 	preferExclusiveFloatTransport = NO;
 	preferredFloatVirtualFormats = nil;
 	bzero(&preferredFloatClientFormat, sizeof(preferredFloatClientFormat));
+	preferExclusiveIntegerTransport = NO;
+	preferredIntegerTransportRequiresHog = NO;
+	preferredIntegerVirtualFormats = nil;
+	preferIntegerPhysicalOutput = NO;
+	preferredIntegerPhysicalFormats = nil;
+	bzero(&preferredIntegerClientFormat, sizeof(preferredIntegerClientFormat));
 	if(exclusiveOutputEnabled) {
 		NSDictionary<NSNumber *, NSValue *> *virtualFormats = nil;
 		NSDictionary<NSNumber *, NSValue *> *physicalFormats = nil;
@@ -2392,6 +2394,22 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 			preferredIntegerClientFormat = clientFormat;
 			preferIntegerPhysicalOutput = YES;
 			return;
+		}
+
+		// DoP must remain an integer carrier. Ordinary integer PCM may instead use
+		// a directly rendered float format when the device has no end-to-end integer
+		// mode and that float representation preserves every decoded source value.
+		if(!requireDoPCarrier) {
+			AudioStreamBasicDescription integerInputFormat =
+			    IntegerClientFormatForSourceBits(requiredBits,
+			                                     sampleRate,
+			                                     deviceFormat.mChannelsPerFrame);
+			[self configurePreferredFloatOutputForInputFormat:integerInputFormat sampleRate:sampleRate];
+			if(preferExclusiveFloatTransport) {
+				preferNativeHighPrecisionOutput = NO;
+				bzero(&preferredNativeHighPrecisionFormat, sizeof(preferredNativeHighPrecisionFormat));
+				return;
+			}
 		}
 	}
 	[self configureSharedIntegerOutputAtSampleRate:sampleRate
@@ -2638,7 +2656,7 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 		return NO;
 	}
 
-	const BOOL nativeFormatChanged = targetNativeHighPrecision &&
+	const BOOL nativeFormatChanged = targetNativeHighPrecision && !targetIntegerPhysical &&
 	                                memcmp(&renderFormat, &preferredNativeHighPrecisionFormat, sizeof(renderFormat)) != 0;
 	const BOOL integerPhysicalFormatChanged = targetIntegerPhysical &&
 	                                          !PhysicalFormatsHaveSameRepresentation(renderFormat, preferredIntegerClientFormat);
@@ -2717,17 +2735,18 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 
 		if(targetDoPInteger) {
 			renderFormat = DoPIntegerRenderFormatForDeviceFormat(deviceFormat);
-		} else if(targetNativeHighPrecision) {
-			renderFormat = preferredNativeHighPrecisionFormat;
-			renderFormat.mSampleRate = deviceFormat.mSampleRate;
-			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
-			renderFormat.mBytesPerFrame = (UInt32)((renderFormat.mBitsPerChannel / 8) * renderFormat.mChannelsPerFrame);
-			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
 		} else if(targetIntegerPhysical) {
 			renderFormat = preferredIntegerClientFormat;
 			renderFormat.mSampleRate = deviceFormat.mSampleRate;
 			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
 			renderFormat.mBytesPerFrame = AudioFormatBytesPerSample(preferredIntegerClientFormat) * renderFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
+		} else if(targetNativeHighPrecision) {
+			const UInt32 bytesPerSample = AudioFormatBytesPerSample(preferredNativeHighPrecisionFormat);
+			renderFormat = preferredNativeHighPrecisionFormat;
+			renderFormat.mSampleRate = deviceFormat.mSampleRate;
+			renderFormat.mChannelsPerFrame = deviceFormat.mChannelsPerFrame;
+			renderFormat.mBytesPerFrame = bytesPerSample * renderFormat.mChannelsPerFrame;
 			renderFormat.mBytesPerPacket = renderFormat.mBytesPerFrame * renderFormat.mFramesPerPacket;
 		} else {
 			renderFormat = deviceFormat;
@@ -3649,11 +3668,22 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 						} else if(highPrecisionRepresentationsMatch(chunkFormat, *renderASBD)) {
 							memcpy(destination, [sampleData bytes], inputTodo * renderASBD->mBytesPerPacket);
 							renderedChunk = YES;
+						} else if(!(chunkFormat.mFormatFlags & kAudioFormatFlagIsFloat) &&
+						          !(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) &&
+						          AudioConvertIntegerPCM(destination,
+						                                 *renderASBD,
+						                                 [sampleData bytes],
+						                                 chunkFormat,
+						                                 sampleCount)) {
+							renderedChunk = YES;
 						} else if(convertPCMBufferToFloat64(_self->inputDoubleScratch, [sampleData bytes], chunkFormat, sampleCount)) {
 							if(renderASBD->mFormatFlags & kAudioFormatFlagIsFloat) {
 								memcpy(destination, _self->inputDoubleScratch, sampleCount * sizeof(double));
 							} else {
-								convertFloat64BufferToFullS32((int32_t *)destination, _self->inputDoubleScratch, sampleCount);
+								convertFloat64BufferToIntegerPCM(destination,
+								                                 _self->inputDoubleScratch,
+								                                 sampleCount,
+								                                 *renderASBD);
 							}
 							renderedChunk = YES;
 						}
@@ -3777,8 +3807,6 @@ static BOOL IntegerTransportFormatIsUsable(AudioStreamBasicDescription format,
 					convertFloat64BufferToF32((float *)inputData->mBuffers[0].mData, outSamples, outputSampleCount);
 				} else if(renderAsFloat64) {
 					memcpy(inputData->mBuffers[0].mData, outSamples, outputSampleCount * sizeof(double));
-				} else if(_self->renderFormatNativeHighPrecision) {
-					convertFloat64BufferToFullS32((int32_t *)inputData->mBuffers[0].mData, outSamples, outputSampleCount);
 				} else {
 					if(!convertFloat64BufferToIntegerPCM(inputData->mBuffers[0].mData,
 					                                          outSamples,
