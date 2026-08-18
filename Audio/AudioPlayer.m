@@ -241,14 +241,14 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 			[output pause];
 		}
 		if(reusingOutput) {
-			[output faderFadeIn];
+			[output faderFadeInForPausedPlayback:YES];
 		}
 		[self setPlaybackStatus:CogStatusPaused waitUntilDone:YES];
 		if(time > 0.0) {
 			[self updatePosition:userInfo];
 		}
 	} else if(reusingOutput || shouldFadeIn) {
-		[output faderFadeIn];
+		[output faderFadeInForPausedPlayback:NO];
 	}
 }
 
@@ -342,7 +342,7 @@ static BOOL streamURLsShareUnderlyingResource(NSURL *firstURL, NSURL *secondURL)
 			[self setPlaybackStatus:CogStatusPaused waitUntilDone:YES];
 		}
 		[self updatePosition:userInfo];
-		[output faderFadeIn];
+		[output faderFadeInForPausedPlayback:paused];
 	}
 }
 
