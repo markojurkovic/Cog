@@ -58,7 +58,7 @@
 - (void)fadeOutBackground;
 - (void)beginSeek;
 - (void)fadeIn;
-- (void)faderFadeIn;
+- (void)faderFadeInForPausedPlayback:(BOOL)pausedPlayback;
 
 - (void)timeOut;
 

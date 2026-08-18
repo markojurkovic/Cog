@@ -2191,21 +2191,23 @@ static BOOL highPrecisionRepresentationsMatch(AudioStreamBasicDescription first,
 		fading = YES;
 		faded = NO;
 	} else {
-		[self faderFadeIn];
+		[self faderFadeInForPausedPlayback:NO];
 	}
 }
 
-- (void)faderFadeIn {
-	[self stopIdle];
-	// Stream replacement fades the new input at the DSP fader. Make sure the
-	// separate final-output fade gate is open as well: a DSD pause completes
-	// that gate as a hard fade, and reusing the output without clearing it
-	// otherwise leaves AUHAL running while it emits only carrier silence.
-	fadeLevel = 1.0f;
-	fadeTarget = 1.0f;
+- (void)faderFadeInForPausedPlayback:(BOOL)pausedPlayback {
+	if(!pausedPlayback) {
+		[self stopIdle];
+	}
+	// Reconnect the post-seek input without reopening the final-output gate
+	// while playback is paused. The controller intentionally remains paused, so
+	// allowing the renderer to consume the new input would make audio advance
+	// while its position timer and playback controls remain frozen.
+	fadeLevel = pausedPlayback ? 0.0f : 1.0f;
+	fadeTarget = fadeLevel;
 	fadeStep = 0.0f;
 	fading = NO;
-	faded = NO;
+	faded = pausedPlayback;
 	if(playbackFadesEnabled() || doPActive) {
 		[faderNode fadeIn];
 	} else {
