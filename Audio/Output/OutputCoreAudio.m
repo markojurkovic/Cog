@@ -134,9 +134,9 @@ static NSString *outputFormatDescriptionWithName(AudioStreamBasicDescription for
 	const UInt32 containerBits = bytesPerSample * 8;
 	NSString *bitDepthDescription;
 	if(containerBits > format.mBitsPerChannel) {
-		bitDepthDescription = [NSString stringWithFormat:@"%u-bit (%u-bit container)",
-		                                                      (unsigned int)format.mBitsPerChannel,
-		                                                      (unsigned int)containerBits];
+		bitDepthDescription = [NSString stringWithFormat:@"%u-bit container (%u valid bits)",
+		                                                      (unsigned int)containerBits,
+		                                                      (unsigned int)format.mBitsPerChannel];
 	} else {
 		bitDepthDescription = [NSString stringWithFormat:@"%u-bit", (unsigned int)format.mBitsPerChannel];
 	}
