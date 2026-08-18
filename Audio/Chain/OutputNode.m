@@ -120,9 +120,9 @@
 	[output fadeIn];
 }
 
-- (void)faderFadeIn {
+- (void)faderFadeInForPausedPlayback:(BOOL)pausedPlayback {
 	[self reconnectInputAndReplumb];
-	[output faderFadeIn];
+	[output faderFadeInForPausedPlayback:pausedPlayback];
 }
 
 - (void)timeOut {
