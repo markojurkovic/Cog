@@ -17,6 +17,15 @@ FOUNDATION_EXPORT BOOL AudioFormatIsFloat32(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsHighPrecisionPCM(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT BOOL AudioFormatIsDoPInteger(AudioStreamBasicDescription format);
+FOUNDATION_EXPORT BOOL AudioConvertIntegerPCM(void *output,
+                                              AudioStreamBasicDescription outputFormat,
+                                              const void *input,
+                                              AudioStreamBasicDescription inputFormat,
+                                              size_t sampleCount);
+FOUNDATION_EXPORT BOOL AudioConvertIntegerPCMToFloat64(double *output,
+                                                       const void *input,
+                                                       AudioStreamBasicDescription inputFormat,
+                                                       size_t sampleCount);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat32(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsFloat64(AudioStreamBasicDescription format);
 FOUNDATION_EXPORT AudioStreamBasicDescription AudioFormatAsCanonicalHighPrecisionPCM(AudioStreamBasicDescription format);

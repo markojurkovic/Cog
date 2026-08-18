@@ -47,6 +47,7 @@ void scale_by_volume_double(double *buffer, size_t count, double volume);
 	double sampleRatio;
 
 	BOOL observersAdded;
+	BOOL enableHDCD;
 
 	BOOL resetProcessed;
 	BOOL doPStream;
